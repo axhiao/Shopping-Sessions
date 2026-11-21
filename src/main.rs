@@ -138,6 +138,14 @@ fn release(p: *const u8, len: usize) {
     }
 }
 
+/// A Vec backed by the calling thread's arena. It must never grow past `cap`
+/// (that would hand arena memory to the allocator) and is never dropped.
+fn arena_vec<T>(cap: usize) -> std::mem::ManuallyDrop<Vec<T>> {
+    let cap = cap.max(1);
+    let p = arena_alloc(cap * std::mem::size_of::<T>()) as *mut T;
+    std::mem::ManuallyDrop::new(unsafe { Vec::from_raw_parts(p, 0, cap) })
+}
+
 fn release_vec<T>(v: &Vec<T>) {
     release(v.as_ptr() as *const u8, v.capacity() * std::mem::size_of::<T>());
 }
@@ -2313,13 +2321,15 @@ fn main() {
         };
         let mut lid = LocalIds::new();
         lid.reset(max_part / 16);
-        let mut evs: Vec<u64> = Vec::with_capacity(max_part);
-        let mut sorted: Vec<u64> = Vec::with_capacity(max_part);
-        let mut pids: Vec<u32> = Vec::with_capacity(max_part);
-        let mut lpur: Vec<(u32, u32)> = Vec::with_capacity(max_part / 16 + 16);
-        let mut cls: Vec<RecC> = Vec::with_capacity(max_clicks);
-        let mut csorted: Vec<RecC> = Vec::with_capacity(max_clicks);
-        let mut cpid: Vec<u32> = Vec::with_capacity(max_clicks);
+        // fixed-capacity scratch from this thread's (recycled) arena: never
+        // grows past its capacity, never dropped
+        let mut evs = arena_vec::<u64>(max_part);
+        let mut sorted = arena_vec::<u64>(max_part);
+        let mut pids = arena_vec::<u32>(max_part);
+        let mut lpur = arena_vec::<(u32, u32)>(max_part);
+        let mut cls = arena_vec::<RecC>(max_clicks);
+        let mut csorted = arena_vec::<RecC>(max_clicks);
+        let mut cpid = arena_vec::<u32>(max_clicks);
         let mut start: Vec<u32> = Vec::new();
         let mut cstart: Vec<u32> = Vec::new();
         let mut fill: Vec<u32> = Vec::new();
@@ -2378,7 +2388,7 @@ fn main() {
             // counting sort by pid
             start.clear();
             start.resize(np + 1, 0);
-            for &p in &pids {
+            for &p in pids.iter() {
                 start[p as usize + 1] += 1;
             }
             for k in 0..np {
@@ -2389,7 +2399,7 @@ fn main() {
             unsafe { sorted.set_len(evs.len()) };
             fill.clear();
             fill.extend_from_slice(&start[..np]);
-            for (&e, &p) in evs.iter().zip(&pids) {
+            for (&e, &p) in evs.iter().zip(pids.iter()) {
                 let f = unsafe { fill.get_unchecked_mut(p as usize) };
                 unsafe { *sorted.get_unchecked_mut(*f as usize) = e };
                 *f += 1;
@@ -2410,7 +2420,7 @@ fn main() {
             }
             cstart.clear();
             cstart.resize(np + 1, 0);
-            for &p in &cpid {
+            for &p in cpid.iter() {
                 cstart[p as usize + 1] += 1;
             }
             for k in 0..np {
@@ -2421,7 +2431,7 @@ fn main() {
             unsafe { csorted.set_len(cls.len()) };
             fill.clear();
             fill.extend_from_slice(&cstart[..np]);
-            for (c, &p) in cls.iter().zip(&cpid) {
+            for (c, &p) in cls.iter().zip(cpid.iter()) {
                 let f = &mut fill[p as usize];
                 csorted[*f as usize] = *c;
                 *f += 1;
@@ -2493,12 +2503,6 @@ fn main() {
                 st.agg[d * (ncamp + 1) + c][3] = st.assist[d * (ncamp + 1) + c] as u64;
             }
         }
-        release_vec(&evs);
-        release_vec(&sorted);
-        release_vec(&pids);
-        release_vec(&cls);
-        release_vec(&csorted);
-        release_vec(&cpid);
         release_vec(&lid.slots);
         // everyone is done reading phase-1 buffers: free this thread's arena
         if verbose {
