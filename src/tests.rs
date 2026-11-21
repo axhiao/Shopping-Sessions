@@ -447,3 +447,148 @@ fn bench_probe() {
         eprintln!("probe: {:.2} ns/line {acc}", t.elapsed().as_secs_f64() * 1e9 / 200.0 / lines as f64);
     }
 }
+
+/// The digits the generator prints for a number.
+fn base36_text(mut v: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        out.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[(v % 36) as usize]);
+        v /= 36;
+        if v == 0 {
+            break;
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// What `base36_40` must return, the slow way.
+fn base36_reference(s: &[u8]) -> Option<u64> {
+    if s.is_empty() || s.len() > 8 || (s[0] == b'0' && s.len() > 1) {
+        return None;
+    }
+    let mut v = 0u64;
+    for &c in s {
+        let d = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'z' => c - b'a' + 10,
+            _ => return None,
+        };
+        v = v * 36 + d as u64;
+    }
+    (v <= M40).then_some(v)
+}
+
+fn rng(x: &mut u64) -> u64 {
+    *x ^= *x << 13;
+    *x ^= *x >> 7;
+    *x ^= *x << 17;
+    *x
+}
+
+#[test]
+fn base36_matches_reference() {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let alphabet: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzAZ_-/:`{ \xff\x00\"";
+    let mut cases: Vec<Vec<u8>> = vec![
+        b"".to_vec(),
+        b"0".to_vec(),
+        b"00".to_vec(),
+        b"01".to_vec(),
+        b"z".to_vec(),
+        base36_text(M40),
+        base36_text(M40 + 1),
+        b"zzzzzzzz".to_vec(),
+        b"zzzzzzzzz".to_vec(),
+        b"10000000".to_vec(),
+        b"100000000".to_vec(),
+    ];
+    for _ in 0..200_000 {
+        let r = rng(&mut x);
+        if r % 3 == 0 {
+            cases.push(base36_text(rng(&mut x) % (M40 + 1000)));
+        } else {
+            let n = (r >> 8) % 11;
+            cases.push((0..n).map(|_| alphabet[(rng(&mut x) % alphabet.len() as u64) as usize]).collect());
+        }
+    }
+    let mut accepted = 0;
+    for c in &cases {
+        let b = padded(c);
+        let got = base36_40(&b[..c.len()]);
+        assert_eq!(got, base36_reference(c), "{:?}", String::from_utf8_lossy(c));
+        if let Some(v) = got {
+            accepted += 1;
+            // exact: the number gives the same text back
+            assert_eq!(&base36_text(v), c);
+            let mut id = vec![b'e'];
+            id.extend_from_slice(c);
+            let pid = padded(&id);
+            assert_eq!(id_number(b'e', &pid[..id.len()]), Some(v));
+            assert_eq!(id_number(b'k', &pid[..id.len()]), None);
+        }
+    }
+    assert!(accepted > 50_000);
+}
+
+#[test]
+fn scramble_is_inverted() {
+    let mut x = 0x1234_5678_9ABC_DEF1u64;
+    for _ in 0..200_000 {
+        let key = rng(&mut x);
+        let n = rng(&mut x) & M40;
+        let v = scramble(n, key);
+        assert!(v <= M40);
+        assert_eq!(seq_of(v, key), n);
+        // any key gives a one-to-one map
+        let other = rng(&mut x);
+        assert_eq!(scramble(seq_of(v, other), other), v);
+    }
+    // the generator's own function, on the numbers from its source
+    assert_eq!(SCR_C1.wrapping_mul(SCR_C1I) & M40, 1);
+    assert_eq!(SCR_C2.wrapping_mul(SCR_C2I) & M40, 1);
+}
+
+#[test]
+fn sequence_key_is_found() {
+    let mut x = 0xDEAD_BEEF_1234_5678u64;
+    for round in 0..6 {
+        let key = rng(&mut x) & M40;
+        let bound = [1u64 << 12, 50_000, 1 << 20][round % 3];
+        let sample: Vec<u64> = (0..48).map(|_| scramble(rng(&mut x) % bound, key)).collect();
+        let found = find_seq_key(&sample, bound, 3).expect("a key");
+        assert!(sample.iter().all(|&v| seq_of(v, found) < bound));
+    }
+    // unrelated numbers have no key
+    let sample: Vec<u64> = (0..48).map(|_| rng(&mut x) & M40).collect();
+    assert_eq!(find_seq_key(&sample, 1 << 16, 3), None);
+}
+
+#[test]
+fn user_codes_are_exact() {
+    let mut x = 0x0BAD_C0DE_F00D_1234u64;
+    let alphabet: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzuuAUZ_-`{:/ \xff\x00";
+    let mut seen = std::collections::HashMap::new();
+    let mut accepted = 0;
+    for i in 0..300_000 {
+        let n = rng(&mut x) % 12;
+        let mut id: Vec<u8> = (0..n).map(|_| alphabet[(rng(&mut x) % alphabet.len() as u64) as usize]).collect();
+        if i % 2 == 0 && !id.is_empty() {
+            id[0] = b'u';
+        }
+        let b = padded(&id);
+        let ok = id.len() >= 2 && id.len() <= 9 && id[0] == b'u' && id[1..].iter().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase());
+        let got = user_code(&b[..id.len()]);
+        assert_eq!(got.is_some(), ok, "{:?}", String::from_utf8_lossy(&id));
+        if let Some(code) = got {
+            accepted += 1;
+            assert!(code < 1 << 52);
+            assert_eq!(user_code_key(code), key_of(&b[..id.len()]), "{:?}", String::from_utf8_lossy(&id));
+            // different IDs, different codes
+            if let Some(old) = seen.insert(code, id.clone()) {
+                assert_eq!(old, id);
+            }
+        }
+    }
+    assert!(accepted > 10_000);
+}

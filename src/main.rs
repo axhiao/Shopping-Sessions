@@ -2031,7 +2031,7 @@ const SCR_C1I: u64 = inv64(SCR_C1);
 const SCR_C2I: u64 = inv64(SCR_C2);
 
 /// The generator's bijection on 0..2^40.
-#[allow(dead_code)]
+#[cfg(test)]
 fn scramble(n: u64, key: u64) -> u64 {
     let mut m = ((n & M40).wrapping_mul(SCR_C1) ^ key) & M40;
     m ^= m >> 17;
@@ -2172,24 +2172,6 @@ fn user_code_key(code: u64) -> Key {
     buf[0] = b'u';
     buf[1..9].copy_from_slice(&y.to_le_bytes());
     key_of(&buf[..n + 1])
-}
-
-/// The key of the ID `id_number` reads `v` from.
-fn id_key(letter: u8, v: u64) -> Key {
-    let mut buf = [0u8; 32];
-    let mut at = 16;
-    let mut rest = v;
-    loop {
-        at -= 1;
-        buf[at] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(rest % 36) as usize];
-        rest /= 36;
-        if rest == 0 {
-            break;
-        }
-    }
-    at -= 1;
-    buf[at] = letter;
-    key_of(&buf[at..16])
 }
 
 /// The key under which the sampled ID numbers all have a sequence number
