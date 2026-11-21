@@ -282,7 +282,19 @@ fn prefetch<T>(p: *const T) {
 type Key = [u64; 2];
 const ZERO: Key = [0, 0];
 
-static LONG: Mutex<BTreeMap<Key, Vec<u8>>> = Mutex::new(BTreeMap::new());
+/// Strings of more than 15 bytes, by their hashed key: sharded, and each
+/// thread remembers which keys it already registered.
+const LONG_SHARDS: usize = 64;
+static LONG: [Mutex<BTreeMap<Key, Vec<u8>>>; LONG_SHARDS] = [const { Mutex::new(BTreeMap::new()) }; LONG_SHARDS];
+
+thread_local! {
+    static LONG_SEEN: std::cell::RefCell<std::collections::HashSet<Key>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+#[inline]
+fn long_shard(k: &Key) -> &'static Mutex<BTreeMap<Key, Vec<u8>>> {
+    &LONG[(k[0] >> 58) as usize % LONG_SHARDS]
+}
 
 #[inline(always)]
 fn fm(a: u64, b: u64) -> u64 {
@@ -303,7 +315,10 @@ fn long_key(s: &[u8]) -> Key {
         h2 = fm(h2 ^ x, 0xC2B2_AE3D_27D4_EB4F) ^ h1;
     }
     let k = [h1, (h2 & !0xFF) | 0xFF];
-    LONG.lock().unwrap().entry(k).or_insert_with(|| s.to_vec());
+    let fresh = LONG_SEEN.with(|seen| seen.borrow_mut().insert(k));
+    if fresh {
+        long_shard(&k).lock().unwrap().entry(k).or_insert_with(|| s.to_vec());
+    }
     k
 }
 
@@ -335,7 +350,7 @@ fn key_bytes(k: &Key, out: &mut Vec<u8>) {
         b[8..].copy_from_slice(&k[1].to_be_bytes());
         out.extend_from_slice(&b[..n]);
     } else {
-        out.extend_from_slice(&LONG.lock().unwrap()[k]);
+        out.extend_from_slice(&long_shard(k).lock().unwrap()[k]);
     }
 }
 
