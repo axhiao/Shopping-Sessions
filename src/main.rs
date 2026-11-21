@@ -2273,6 +2273,10 @@ struct P3 {
     uw: pq::UserWriter,
     name: Vec<u8>,
     agg: Vec<[u64; 4]>, // (day * (ncamp + 1) + camp) -> sessions, purchasing, revenue, assisted
+    /// (day * (ncamp + 1) + camp) -> sessions. Every session bumps one of
+    /// these counters at random; kept apart from `agg` (which only purchasing
+    /// sessions touch) so that the table stays in the L2 cache.
+    sess: Vec<u32>,
     assist: Vec<u32>,   // (day * (ncamp + 1) + camp) -> assisted sessions
     cnt: Vec<u32>,
     pos: Vec<u32>,
@@ -2363,10 +2367,13 @@ fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u
                 lo += 1;
             }
             let credit = if lo < hi { unsafe { *camps.get_unchecked(cls[hi - 1] as u32 as usize) } } else { g.organic } as usize;
-            let a = unsafe { st.agg.get_unchecked_mut(s_didx * (g.organic as usize + 1) + credit) };
-            a[0] += 1;
-            a[1] += s_purch as u64;
-            a[2] += s_rev;
+            let cell = s_didx * (g.organic as usize + 1) + credit;
+            unsafe { *st.sess.get_unchecked_mut(cell) += 1 };
+            if s_purch {
+                let a = unsafe { st.agg.get_unchecked_mut(cell) };
+                a[1] += 1;
+                a[2] += s_rev;
+            }
             if !st.active.is_empty() {
                 if st.pend[s_didx] == 0 {
                     st.pend_days.push(s_didx as u32);
@@ -3016,6 +3023,7 @@ fn main() {
             uw: pq::UserWriter::new(&out.join("user_daily"), w, day0 as i32, ndays, &ctx.cat_names),
             name: Vec::new(),
             agg: vec![[0u64; 4]; (ncamp + 1) * ndays],
+            sess: vec![0; (ncamp + 1) * ndays],
             assist: vec![0; (ncamp + 1) * ndays],
             cnt: vec![0; ncamp + 1],
             pos: vec![0; ncamp + 1],
@@ -3194,6 +3202,7 @@ fn main() {
         }
         for d in 0..ndays {
             for c in 0..=ncamp {
+                st.agg[d * (ncamp + 1) + c][0] = st.sess[d * (ncamp + 1) + c] as u64;
                 st.agg[d * (ncamp + 1) + c][3] = st.assist[d * (ncamp + 1) + c] as u64;
             }
         }
