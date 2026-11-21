@@ -3895,12 +3895,16 @@ fn main() {
                 }
                 // entry: ingest << 40 | worker << 32 | position; the smallest wins
                 let mut any = false;
+                let mut bases = [std::ptr::null::<RecX>(); 32];
                 for (w, o) in p1.iter().enumerate() {
                     let recs = o.ix[i].as_slice();
+                    bases[w] = recs.as_ptr();
+                    let tag = (w as u64) << 32;
                     let mut pos = 0;
                     while pos < recs.len() {
                         let r = unsafe { recs.get_unchecked(pos) };
-                        let cand = (r.ingest() << 40) | ((w as u64) << 32) | pos as u64;
+                        // (ingest sits at bits 16..40 of a)
+                        let cand = ((r.a << 24) & 0xFFFF_FF00_0000_0000) | tag | pos as u64;
                         let e = unsafe { table.get_unchecked_mut(r.slot()) };
                         if cand < *e {
                             *e = cand;
@@ -3918,9 +3922,8 @@ fn main() {
                         continue;
                     }
                     let (w, pos) = ((c >> 32) as usize & 0xFF, c as u32 as usize);
-                    let src = unsafe { p1.get_unchecked(w) };
-                    let recs = src.ix[i].as_slice();
-                    let r = unsafe { *recs.get_unchecked(pos) };
+                    let rp = unsafe { bases.get_unchecked(w).add(pos) };
+                    let r = unsafe { *rp };
                     if r.b & X_VALID == 0 {
                         continue;
                     }
@@ -3928,7 +3931,7 @@ fn main() {
                     let field = user | (r.b & X_ODD);
                     if field != last_user || r.b & X_ODD != 0 {
                         let (person, ph) = if r.b & X_ODD != 0 {
-                            let key = src.ixodd[i].as_slice()[user as usize];
+                            let key = p1[w].ixodd[i].as_slice()[user as usize];
                             let h = hk(&key);
                             if linkmap.maybe_linked(h) {
                                 let p = linkmap.person(&key, h);
@@ -3963,11 +3966,16 @@ fn main() {
                     }
                     let purchase = (r.b & X_PURCHASE != 0) as u32;
                     if purchase != 0 {
-                        let x = unsafe { recs.get_unchecked(pos + 1) };
+                        let x = unsafe { *rp.add(1) };
                         unsafe { pur.get_unchecked_mut(run_q) }.push((x.a as u32, (x.a >> 32) as u32));
                         run_npur += 1;
                     }
-                    run.push(r.ts() | (purchase << 31));
+                    // (room for RUN_MAX words was reserved)
+                    unsafe {
+                        let n = run.len();
+                        run.as_mut_ptr().add(n).write(r.ts() | (purchase << 31));
+                        run.set_len(n + 1);
+                    }
                 }
                 // (a person's events may go on in the next partition, which
                 // another thread may have: that is a second run)
