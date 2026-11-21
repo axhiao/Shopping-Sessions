@@ -38,6 +38,17 @@ fn chunk_size() -> u64 {
 }
 const PAD: usize = 128;
 
+/// Experiment switches of the diagnostic build: 0 = SS_SF (last record of a
+/// line from registers), 1 = SS_NT (streaming stores), 2 = SS_PF (input
+/// prefetch distance in bytes, 0 = none).
+fn knob(i: usize) -> i64 {
+    static V: OnceLock<[i64; 3]> = OnceLock::new();
+    V.get_or_init(|| {
+        let g = |k: &str, d: i64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        [g("SS_SF", 1), g("SS_NT", 1), g("SS_PF", 0)]
+    })[i]
+}
+
 // ---------------------------------------------------------------------------
 // Memory helpers
 
@@ -250,6 +261,8 @@ struct Parts<T: Copy, const K: usize> {
     out: Vec<PVec<T>>,
     buf: Vec<[T; K]>,
     n: Vec<u32>,
+    sf: bool,
+    nt: bool,
 }
 
 impl<T: Copy, const K: usize> Parts<T, K> {
@@ -261,7 +274,7 @@ impl<T: Copy, const K: usize> Parts<T, K> {
             buf.set_len(parts);
             std::ptr::write_bytes(buf.as_mut_ptr(), 0, parts);
         }
-        Parts { out: (0..parts).map(|_| PVec::with_capacity(reserve)).collect(), buf, n: vec![0; parts] }
+        Parts { out: (0..parts).map(|_| PVec::with_capacity(reserve)).collect(), buf, n: vec![0; parts], sf: knob(0) != 0, nt: knob(1) != 0 }
     }
     /// The index the next record pushed to partition q will get.
     #[inline(always)]
@@ -274,7 +287,7 @@ impl<T: Copy, const K: usize> Parts<T, K> {
             let k = *self.n.get_unchecked(q) as usize;
             if k + 1 == K {
                 #[cfg(target_feature = "avx2")]
-                if std::mem::size_of::<T>() == 16 || std::mem::size_of::<T>() == 32 {
+                if self.sf && (std::mem::size_of::<T>() == 16 || std::mem::size_of::<T>() == 32) {
                     self.flush_with(q, v);
                     *self.n.get_unchecked_mut(q) = 0;
                     return;
@@ -297,6 +310,7 @@ impl<T: Copy, const K: usize> Parts<T, K> {
     #[inline(always)]
     unsafe fn flush_with(&mut self, q: usize, v: T) {
         use std::arch::x86_64::*;
+        let nt = self.nt;
         let o = self.out.get_unchecked_mut(q);
         if o.len + K > o.cap {
             o.grow();
@@ -307,7 +321,11 @@ impl<T: Copy, const K: usize> Parts<T, K> {
         let mut i = 0;
         while i + 32 < bytes {
             let x = _mm256_loadu_si256(src.add(i) as *const __m256i);
-            _mm256_stream_si256(dst.add(i) as *mut __m256i, x);
+            if nt {
+                _mm256_stream_si256(dst.add(i) as *mut __m256i, x);
+            } else {
+                _mm256_storeu_si256(dst.add(i) as *mut __m256i, x);
+            }
             i += 32;
         }
         let last = if std::mem::size_of::<T>() == 16 {
@@ -318,12 +336,17 @@ impl<T: Copy, const K: usize> Parts<T, K> {
             let w = std::mem::transmute_copy::<T, [u64; 4]>(&v);
             _mm256_set_epi64x(w[3] as i64, w[2] as i64, w[1] as i64, w[0] as i64)
         };
-        _mm256_stream_si256(dst.add(i) as *mut __m256i, last);
+        if nt {
+            _mm256_stream_si256(dst.add(i) as *mut __m256i, last);
+        } else {
+            _mm256_storeu_si256(dst.add(i) as *mut __m256i, last);
+        }
         o.len += K;
     }
     #[inline(always)]
     fn flush(&mut self, q: usize) {
         unsafe {
+            let nt = self.nt;
             let o = self.out.get_unchecked_mut(q);
             if o.len + K > o.cap {
                 o.grow();
@@ -337,7 +360,7 @@ impl<T: Copy, const K: usize> Parts<T, K> {
                 let mut i = 0;
                 while i < bytes {
                     let v = _mm256_loadu_si256(src.add(i) as *const __m256i);
-                    if NT_STORES {
+                    if NT_STORES && nt {
                         _mm256_stream_si256(dst.add(i) as *mut __m256i, v);
                     } else {
                         _mm256_storeu_si256(dst.add(i) as *mut __m256i, v);
@@ -1152,8 +1175,12 @@ fn scan_lean<'a, const N: usize, const K: usize, F: FnMut(&[&'a [u8]; N])>(buf: 
     debug_assert!(K >= 1 && K < N);
     let ptr = buf.as_ptr();
     let mut ls = begin;
+    let pf = knob(2) as usize;
     while ls < limit && ls < n {
         let p = unsafe { ptr.add(ls) };
+        if pf != 0 {
+            prefetch(p.wrapping_add(pf));
+        }
         let (sep, nl, qt) = unsafe { win_masks(p) };
         // the line ends at the first newline (128: none in the window)
         let e = if nl[0] != 0 { nl[0].trailing_zeros() } else { 64 + nl[1].trailing_zeros() } as usize;
@@ -2594,7 +2621,9 @@ fn main() {
     SUBS.store(nthreads + 1, Ordering::Relaxed);
     let verbose = cfg!(feature = "diag") || std::env::var("SS_VERBOSE").is_ok();
     #[cfg(feature = "diag")]
-    diag::run(&data, &out, nthreads);
+    if std::env::var_os("SS_CHILD").is_none() {
+        diag::run(&data, &out, nthreads);
+    }
     #[cfg(feature = "diag")]
     let t0 = Instant::now();
     let lap = |what: &str| {
@@ -3252,14 +3281,17 @@ fn main() {
         }
     }
     #[cfg(feature = "diag")]
-    {
-        // a diagnostic build must never be scored: one extra row
-        n += 1;
-        cols[0].push_str(b"diag");
-        cols[1].push_str(b"diag");
-        cols[2].push_i32(day0 as i32);
-        for k in 0..4 {
-            cols[3 + k].push_i64(k as i64);
+    if std::env::var_os("SS_CHILD").is_none() {
+        // a diagnostic build must never be scored: an extra row, which also
+        // carries the diagnostics back in its text column
+        for (i, text) in diag::rows().iter().enumerate() {
+            n += 1;
+            cols[0].push_str(format!("diag{i:03}").as_bytes());
+            cols[1].push_str(text.as_bytes());
+            cols[2].push_i32(day0 as i32);
+            for k in 0..4 {
+                cols[3 + k].push_i64(k as i64);
+            }
         }
     }
     pq::write_file(&out.join("campaign_daily").join("part-000.parquet"), &cols, n).expect("write campaign_daily");
