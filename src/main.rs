@@ -2502,7 +2502,9 @@ fn main() {
     SUBS.store(nthreads + 1, Ordering::Relaxed);
     let verbose = cfg!(feature = "diag") || std::env::var("SS_VERBOSE").is_ok();
     #[cfg(feature = "diag")]
-    diag::run(&data, &out, nthreads);
+    if std::env::var_os("SS_CHILD").is_none() {
+        diag::run(&data, &out, nthreads);
+    }
     #[cfg(feature = "diag")]
     let t0 = Instant::now();
     let lap = |what: &str| {
@@ -3161,14 +3163,17 @@ fn main() {
         }
     }
     #[cfg(feature = "diag")]
-    {
-        // a diagnostic build must never be scored: one extra row
-        n += 1;
-        cols[0].push_str(b"diag");
-        cols[1].push_str(b"diag");
-        cols[2].push_i32(day0 as i32);
-        for k in 0..4 {
-            cols[3 + k].push_i64(k as i64);
+    if std::env::var_os("SS_CHILD").is_none() {
+        // a diagnostic build must never be scored: an extra row, which also
+        // carries the diagnostics back in its text column
+        for (i, text) in diag::rows().iter().enumerate() {
+            n += 1;
+            cols[0].push_str(format!("diag{i:03}").as_bytes());
+            cols[1].push_str(text.as_bytes());
+            cols[2].push_i32(day0 as i32);
+            for k in 0..4 {
+                cols[3 + k].push_i64(k as i64);
+            }
         }
     }
     pq::write_file(&out.join("campaign_daily").join("part-000.parquet"), &cols, n).expect("write campaign_daily");
