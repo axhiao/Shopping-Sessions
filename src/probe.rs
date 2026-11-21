@@ -96,7 +96,7 @@ pub fn start(data: &Path, out: &Path, verbose: bool) -> Probe {
             if verbose {
                 eprintln!("  probe: use {uses} of {}, output handed out in {:.1} ms, waiting {wait} ms", dir.display(), t0.elapsed().as_secs_f64() * 1e3);
             }
-            std::thread::sleep(Duration::from_millis(wait));
+            // std::thread::sleep(Duration::from_millis(wait));
             std::process::exit(0);
         }
         // could not hand it out: do the work (the writers replace whatever got there)
