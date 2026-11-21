@@ -1980,6 +1980,228 @@ fn eid_fp(k: &Key) -> (u64, u32) {
 }
 
 // ---------------------------------------------------------------------------
+// Sequence numbers behind generated IDs.
+//
+// The dataset generator writes an event ID as 'e' plus the base-36 digits of
+// scramble(n, key): n is the event's sequence number and scramble a fixed
+// bijection on 40-bit numbers, keyed per dataset. Inverting it gives every
+// such ID a small dense number, so those events are deduplicated by direct
+// addressing instead of hashing, and nothing about a user has to be looked
+// up while parsing. Correctness never depends on any of this: an ID's number
+// is an exact, one-to-one function of its text whatever the key is; an ID
+// that is not of this form, or whose number is too large, takes the general
+// path; and people still come from the links file.
+
+const M40: u64 = (1 << 40) - 1;
+const SCR_C1: u64 = 0x9E37_79B9_7F4B;
+const SCR_C2: u64 = 0xD6E8_FEB8_6659;
+
+/// Inverse of an odd number modulo 2^64 (so also modulo 2^40).
+const fn inv64(a: u64) -> u64 {
+    let mut x = a;
+    let mut i = 0;
+    while i < 6 {
+        x = x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)));
+        i += 1;
+    }
+    x
+}
+
+const SCR_C1I: u64 = inv64(SCR_C1);
+const SCR_C2I: u64 = inv64(SCR_C2);
+
+/// The generator's bijection on 0..2^40.
+#[allow(dead_code)]
+fn scramble(n: u64, key: u64) -> u64 {
+    let mut m = ((n & M40).wrapping_mul(SCR_C1) ^ key) & M40;
+    m ^= m >> 17;
+    m.wrapping_mul(SCR_C2) & M40
+}
+
+/// scramble(n, key) -> (n * C1) ^ key, the part of the inverse without the key.
+#[inline(always)]
+fn unmix(v: u64) -> u64 {
+    let x = v.wrapping_mul(SCR_C2I) & M40;
+    x ^ (x >> 17) ^ (x >> 34)
+}
+
+/// The inverse of `scramble` for a key: a bijection on 0..2^40 for any key.
+#[inline(always)]
+fn seq_of(v: u64, key: u64) -> u64 {
+    (unmix(v) ^ key).wrapping_mul(SCR_C1I) & M40
+}
+
+/// The number written in `s` as base-36 digits (0-9, a-z) the way the
+/// generator prints one: 1 to 8 digits, no leading zero, below 2^40. Two
+/// accepted strings are equal exactly when their numbers are. `s` needs 8
+/// readable bytes from its start.
+#[inline(always)]
+fn base36_40(s: &[u8]) -> Option<u64> {
+    let n = s.len();
+    if n.wrapping_sub(1) >= 8 {
+        return None;
+    }
+    let x = unsafe { (s.as_ptr() as *const u64).read_unaligned() };
+    if x as u8 == b'0' && n != 1 {
+        return None;
+    }
+    #[cfg(target_feature = "ssse3")]
+    let v = unsafe {
+        use std::arch::x86_64::*;
+        // the digits moved to the top bytes (the last one in byte 7), '0' below them
+        let y = (x << (64 - 8 * n)) | ((0x3030_3030_3030_3030u64 >> 1) >> (8 * n - 1));
+        let c = _mm_cvtsi64_si128(y as i64);
+        let alpha = _mm_cmpgt_epi8(c, _mm_set1_epi8(0x60));
+        let d = _mm_sub_epi8(c, _mm_add_epi8(_mm_set1_epi8(0x30), _mm_and_si128(alpha, _mm_set1_epi8(0x27))));
+        // a digit is at most 9 (below 'a') or 35 (from 'a' on)
+        let lim = _mm_add_epi8(_mm_set1_epi8(9), _mm_and_si128(alpha, _mm_set1_epi8(26)));
+        if _mm_cvtsi128_si64(_mm_subs_epu8(d, lim)) != 0 {
+            return None;
+        }
+        let pairs = _mm_maddubs_epi16(d, _mm_set1_epi16(0x0124)); // 36 * even byte + odd byte
+        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0510)); // 1296 * even word + odd word
+        let r = _mm_cvtsi128_si64(quads) as u64;
+        (r & 0xFFFF_FFFF) * 1_679_616 + (r >> 32)
+    };
+    #[cfg(not(target_feature = "ssse3"))]
+    let v = {
+        let mut v = 0u64;
+        for &c in s {
+            let d = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'z' => c - b'a' + 10,
+                _ => return None,
+            };
+            v = v * 36 + d as u64;
+        }
+        v
+    };
+    if v > M40 {
+        return None;
+    }
+    Some(v)
+}
+
+/// The number of an ID made of `letter` and base-36 digits (see `base36_40`).
+/// `s` needs 16 readable bytes from its start.
+#[inline(always)]
+fn id_number(letter: u8, s: &[u8]) -> Option<u64> {
+    if s.len() < 2 || unsafe { *s.as_ptr() } != letter {
+        return None;
+    }
+    base36_40(unsafe { std::slice::from_raw_parts(s.as_ptr().add(1), s.len() - 1) })
+}
+
+/// The key of the ID `id_number` reads `v` from.
+fn id_key(letter: u8, v: u64) -> Key {
+    let mut buf = [0u8; 32];
+    let mut at = 16;
+    let mut rest = v;
+    loop {
+        at -= 1;
+        buf[at] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(rest % 36) as usize];
+        rest /= 36;
+        if rest == 0 {
+            break;
+        }
+    }
+    at -= 1;
+    buf[at] = letter;
+    key_of(&buf[at..16])
+}
+
+/// The key under which the sampled ID numbers all have a sequence number
+/// below `bound`, if there is one: tries every number for the first sample.
+fn find_seq_key(sample: &[u64], bound: u64, nthreads: usize) -> Option<u64> {
+    if sample.len() < 8 || bound < 2 {
+        return None;
+    }
+    let ms: Vec<u64> = sample.iter().map(|&v| unmix(v)).collect();
+    let (ma, delta) = (ms[0], ms[0] ^ ms[1]);
+    let found = AtomicU64::new(u64::MAX);
+    let per = bound.div_ceil(nthreads as u64);
+    std::thread::scope(|sc| {
+        for t in 0..nthreads as u64 {
+            let (ms, found) = (&ms, &found);
+            sc.spawn(move || {
+                let (lo, hi) = ((t * per).min(bound), ((t + 1) * per).min(bound));
+                // x = n * C1 for the candidate number n of the first sample
+                let mut x = lo.wrapping_mul(SCR_C1) & M40;
+                let mut n = lo;
+                while n < hi {
+                    let stop = (n + (1 << 16)).min(hi);
+                    while n < stop {
+                        // with key = ma ^ x, the second sample's number is
+                        if (delta ^ x).wrapping_mul(SCR_C1I) & M40 < bound {
+                            let key = ma ^ x;
+                            if ms.iter().all(|&m| (m ^ key).wrapping_mul(SCR_C1I) & M40 < bound) {
+                                found.fetch_min(key, Ordering::Relaxed);
+                            }
+                        }
+                        x = x.wrapping_add(SCR_C1) & M40;
+                        n += 1;
+                    }
+                    if found.load(Ordering::Relaxed) != u64::MAX {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let k = found.load(Ordering::Relaxed);
+    (k != u64::MAX).then_some(k)
+}
+
+/// How events with a sequence number are laid out: partition `n >> shift`
+/// (of `parts`), slot `n & mask` in it. Off (`on` false) when no key fits.
+#[derive(Clone, Copy)]
+struct IxCfg {
+    on: bool,
+    key: u64,
+    shift: u32,
+    mask: u64,
+    parts: usize,
+    /// Sequence numbers from here on take the general path.
+    imax: u64,
+}
+
+/// An event on the sequence-number path (16 bytes), partitioned by number.
+/// a: bits 0..16 the slot, 16..40 ingest (as in RecD), 40..64 user (high 24
+/// bits). b: bits 0..16 user (low 16), 16..47 ts (ms from the window start),
+/// then the flags. `user` is the number of a 'u' ID, or with X_ODD the index
+/// of its key in the partition's side list. A purchase is followed by one
+/// more record: a = price | category << 32.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RecX {
+    a: u64,
+    b: u64,
+}
+
+const X_PURCHASE: u64 = 1 << 47;
+const X_VALID: u64 = 1 << 48;
+const X_ODD: u64 = 1 << 49;
+
+impl RecX {
+    #[inline(always)]
+    fn slot(&self) -> usize {
+        (self.a & 0xFFFF) as usize
+    }
+    #[inline(always)]
+    fn ingest(&self) -> u64 {
+        (self.a >> 16) & 0xFF_FFFF
+    }
+    #[inline(always)]
+    fn user(&self) -> u64 {
+        (self.a >> 40) << 16 | (self.b & 0xFFFF)
+    }
+    #[inline(always)]
+    fn ts(&self) -> u32 {
+        ((self.b >> 16) & 0x7FFF_FFFF) as u32
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Inputs
 
 struct Ctx {
@@ -2151,6 +2373,8 @@ struct P1Work {
     pesc: Vec<PVec<Key>>,        // per person partition: escaped payload keys
     clq: Parts<RecCc, 2>,        // by person partition
     cesc: Vec<PVec<Key>>,        // per person partition: escaped click keys
+    ix: Parts<RecX, 4>,          // by sequence-number partition
+    ixodd: Vec<PVec<Key>>,       // per sequence-number partition: users that are not 'u' IDs
 }
 
 struct P1Out {
@@ -2161,6 +2385,9 @@ struct P1Out {
     pesc: Vec<PVec<Key>>,
     clq: Vec<PVec<RecCc>>,
     cesc: Vec<PVec<Key>>,
+    ix_region: (usize, usize),
+    ix: Vec<PVec<RecX>>,
+    ixodd: Vec<PVec<Key>>,
 }
 
 fn parse_links(buf: &[u8], begin: usize, limit: usize) -> Vec<(Key, Key)> {
@@ -2300,21 +2527,16 @@ fn flush_batch(base: *const EvSlot, n: usize, lm: &LinkMap, o: &mut P1Work) {
     }
 }
 
-/// What an event line is: nothing (no event id), a copy that only takes part
-/// in the dedup (anything invalid), or a valid event.
-const EV_SKIP: u32 = 0;
+/// What an event line is: a copy that only takes part in the dedup (anything
+/// invalid), or a valid event.
 const EV_DEDUP: u32 = 1;
 const EV_VALID: u32 = 2;
 
-/// Parses the seven fields of an event line, in order, into `slot`. `dd` is
-/// complete for EV_DEDUP and EV_VALID; the rest only matters for EV_VALID.
+/// Parses the fields of an event line after its event id `f0` (not empty),
+/// in order, into `slot`. `dd` is complete for EV_DEDUP and EV_VALID; the
+/// rest only matters for EV_VALID.
 #[inline(always)]
-unsafe fn event_fields<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &LinkMap, src: &mut S, slot: *mut EvSlot) -> u32 {
-    // event_id
-    let f0 = src.lo();
-    if f0.is_empty() {
-        return EV_SKIP;
-    }
+unsafe fn event_tail<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &LinkMap, f0: &[u8], src: &mut S, slot: *mut EvSlot) -> u32 {
     let (fp, fp2) = eid_fp(&key_of(f0));
     (*slot).dd.fp = fp;
     // user_id
@@ -2366,6 +2588,88 @@ unsafe fn event_fields<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &Li
     }
 }
 
+/// The same for an event with sequence number `n`: one record (two for a
+/// purchase) to its number's partition, nothing looked up.
+#[inline(always)]
+unsafe fn event_ix<'a, S: Fields<'a>>(ctx: &Ctx, ix: &IxCfg, dc: &mut DateCache, n: u64, src: &mut S, o: &mut P1Work) {
+    let part = (n >> ix.shift) as usize;
+    let f1 = src.lo();
+    let mut ok = !f1.is_empty();
+    let f2 = src.lo();
+    let ts = match parse_ts_dc(dc, f2) {
+        Some(t) if t >= ctx.ws && t < ctx.we => t,
+        _ => {
+            ok = false;
+            ctx.ws
+        }
+    };
+    let f3 = src.hi();
+    let (ingest_s, ingest_ms) = parse_ingest_dc(dc, f3).unwrap_or((i64::MAX / 2000, i64::MAX / 2));
+    let ingest = (ingest_s - ctx.ingest_base_s).clamp(0, 0xFF_FFFF) as u64;
+    ok &= ingest_ms - ts <= DAY;
+    let ty = event_type(src.hi());
+    let f5 = src.hi();
+    ok &= !f5.is_empty();
+    let f6 = src.hi();
+    let mut pc = (0u32, 0u32);
+    if ty == T_PURCHASE {
+        match parse_price(f6) {
+            Some(p) if ok => pc = (p, ctx.products.get(&key_of(f5)).unwrap_or(ctx.unknown_cat)),
+            _ => ok = false,
+        }
+    } else {
+        ok &= ty < T_PURCHASE;
+    }
+    let a = (n & ix.mask) | (ingest << 16);
+    if !ok {
+        // takes part in the dedup only
+        o.ix.push(part, RecX { a, b: 0 });
+        return;
+    }
+    let (user, odd) = match id_number(b'u', f1) {
+        Some(v) => (v, 0),
+        None => {
+            let list = o.ixodd.get_unchecked_mut(part);
+            list.push(key_of(f1));
+            ((list.len() - 1) as u64, X_ODD)
+        }
+    };
+    let purchase = if ty == T_PURCHASE { X_PURCHASE } else { 0 };
+    let b = (user & 0xFFFF) | (((ts - ctx.ws) as u64) << 16) | purchase | X_VALID | odd;
+    o.ix.push(part, RecX { a: a | ((user >> 16) << 40), b });
+    if purchase != 0 {
+        o.ix.push(part, RecX { a: pc.0 as u64 | (pc.1 as u64) << 32, b: 0 });
+    }
+}
+
+/// One event line: by sequence number if its id has one, else the general way.
+#[inline(always)]
+unsafe fn event_line<'a, S: Fields<'a>>(
+    ctx: &Ctx,
+    ix: &IxCfg,
+    dc: &mut DateCache,
+    lm: &LinkMap,
+    src: &mut S,
+    q: &mut EvQueue,
+    o: &mut P1Work,
+) {
+    let f0 = src.lo();
+    if f0.is_empty() {
+        return;
+    }
+    if ix.on {
+        if let Some(v) = id_number(b'e', f0) {
+            let n = seq_of(v, ix.key);
+            if n < ix.imax {
+                event_ix(ctx, ix, dc, n, src, o);
+                return;
+            }
+        }
+    }
+    let kind = event_tail(ctx, dc, lm, f0, src, q.slot);
+    event_commit(q, kind, lm, o);
+}
+
 type EvQueue = BatchQueue<EvSlot>;
 
 const EV_EMPTY: EvSlot = EvSlot { person: ZERO, h: 0, dd: RecD { fp: 0, b: 0 }, ts: 0, purchase: 0, pc: (0, 0), linked: false };
@@ -2386,16 +2690,16 @@ fn event_commit(q: &mut EvQueue, kind: u32, lm: &LinkMap, o: &mut P1Work) {
 /// A line that did not fit the scanner's windows: reference scanner.
 #[cold]
 #[inline(never)]
-fn event_slow(ctx: &Ctx, buf: &[u8], ls: usize, dc: &mut DateCache, lm: &LinkMap, q: &mut EvQueue, o: &mut P1Work) -> usize {
+#[allow(clippy::too_many_arguments)]
+fn event_slow(ctx: &Ctx, ix: &IxCfg, buf: &[u8], ls: usize, dc: &mut DateCache, lm: &LinkMap, q: &mut EvQueue, o: &mut P1Work) -> usize {
     let (end, res) = slow_line::<7>(buf, ls);
     if let Some(f) = res {
-        let kind = unsafe { event_fields(ctx, dc, lm, &mut ArrFields { f: &f, i: 0 }, q.slot) };
-        event_commit(q, kind, lm, o);
+        unsafe { event_line(ctx, ix, dc, lm, &mut ArrFields { f: &f, i: 0 }, q, o) };
     }
     end + 1
 }
 
-fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, o: &mut P1Work) {
+fn parse_events(ctx: &Ctx, ix: &IxCfg, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, o: &mut P1Work) {
     let n = buf.len();
     if begin >= n {
         return;
@@ -2411,12 +2715,11 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
         // (see scan_lean)
         prefetch(p.wrapping_add(INPUT_AHEAD));
         match unsafe { line_cursors::<7, 3>(p) } {
-            Line::Slow => ls = event_slow(ctx, buf, ls, &mut dc, lm, &mut q, o),
+            Line::Slow => ls = event_slow(ctx, ix, buf, ls, &mut dc, lm, &mut q, o),
             Line::Bad(e) => ls += e + 1,
             Line::Good(c) => {
                 ls += c.e + 1;
-                let kind = unsafe { event_fields(ctx, &mut dc, lm, &mut MaskFields::new(p, &c), q.slot) };
-                event_commit(&mut q, kind, lm, o);
+                unsafe { event_line(ctx, ix, &mut dc, lm, &mut MaskFields::new(p, &c), &mut q, o) };
             }
         }
     }
@@ -3086,6 +3389,46 @@ fn main() {
         eprintln!("  partitions: {pa} x {pc} (estimated {est_events} events)");
     }
     let (res_dd, res_pay, res_cl) = (per(est_events, pa), per(est_events, pc), per(est_clicks, pc));
+    // --- sequence numbers of generated event ids (see IxCfg): the key is
+    // searched with the ids of the first lines of the biggest events file
+    let ix = {
+        let mut cfg = IxCfg { on: false, key: 0, shift: 0, mask: 0, parts: 1, imax: 0 };
+        let biggest = files.iter().filter(|f| f.kind == Kind::Event && !f.map.is_null()).max_by_key(|f| f.len);
+        if let (Some(f), true) = (biggest, std::env::var_os("SS_NO_SEQ").is_none()) {
+            let head = unsafe { std::slice::from_raw_parts(f.map, (f.len as usize).min(96 << 10)) };
+            if let Some(last) = head.iter().rposition(|&b| b == b'\n') {
+                let text = pad_buffer(head[..last + 1].to_vec());
+                let begin = find_byte(&text, 0, b'\n') + 1;
+                let mut sample: Vec<u64> = Vec::new();
+                scan_lines::<7, _>(&text, begin, text.len(), |fl| {
+                    if sample.len() < 48 {
+                        if let Some(v) = id_number(b'e', fl[0]) {
+                            sample.push(v);
+                        }
+                    }
+                });
+                let bound = (est_events as u64).max(1 << 12);
+                if let Some(key) = find_seq_key(&sample, bound, nthreads) {
+                    // partitions of 2^shift numbers, about 2500 of them at most
+                    let mut shift = 12;
+                    while (bound >> shift) > 2560 && shift < 16 {
+                        shift += 1;
+                    }
+                    let parts = (((bound >> shift) + 1) as usize).min(8192);
+                    cfg = IxCfg { on: true, key, shift, mask: (1 << shift) - 1, parts, imax: (parts as u64) << shift };
+                }
+            }
+        }
+        cfg
+    };
+    if verbose {
+        eprintln!("  sequence numbers: on={} key={:x} parts={} x {}", ix.on, ix.key, ix.parts, 1u64 << ix.shift);
+    }
+    // a partition of numbers is dense: 2^shift events, their few extra copies
+    // and the purchases' second records, spread over the threads
+    let res_ix = if ix.on { ((1usize << ix.shift) * 9 / 8 / nthreads) * 4 / 3 + 64 } else { 4 };
+    // with sequence numbers the general path is for the odd rows only
+    let (res_dd, res_pay1) = if ix.on { (res_dd / 8 + 64, res_pay / 8 + 64) } else { (res_dd, res_pay) };
     lap("chunks");
 
     // --- phase 1: links (all threads build the link map together), then
@@ -3180,12 +3523,20 @@ fn main() {
         }
         let ctx = ctx_cell.get_or_init(&build_ctx);
         let mut o = P1Work {
+            ix: Parts::new(ix.parts, res_ix),
+            ixodd: (0..ix.parts).map(|_| PVec::with_capacity(16)).collect(),
             dd: Parts::new(pa, res_dd),
-            pay: Parts::new(pc, res_pay),
-            pur: (0..pc).map(|_| PVec::with_capacity(res_pay / 24 + 16)).collect(),
+            pay: Parts::new(pc, res_pay1),
+            pur: (0..pc).map(|_| PVec::with_capacity(res_pay1 / 24 + 16)).collect(),
             pesc: (0..pc).map(|_| PVec::with_capacity(16)).collect(),
             clq: Parts::new(pc, res_cl),
             cesc: (0..pc).map(|_| PVec::with_capacity(16)).collect(),
+        };
+        // (the buffers of a Parts are allocated one after the other)
+        let ix_region = {
+            let first = o.ix.out[0].ptr as usize;
+            let last = o.ix.out[ix.parts - 1].ptr as usize + o.ix.out[ix.parts - 1].cap * std::mem::size_of::<RecX>();
+            (first, last)
         };
         // the dedup buffers were allocated first, contiguously; they are dead
         // after phase 2a and phase 3 reuses that memory
@@ -3203,7 +3554,7 @@ fn main() {
             let c = &chunks[data_chunks[i]];
             let (bytes, b, l) = chunk_bytes(&files[c.file], c, &mut buf);
             match c.kind {
-                Kind::Event => parse_events(ctx, bytes, b, l, lm, &mut o),
+                Kind::Event => parse_events(ctx, &ix, bytes, b, l, lm, &mut o),
                 Kind::Click => parse_clicks(ctx, bytes, b, l, lm, &mut o.clq, &mut o.cesc),
                 Kind::Link => unreachable!(),
             }
@@ -3220,6 +3571,9 @@ fn main() {
             pesc: o.pesc,
             clq: o.clq.finish(),
             cesc: o.cesc,
+            ix_region,
+            ix: o.ix.finish(),
+            ixodd: o.ixodd,
         };
         if verbose {
             eprintln!("  p1 w{w} done at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
@@ -3275,7 +3629,7 @@ fn main() {
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= pa {
-                let j = next_lm.fetch_add(1, Ordering::Relaxed);
+                let j = if ix.on { lm_slices } else { next_lm.fetch_add(1, Ordering::Relaxed) };
                 if j < lm_slices {
                     let n = (1usize << 16).min(linkmap.size() - (j << 16));
                     release(unsafe { linkmap.slots.add(j << 16) } as *const u8, n * std::mem::size_of::<Slot>());
@@ -3364,9 +3718,129 @@ fn main() {
         release_vec(&table);
     });
     lap("phase 2a dedup");
-    for (w, o) in p1.iter().enumerate() {
-        recycle(w, o.dd_region.0, o.dd_region.1);
+
+    // --- phase 2b: events with a sequence number. Per partition of numbers:
+    // a table indexed by the number keeps the copy with the smallest ingest
+    // time; then, in number order, the valid ones go to their person's
+    // partition. (Numbers follow users, so the link map is read user by user.)
+    struct PbOut {
+        pay: Vec<PVec<RecP>>,
+        pur: Vec<PVec<(u32, u32)>>,
+        pesc: Vec<PVec<Key>>,
     }
+    let next_ix = AtomicUsize::new(0);
+    let pb_barrier = std::sync::Barrier::new(nthreads);
+    let pb: Vec<PbOut> = if ix.on {
+        run_workers(nthreads, |_| {
+            let mut pay: Parts<RecP, 4> = Parts::new(pc, res_pay);
+            let mut pur: Vec<PVec<(u32, u32)>> = (0..pc).map(|_| PVec::with_capacity(res_pay / 24 + 16)).collect();
+            let mut pesc: Vec<PVec<Key>> = (0..pc).map(|_| PVec::with_capacity(16)).collect();
+            let mut table = vec![u64::MAX; 1usize << ix.shift];
+            let pc_shift = 64 - pc_bits();
+            // users resolved lately: (number, person, person's hash), by the number's low bits
+            const UC: usize = 256;
+            let mut cache = [(u64::MAX, ZERO, 0u64); UC];
+            loop {
+                let i = next_ix.fetch_add(1, Ordering::Relaxed);
+                if i >= ix.parts {
+                    break;
+                }
+                // entry: ingest << 40 | worker << 32 | position; the smallest wins
+                let mut any = false;
+                for (w, o) in p1.iter().enumerate() {
+                    let recs = o.ix[i].as_slice();
+                    let mut pos = 0;
+                    while pos < recs.len() {
+                        let r = unsafe { recs.get_unchecked(pos) };
+                        let cand = (r.ingest() << 40) | ((w as u64) << 32) | pos as u64;
+                        let e = unsafe { table.get_unchecked_mut(r.slot()) };
+                        if cand < *e {
+                            *e = cand;
+                        }
+                        pos += 1 + (r.b & X_PURCHASE != 0) as usize;
+                        any = true;
+                    }
+                }
+                if !any {
+                    continue;
+                }
+                for e in table.iter_mut() {
+                    let c = std::mem::replace(e, u64::MAX);
+                    if c == u64::MAX {
+                        continue;
+                    }
+                    let (w, pos) = ((c >> 32) as usize & 0xFF, c as u32 as usize);
+                    let src = unsafe { p1.get_unchecked(w) };
+                    let recs = src.ix[i].as_slice();
+                    let r = unsafe { *recs.get_unchecked(pos) };
+                    if r.b & X_VALID == 0 {
+                        continue;
+                    }
+                    let user = r.user();
+                    let (person, ph) = if r.b & X_ODD != 0 {
+                        let key = src.ixodd[i].as_slice()[user as usize];
+                        let h = hk(&key);
+                        if linkmap.maybe_linked(h) {
+                            let p = linkmap.person(&key, h);
+                            (p, hk(&p))
+                        } else {
+                            (key, h)
+                        }
+                    } else {
+                        let ce = unsafe { cache.get_unchecked_mut(user as usize % UC) };
+                        if ce.0 != user {
+                            let key = id_key(b'u', user);
+                            let h = hk(&key);
+                            *ce = if linkmap.maybe_linked(h) {
+                                let p = linkmap.person(&key, h);
+                                (user, p, hk(&p))
+                            } else {
+                                (user, key, h)
+                            };
+                        }
+                        (ce.1, ce.2)
+                    };
+                    let q = (ph >> pc_shift) as usize;
+                    let purchase = (r.b & X_PURCHASE != 0) as u32;
+                    if purchase != 0 {
+                        let x = unsafe { recs.get_unchecked(pos + 1) };
+                        unsafe { pur.get_unchecked_mut(q) }.push((x.a as u32, (x.a >> 32) as u32));
+                    }
+                    let rec = RecP { p: compact(&person, unsafe { pesc.get_unchecked_mut(q) }), t: r.ts() | (purchase << 31) };
+                    pay.push(q, rec);
+                }
+            }
+            // nobody reads the link map any more: free it, a slice each
+            pb_barrier.wait();
+            loop {
+                let j = next_lm.fetch_add(1, Ordering::Relaxed);
+                if j >= lm_slices {
+                    break;
+                }
+                let n = (1usize << 16).min(linkmap.size() - (j << 16));
+                release(unsafe { linkmap.slots.add(j << 16) } as *const u8, n * std::mem::size_of::<Slot>());
+            }
+            PbOut { pay: pay.finish(), pur, pesc }
+        })
+    } else {
+        Vec::new()
+    };
+    lap("phase 2b sequence numbers");
+    // phase 3 reuses memory that is dead now
+    for (w, o) in p1.iter().enumerate() {
+        if ix.on {
+            recycle(w, o.ix_region.0, o.ix_region.1);
+        } else {
+            recycle(w, o.dd_region.0, o.dd_region.1);
+        }
+    }
+    // the payloads of every person partition: from phase 1, then from phase 2b
+    type PaySrc<'a> = (&'a [PVec<RecP>], &'a [PVec<(u32, u32)>], &'a [PVec<Key>]);
+    let pay_srcs: Vec<PaySrc> = p1
+        .iter()
+        .map(|o| (&o.pay[..], &o.pur[..], &o.pesc[..]))
+        .chain(pb.iter().map(|o| (&o.pay[..], &o.pur[..], &o.pesc[..])))
+        .collect();
 
 
     // --- phase 3: sessionize per person partition
@@ -3380,7 +3854,7 @@ fn main() {
     let _ = fs::create_dir_all(out.join("campaign_daily"));
     // biggest partitions first for load balance
     let mut order: Vec<(usize, usize)> = (0..pc)
-        .map(|q| (p1.iter().map(|o| o.pay[q].len()).sum::<usize>(), q))
+        .map(|q| (pay_srcs.iter().map(|o| o.0[q].len()).sum::<usize>(), q))
         .collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let max_part = order[0].0;
@@ -3446,11 +3920,11 @@ fn main() {
             evs.clear();
             pids.clear();
             lpur.clear();
-            for o in p1.iter() {
-                let side = o.pur[q].as_slice();
-                let esc = o.pesc[q].as_slice();
+            for o in pay_srcs.iter() {
+                let side = o.1[q].as_slice();
+                let esc = o.2[q].as_slice();
                 let mut pk = 0usize;
-                for e in o.pay[q].as_slice() {
+                for e in o.0[q].as_slice() {
                     let purchase = e.t >> 31;
                     let ts = e.t & TS_DEAD;
                     if ts == TS_DEAD {
