@@ -1103,7 +1103,6 @@ fn scan_lean<'a, const N: usize, const K: usize, F: FnMut(&[&'a [u8]; N])>(buf: 
     debug_assert!(K >= 1 && K < N);
     let ptr = buf.as_ptr();
     let mut ls = begin;
-    let mut fields: [&'a [u8]; N] = [&[]; N];
     while ls < limit && ls < n {
         let p = unsafe { ptr.add(ls) };
         let (sep, nl, qt) = unsafe { win_masks(p) };
@@ -1149,6 +1148,7 @@ fn scan_lean<'a, const N: usize, const K: usize, F: FnMut(&[&'a [u8]; N])>(buf: 
         // well-formed: quotes only around whole fields, and the N-th separator is the newline
         if (bad_lo | bad_hi) == 0 && r + t1.trailing_zeros() as usize == e {
             // first and one-past-last content byte of each field (inside the quotes)
+            let mut fields: [&'a [u8]; N] = [&[]; N];
             let (mut cs, mut ce) = (starts + o, seps - c);
             unsafe {
                 for i in 0..K {
@@ -2003,7 +2003,7 @@ struct P1Out {
 fn parse_links(buf: &[u8], begin: usize, limit: usize) -> Vec<(Key, Key)> {
     // a link line is rarely shorter than 16 bytes
     let mut out = Vec::with_capacity(limit.min(buf.len()).saturating_sub(begin) / 16 + 16);
-    scan_lean::<2, 1, _>(buf, begin, limit, |f| {
+    scan_lean::<2, 1, _>(buf, begin, limit, #[inline(always)] |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
@@ -2081,7 +2081,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
     let mut bs = [empty, empty];
     let mut cur = 0usize;
     let mut dc = DateCache::new();
-    scan_lean::<7, 3, _>(buf, begin, limit, |f| {
+    scan_lean::<7, 3, _>(buf, begin, limit, #[inline(always)] |f| {
         if f[0].is_empty() {
             return;
         }
@@ -2185,7 +2185,7 @@ fn parse_clicks(
         b.n = 0;
     };
     let mut dc = DateCache::new();
-    scan_lean::<4, 2, _>(buf, begin, limit, |f| {
+    scan_lean::<4, 2, _>(buf, begin, limit, #[inline(always)] |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
