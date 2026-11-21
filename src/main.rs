@@ -3530,9 +3530,13 @@ fn main() {
                 });
                 let bound = (est_events as u64).max(1 << 12);
                 if let Some(key) = find_seq_key(&sample, bound, nthreads) {
-                    // partitions of 2^shift numbers, about 2500 of them at most
-                    let mut shift = 12;
-                    while (bound >> shift) > 2560 && shift < 16 {
+                    // Partitions of 2^14 numbers while that makes at most about
+                    // 4400 of them. Measured on the scorer at 20M events: 2^12
+                    // to 2^14 numbers per partition are equally fast, 2^15
+                    // costs 1% and 2^16 3% (in the sequence phase), and phase 1
+                    // is as fast with 5800 partitions as with 360.
+                    let mut shift = 14;
+                    while (bound >> shift) > 4400 && shift < 16 {
                         shift += 1;
                     }
                     let parts = (((bound >> shift) + 1) as usize).min(8192);
