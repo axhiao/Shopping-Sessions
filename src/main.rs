@@ -15,10 +15,19 @@ use std::time::Instant;
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 604_800_000;
-const PA_BITS: u32 = 10; // event-id partitions
-const PA: usize = 1 << PA_BITS;
-const PC_BITS: u32 = 10; // person partitions
-const PC: usize = 1 << PC_BITS;
+// Partition counts (log2), chosen at startup from the input size: event-id
+// partitions for dedup, person partitions for sessions.
+static PA_BITS_V: AtomicU32 = AtomicU32::new(10);
+static PC_BITS_V: AtomicU32 = AtomicU32::new(10);
+#[inline(always)]
+fn pa_bits() -> u32 {
+    PA_BITS_V.load(Ordering::Relaxed)
+}
+#[inline(always)]
+fn pc_bits() -> u32 {
+    PC_BITS_V.load(Ordering::Relaxed)
+}
+const MAX_PC_BITS: u32 = 10;
 const CHUNK: u64 = 4 << 20;
 const PAD: usize = 128;
 
@@ -40,7 +49,7 @@ fn zeroed_vec<T>(n: usize) -> Vec<T> {
         assert!(!p.is_null());
         let start = (p as usize + (2 << 20) - 1) & !((2 << 20) - 1);
         let end = (p as usize + layout.size()) & !((2 << 20) - 1);
-        if end > start {
+        if end > start && !exp(1 << 18) {
             madvise(start as *mut _, end - start, 14 /* MADV_HUGEPAGE */);
         }
         Vec::from_raw_parts(p, n, n)
@@ -419,9 +428,6 @@ impl LinkMap {
             filter: zeroed_vec(1 << (FILTER_BITS - 6)),
         }
     }
-    fn empty() -> LinkMap {
-        LinkMap::with_pairs(0)
-    }
     fn size(&self) -> usize {
         self.mask + 1
     }
@@ -438,6 +444,11 @@ impl LinkMap {
         let i = self.slot_of(h);
         prefetch(unsafe { self.slots.add(i) });
         prefetch(unsafe { self.slots.add((i + 2) & self.mask) });
+    }
+    #[inline(always)]
+    fn prefetch_filter(&self, h: u64) {
+        let b = h >> (64 - FILTER_BITS);
+        prefetch(unsafe { self.filter.as_ptr().add((b >> 6) as usize) });
     }
     /// False when user hash `h` surely maps to itself.
     #[inline(always)]
@@ -459,20 +470,6 @@ impl LinkMap {
                 return *k;
             }
             i = (i + 1) & self.mask;
-        }
-    }
-    /// Resolves persons for a slice of users in place, with prefetching.
-    fn resolve(&self, keys: &mut [Key]) {
-        const B: usize = 16;
-        let mut hs = [0u64; B];
-        for chunk in keys.chunks_mut(B) {
-            for (j, k) in chunk.iter().enumerate() {
-                hs[j] = hk(k);
-                self.prefetch(hs[j]);
-            }
-            for (j, k) in chunk.iter_mut().enumerate() {
-                *k = self.person(k, hs[j]);
-            }
         }
     }
 
@@ -915,10 +912,6 @@ fn eight_digits(v: u64) -> u64 {
     v.wrapping_mul(10000).wrapping_add(v >> 32) & 0xFFFF_FFFF
 }
 
-#[inline(always)]
-fn lane(v: u64, i: u32) -> i64 {
-    ((v >> (8 * i)) & 0xFF) as i64 - b'0' as i64
-}
 
 /// Days since 1970-01-01 for a valid proleptic Gregorian date, y in 0..=9999.
 #[inline(always)]
@@ -1106,7 +1099,7 @@ struct RecD {
 
 const HAS_PAY: u64 = 1 << 31;
 const IDX_BITS: u32 = 21;
-const _: () = assert!(PC_BITS + IDX_BITS <= 31);
+const _: () = assert!(MAX_PC_BITS + IDX_BITS <= 31);
 static IDX_OVERFLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl RecD {
@@ -1344,6 +1337,7 @@ fn parse_links(buf: &[u8], begin: usize, limit: usize) -> Vec<(Key, Key)> {
 
 const EB: usize = 16;
 
+#[derive(Clone, Copy)]
 struct EvBatch {
     n: usize,
     pay: [RecP; EB],
@@ -1353,6 +1347,19 @@ struct EvBatch {
     dd: [RecD; EB],
 }
 
+/// Pipeline stage 2: the filter words were prefetched while parsing; decide
+/// which users need a probe and prefetch their slots.
+#[inline(always)]
+fn stage2(b: &mut EvBatch, lm: &LinkMap) {
+    for j in 0..b.n {
+        let linked = lm.maybe_linked(b.h[j]);
+        if linked {
+            lm.prefetch(b.h[j]);
+        }
+        b.linked[j] = linked;
+    }
+}
+
 #[inline(always)]
 fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
     for j in 0..b.n {
@@ -1360,7 +1367,7 @@ fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
         if b.linked[j] {
             p.person = lm.person(&p.person, b.h[j]);
         }
-        let q = (hk(&p.person) >> (64 - PC_BITS)) as usize;
+        let q = (hk(&p.person) >> (64 - pc_bits())) as usize;
         if p.x != 0 {
             let side = unsafe { o.pur.get_unchecked_mut(q) };
             p.x = PURCHASE | side.len() as u32;
@@ -1378,7 +1385,7 @@ fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
             std::hint::black_box(&p);
         }
         if !exp(128) {
-            o.dd.push((d.fp >> (64 - PA_BITS)) as usize, d);
+            o.dd.push((d.fp >> (64 - pa_bits())) as usize, d);
         } else {
             std::hint::black_box(&d);
         }
@@ -1388,7 +1395,7 @@ fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
 
 fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, o: &mut P1Work) {
     let (ws, we) = (ctx.ws, ctx.we);
-    let mut b = EvBatch {
+    let empty = EvBatch {
         n: 0,
         pay: [RecP { person: ZERO, ts: 0, x: 0 }; EB],
         pc: [(0, 0); EB],
@@ -1396,6 +1403,9 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
         linked: [false; EB],
         dd: [RecD { fp: 0, b: 0 }; EB],
     };
+    // two batches: `bs[cur]` fills while `bs[cur ^ 1]` waits for its slots
+    let mut bs = [empty, empty];
+    let mut cur = 0usize;
     let stop_scan = exp(16);
     let stop_push = exp(32);
     let (x_nofp, x_noing, x_nots, x_nolm) = (exp(1 << 15), exp(1 << 16), exp(1 << 17), exp(64));
@@ -1411,7 +1421,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
         let ingest_ms = if x_noing { 1_800_000_000_000 } else { parse_ingest(f[3]).unwrap_or(i64::MAX / 2) };
         let ingest = (ingest_ms.div_euclid(1000) - ctx.ingest_base_s).clamp(0, 0xFF_FFFF) as u64;
         let d = RecD { fp, b: ((fp2 as u64) << 56) | (ingest << 32) };
-        let part = (fp >> (64 - PA_BITS)) as usize;
+        let part = (fp >> (64 - pa_bits())) as usize;
         'v: {
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
@@ -1439,25 +1449,28 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
                 std::hint::black_box((&p, &d));
                 return;
             }
-            let h = hk(&user);
-            let linked = !x_nolm && lm.maybe_linked(h);
-            if linked {
-                lm.prefetch(h);
-            }
-            b.linked[b.n] = linked;
+            let h = if x_nolm { 0 } else { hk(&user) };
+            lm.prefetch_filter(h);
+            let b = &mut bs[cur];
             b.pay[b.n] = p;
             b.pc[b.n] = (price, cat);
             b.h[b.n] = h;
             b.dd[b.n] = d;
             b.n += 1;
             if b.n == EB {
-                flush_batch(&mut b, lm, o);
+                stage2(b, lm);
+                let [b0, b1] = &mut bs;
+                let prev = if cur == 0 { b1 } else { b0 };
+                flush_batch(prev, lm, o);
+                cur ^= 1;
             }
             return;
         }
         o.dd.push(part, d);
     });
-    flush_batch(&mut b, lm, o);
+    stage2(&mut bs[cur], lm);
+    flush_batch(&mut bs[cur ^ 1], lm, o);
+    flush_batch(&mut bs[cur], lm, o);
 }
 
 fn parse_clicks(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, clq: &mut Parts<RecC, 8>) {
@@ -1472,7 +1485,7 @@ fn parse_clicks(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
             if lm.maybe_linked(h) {
                 r.user = lm.person(&r.user, h);
             }
-            let q = (hk(&r.user) >> (64 - PC_BITS)) as usize;
+            let q = (hk(&r.user) >> (64 - pc_bits())) as usize;
             clq.push(q, r);
         }
     };
@@ -1871,7 +1884,15 @@ fn main() {
     let est_events = (bytes_of(Kind::Event) / 70) as usize;
     let est_clicks = (bytes_of(Kind::Click) / 40) as usize;
     let per = |n: usize, parts: usize| n / parts / nthreads + n / parts / nthreads / 3 + 64;
-    let (res_dd, res_pay, res_cl) = (per(est_events, PA), per(est_events, PC), per(est_clicks, PC));
+    // about 40k events per partition, between 256 and 1024 partitions
+    let bits = ((est_events / 40_000).max(1) as f64).log2().round().clamp(8.0, MAX_PC_BITS as f64) as u32;
+    PA_BITS_V.store(bits, Ordering::Relaxed);
+    PC_BITS_V.store(bits, Ordering::Relaxed);
+    let (pa, pc) = (1usize << bits, 1usize << bits);
+    if verbose {
+        eprintln!("  partitions: {pa} x {pc} (estimated {est_events} events)");
+    }
+    let (res_dd, res_pay, res_cl) = (per(est_events, pa), per(est_events, pc), per(est_clicks, pc));
     lap("chunks");
 
     // --- phase 1: links (all threads build the link map together), then
@@ -1941,10 +1962,10 @@ fn main() {
             eprintln!("{:>8.1} ms  link map built ({} pairs)", t0.elapsed().as_secs_f64() * 1e3, total_pairs.load(Ordering::Relaxed));
         }
         let mut o = P1Work {
-            dd: Parts::new(PA, res_dd),
-            pay: Parts::new(PC, res_pay),
-            pur: (0..PC).map(|_| PVec::with_capacity(res_pay / 24 + 16)).collect(),
-            clq: Parts::new(PC, res_cl),
+            dd: Parts::new(pa, res_dd),
+            pay: Parts::new(pc, res_pay),
+            pur: (0..pc).map(|_| PVec::with_capacity(res_pay / 24 + 16)).collect(),
+            clq: Parts::new(pc, res_cl),
         };
 
         loop {
@@ -1989,7 +2010,7 @@ fn main() {
         if b & HAS_PAY == 0 {
             return;
         }
-        let q = ((b >> IDX_BITS) as usize) & (PC - 1);
+        let q = ((b >> IDX_BITS) as usize) & (pc - 1);
         let i = (b as usize) & ((1 << IDX_BITS) - 1);
         unsafe { (*p1[w].pay[q].ptr.add(i)).ts = DEAD };
     };
@@ -2002,7 +2023,7 @@ fn main() {
         let mut table: Vec<u64> = Vec::new();
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= PA {
+            if i >= pa {
                 let j = next_lm.fetch_add(1, Ordering::Relaxed);
                 if j < lm_slices {
                     let n = (1usize << 16).min(linkmap.size() - (j << 16));
@@ -2066,14 +2087,14 @@ fn main() {
     let _ = fs::create_dir_all(out.join("user_daily"));
     let _ = fs::create_dir_all(out.join("campaign_daily"));
     // biggest partitions first for load balance
-    let mut order: Vec<(usize, usize)> = (0..PC)
+    let mut order: Vec<(usize, usize)> = (0..pc)
         .map(|q| (p1.iter().map(|o| o.pay[q].len()).sum::<usize>(), q))
         .collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let total_pay: usize = order.iter().map(|o| o.0).sum();
     let est_rows = total_pay / 7 / nthreads + 1024;
     let max_part = order[0].0;
-    let max_clicks = (0..PC).map(|q| p1.iter().map(|o| o.clq[q].len()).sum::<usize>()).max().unwrap_or(0);
+    let max_clicks = (0..pc).map(|q| p1.iter().map(|o| o.clq[q].len()).sum::<usize>()).max().unwrap_or(0);
     let next = AtomicUsize::new(0);
     let aggs: Vec<Vec<[u64; 4]>> = run_workers(nthreads, |w| {
         let mut st = P3 {
@@ -2098,7 +2119,7 @@ fn main() {
         let mut start: Vec<u32> = Vec::new();
         let mut cstart: Vec<u32> = Vec::new();
         let mut fill: Vec<u32> = Vec::new();
-        let mut tm = [0f64; 6];
+        let mut tm = [0f64; 7];
         let mut tt = Instant::now();
         macro_rules! tick {
             ($i:expr) => {
@@ -2111,7 +2132,7 @@ fn main() {
         }
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= PC {
+            if i >= pc {
                 break;
             }
             let (ne, q) = order[i];
@@ -2203,6 +2224,11 @@ fn main() {
                 if cl.len() > 1 {
                     cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| cmp_key(&b.cid, &a.cid)));
                 }
+            }
+            tick!(6);
+            for p in 0..np {
+                let ev = &sorted[start[p] as usize..start[p + 1] as usize];
+                let cl = &csorted[cstart[p] as usize..cstart[p + 1] as usize];
                 process_person(&geo, &mut st, lid.persons[p], ev, &lpur, cl);
             }
             tick!(3);
@@ -2252,8 +2278,8 @@ fn main() {
         if verbose {
             let e = tt.elapsed().as_secs_f64();
             eprintln!(
-                "  p3 w{w}: gather {:.0} sortp {:.0} clicks {:.0} sess {:.0} release {:.0} idle {:.0} write {:.0} ms",
-                tm[0] * 1e3, tm[1] * 1e3, tm[2] * 1e3, tm[3] * 1e3, tm[4] * 1e3, tm[5] * 1e3, e * 1e3
+                "  p3 w{w}: gather {:.0} sortp {:.0} clicks {:.0} sort {:.0} sess {:.0} release {:.0} idle {:.0} write {:.0} ms",
+                tm[0] * 1e3, tm[1] * 1e3, tm[2] * 1e3, tm[6] * 1e3, tm[3] * 1e3, tm[4] * 1e3, tm[5] * 1e3, e * 1e3
             );
         }
         for d in 0..ndays {
