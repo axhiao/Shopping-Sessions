@@ -1507,10 +1507,12 @@ fn stage2(b: &mut EvBatch, lm: &LinkMap) {
 fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
     for j in 0..b.n {
         let mut p = b.pay[j];
+        let mut ph = b.h[j];
         if b.linked[j] {
-            p.person = lm.person(&p.person, b.h[j]);
+            p.person = lm.person(&p.person, ph);
+            ph = hk(&p.person);
         }
-        let q = (hk(&p.person) >> (64 - pc_bits())) as usize;
+        let q = (ph >> (64 - pc_bits())) as usize;
         if p.purchase {
             unsafe { o.pur.get_unchecked_mut(q) }.push(b.pc[j]);
         }
@@ -1613,10 +1615,12 @@ fn parse_clicks(
     let flush = |batch: &[RecC], hs: &[u64], clq: &mut Parts<RecCc, 2>, cesc: &mut [PVec<Key>]| {
         for (r, &h) in batch.iter().zip(hs) {
             let mut r = *r;
+            let mut ph = h;
             if lm.maybe_linked(h) {
                 r.user = lm.person(&r.user, h);
+                ph = hk(&r.user);
             }
-            let q = (hk(&r.user) >> (64 - pc_bits())) as usize;
+            let q = (ph >> (64 - pc_bits())) as usize;
             let esc = unsafe { cesc.get_unchecked_mut(q) };
             let rec = RecCc { p: compact(&r.user, esc), c: compact(&r.cid, esc), ts: r.ts, camp: r.camp };
             clq.push(q, rec);
