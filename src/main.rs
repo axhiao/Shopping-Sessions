@@ -66,23 +66,28 @@ struct Arena {
     used: Vec<AtomicUsize>,
 }
 
-const SUBS: usize = 33; // up to 32 workers + the main thread
+/// Sub-arenas: one per worker, the last one for the main thread. Set before
+/// the first allocation.
+static SUBS: AtomicUsize = AtomicUsize::new(33);
 
 static ARENA: OnceLock<Arena> = OnceLock::new();
 
 thread_local! {
-    static SUB: std::cell::Cell<usize> = const { std::cell::Cell::new(SUBS - 1) };
+    static SUB: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
 fn arena() -> &'static Arena {
     ARENA.get_or_init(|| {
-        for gb in [256usize, 128, 64, 32] {
+        let subs = SUBS.load(Ordering::Relaxed);
+        // Untouched pages cost nothing; reserve generously, smaller if the
+        // kernel refuses (strict overcommit).
+        for gb in [256usize, 128, 64, 32, 20, 16, 12, 8, 6, 4] {
             let cap = gb << 30;
             let p = unsafe { mmap(std::ptr::null_mut(), cap, 3, 0x02 | 0x20 | 0x4000, -1, 0) };
             if p as isize != -1 && !p.is_null() {
                 let base = (p as usize + (2 << 20) - 1) & !((2 << 20) - 1);
-                let sub = ((cap - (2 << 20)) / SUBS) & !4095;
-                return Arena { base, sub, used: (0..SUBS).map(|_| AtomicUsize::new(0)).collect() };
+                let sub = ((cap - (2 << 20)) / subs) & !4095;
+                return Arena { base, sub, used: (0..subs).map(|_| AtomicUsize::new(0)).collect() };
             }
         }
         panic!("cannot reserve arena");
@@ -92,7 +97,7 @@ fn arena() -> &'static Arena {
 #[inline]
 fn arena_alloc(bytes: usize) -> *mut u8 {
     let a = arena();
-    let s = SUB.with(|c| c.get());
+    let s = SUB.with(|c| c.get()).min(a.used.len() - 1);
     let bytes = (bytes + 63) & !63;
     let off = a.used[s].fetch_add(bytes, Ordering::Relaxed);
     assert!(off + bytes <= a.sub, "arena exhausted");
@@ -1777,6 +1782,7 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
         .clamp(1, 31);
+    SUBS.store(nthreads + 1, Ordering::Relaxed);
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     let lap = |what: &str| {
         if verbose {
