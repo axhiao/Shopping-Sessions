@@ -93,6 +93,10 @@ fn release(p: *const u8, len: usize) {
     }
 }
 
+fn release_vec<T>(v: &Vec<T>) {
+    release(v.as_ptr() as *const u8, v.capacity() * std::mem::size_of::<T>());
+}
+
 /// Growable buffer of Copy records in the arena.
 pub struct PVec<T: Copy> {
     ptr: *mut T,
@@ -122,6 +126,7 @@ impl<T: Copy> PVec<T> {
         let nc = self.cap * 2;
         let np = arena_alloc(nc * std::mem::size_of::<T>()) as *mut T;
         unsafe { std::ptr::copy_nonoverlapping(self.ptr, np, self.len) };
+        release(self.ptr as *const u8, self.cap * std::mem::size_of::<T>());
         self.ptr = np;
         self.cap = nc;
     }
@@ -1514,7 +1519,8 @@ struct URow {
 
 struct P3 {
     rows: PVec<URow>,
-    agg: Vec<[u64; 4]>, // (camp * ndays + day) -> sessions, purchasing, revenue, assisted
+    agg: Vec<[u64; 4]>, // (camp * ndays + day) -> sessions, purchasing, revenue, (unused)
+    assist: Vec<u32>,   // (day * (ncamp + 1) + camp) -> assisted sessions
     cnt: Vec<u32>,
     pos: Vec<u32>,
     active: Vec<u32>,
@@ -1577,8 +1583,9 @@ fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u
             a[0] += 1;
             a[1] += s_purch as u64;
             a[2] += s_rev;
+            let row = s_didx * (g.organic as usize + 1);
             for &c in &st.active {
-                st.agg[c as usize * ndays + s_didx][3] += 1;
+                unsafe { *st.assist.get_unchecked_mut(row + c as usize) += 1 };
             }
         }};
     }
@@ -1648,44 +1655,68 @@ fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u
 
 /// Per-partition local person table (generation-stamped, never cleared).
 struct LocalIds {
-    keys: Vec<Key>,
-    ids: Vec<u32>,
-    stamp: Vec<u32>,
+    slots: Vec<LSlot>,
     gen: u32,
     mask: usize,
     persons: Vec<Key>,
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct LSlot {
+    k: Key,
+    id: u32,
+    stamp: u32,
+}
+
 impl LocalIds {
     fn new() -> LocalIds {
-        LocalIds { keys: Vec::new(), ids: Vec::new(), stamp: Vec::new(), gen: 0, mask: 0, persons: Vec::new() }
+        LocalIds { slots: Vec::new(), gen: 0, mask: 0, persons: Vec::new() }
     }
+    /// Starts a new partition expecting about `n` persons.
     fn reset(&mut self, n: usize) {
-        let size = (n * 2).next_power_of_two().max(64);
-        if size > self.keys.len() {
-            self.keys = vec![ZERO; size];
-            self.ids = vec![0; size];
-            self.stamp = vec![0; size];
+        let size = (n * 2).next_power_of_two().max(256);
+        if size > self.slots.len() {
+            self.slots = vec![LSlot { k: ZERO, id: 0, stamp: 0 }; size];
             self.gen = 0;
         }
         self.mask = size - 1;
         self.gen += 1;
         self.persons.clear();
     }
+    #[cold]
+    fn grow(&mut self) {
+        let size = (self.mask + 1) * 2;
+        if size > self.slots.len() {
+            self.slots = vec![LSlot { k: ZERO, id: 0, stamp: 0 }; size];
+            self.gen = 0;
+        }
+        self.mask = size - 1;
+        self.gen += 1;
+        for (id, k) in self.persons.iter().enumerate() {
+            let mut i = (hk(k) >> 20) as usize & self.mask;
+            while self.slots[i].stamp == self.gen {
+                i = (i + 1) & self.mask;
+            }
+            self.slots[i] = LSlot { k: *k, id: id as u32, stamp: self.gen };
+        }
+    }
     #[inline(always)]
     fn intern(&mut self, k: &Key) -> u32 {
         let mut i = (hk(k) >> 20) as usize & self.mask;
         loop {
-            if self.stamp[i] != self.gen {
-                self.stamp[i] = self.gen;
-                self.keys[i] = *k;
+            let s = unsafe { self.slots.get_unchecked_mut(i) };
+            if s.stamp != self.gen {
                 let id = self.persons.len() as u32;
-                self.ids[i] = id;
+                *s = LSlot { k: *k, id, stamp: self.gen };
                 self.persons.push(*k);
+                if self.persons.len() * 2 > self.mask + 1 {
+                    self.grow();
+                }
                 return id;
             }
-            if self.keys[i] == *k {
-                return self.ids[i];
+            if s.k == *k {
+                return s.id;
             }
             i = (i + 1) & self.mask;
         }
@@ -1694,11 +1725,12 @@ impl LocalIds {
     fn get(&self, k: &Key) -> Option<u32> {
         let mut i = (hk(k) >> 20) as usize & self.mask;
         loop {
-            if self.stamp[i] != self.gen {
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s.stamp != self.gen {
                 return None;
             }
-            if self.keys[i] == *k {
-                return Some(self.ids[i]);
+            if s.k == *k {
+                return Some(s.id);
             }
             i = (i + 1) & self.mask;
         }
@@ -1961,6 +1993,9 @@ fn main() {
         let i = (b as usize) & ((1 << IDX_BITS) - 1);
         unsafe { (*p1[w].pay[q].ptr.add(i)).ts = DEAD };
     };
+    for v in all_pairs.get().unwrap() {
+        release_vec(v);
+    }
     let lm_slices = linkmap.size().div_ceil(1 << 16);
     let next_lm = AtomicUsize::new(0);
     run_workers(nthreads, |_| {
@@ -2018,6 +2053,7 @@ fn main() {
                 o.dd[i].release();
             }
         }
+        release_vec(&table);
     });
     lap("phase 2a dedup");
 
@@ -2043,6 +2079,7 @@ fn main() {
         let mut st = P3 {
             rows: PVec::with_capacity(est_rows),
             agg: vec![[0u64; 4]; (ncamp + 1) * ndays],
+            assist: vec![0; (ncamp + 1) * ndays],
             cnt: vec![0; ncamp + 1],
             pos: vec![0; ncamp + 1],
             active: Vec::new(),
@@ -2050,7 +2087,7 @@ fn main() {
             touched: Vec::new(),
         };
         let mut lid = LocalIds::new();
-        lid.reset(max_part);
+        lid.reset(max_part / 16);
         let mut evs: Vec<u64> = Vec::with_capacity(max_part);
         let mut sorted: Vec<u64> = Vec::with_capacity(max_part);
         let mut pids: Vec<u32> = Vec::with_capacity(max_part);
@@ -2082,7 +2119,7 @@ fn main() {
                 continue;
             }
             // gather live events: local person id + packed value
-            lid.reset(ne);
+            lid.reset(ne / 16);
             evs.clear();
             pids.clear();
             lpur.clear();
@@ -2202,12 +2239,12 @@ fn main() {
                 }
             }
             let tw = Instant::now();
-            let r = pq::write_file(
-                &out.join("user_daily").join(format!("part-{w:03}.parquet")),
-                &[c_user, c_day, c_ses, c_ev, c_rev, c_top],
-                n,
-            );
+            let cols = [c_user, c_day, c_ses, c_ev, c_rev, c_top];
+            let r = pq::write_file(&out.join("user_daily").join(format!("part-{w:03}.parquet")), &cols, n);
             r.expect("write user_daily");
+            for c in &cols {
+                c.release();
+            }
             if verbose {
                 eprintln!("  w{w} write_file {:.1} ms ({n} rows)", tw.elapsed().as_secs_f64() * 1e3);
             }
@@ -2219,6 +2256,19 @@ fn main() {
                 tm[0] * 1e3, tm[1] * 1e3, tm[2] * 1e3, tm[3] * 1e3, tm[4] * 1e3, tm[5] * 1e3, e * 1e3
             );
         }
+        for d in 0..ndays {
+            for c in 0..=ncamp {
+                st.agg[c * ndays + d][3] = st.assist[d * (ncamp + 1) + c] as u64;
+            }
+        }
+        st.rows.release();
+        release_vec(&evs);
+        release_vec(&sorted);
+        release_vec(&pids);
+        release_vec(&cls);
+        release_vec(&csorted);
+        release_vec(&cpid);
+        release_vec(&lid.slots);
         st.agg
     });
     lap("phase 3 sessions + user_daily");
@@ -2264,6 +2314,12 @@ fn main() {
     }
     pq::write_file(&out.join("campaign_daily").join("part-000.parquet"), &cols, n).expect("write campaign_daily");
     lap("done");
+    if verbose {
+        let st = fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for l in st.lines().filter(|l| l.starts_with("VmRSS") || l.starts_with("RssAnon") || l.starts_with("RssFile") || l.starts_with("VmPTE")) {
+            eprintln!("  {l}");
+        }
+    }
     // Skip freeing gigabytes of buffers: the kernel reclaims them at exit.
     std::process::exit(0);
 }
