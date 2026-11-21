@@ -335,6 +335,159 @@ fn io_tests(data: &Path, out: &Path, scratch: &Path, nt: usize) {
     }
 }
 
+/// Writes `copies` tagged copies of every CSV in `src/{events,clicks,links}` to
+/// `dst` (the first two fields of each line get a one-character tag, so IDs
+/// stay unique per copy): a data set `copies` times the size, same shape.
+fn synthesize(src: &Path, dst: &Path, copies: usize, nt: usize) -> u64 {
+    let _ = fs::remove_dir_all(dst);
+    for d in ["events", "clicks", "links"] {
+        fs::create_dir_all(dst.join(d)).unwrap();
+    }
+    for f in ["manifest.json", "products.csv", "campaigns.csv"] {
+        let _ = fs::copy(src.join(f), dst.join(f));
+    }
+    let mut jobs: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    for d in ["events", "clicks", "links"] {
+        if let Ok(rd) = fs::read_dir(src.join(d)) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.ends_with(".csv") {
+                    jobs.push((e.path(), dst.join(d).join(name.trim_end_matches(".csv"))));
+                }
+            }
+        }
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let total = std::sync::atomic::AtomicU64::new(0);
+    timed(nt, |_| loop {
+        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if i >= jobs.len() {
+            break;
+        }
+        let text = fs::read(&jobs[i].0).unwrap_or_default();
+        let head = text.iter().position(|&b| b == b'\n').map(|p| p + 1).unwrap_or(text.len());
+        let mut out = Vec::with_capacity(text.len() + text.len() / 16 + 64);
+        for c in 0..copies {
+            out.clear();
+            out.extend_from_slice(&text[..head]);
+            if c == 0 {
+                out.extend_from_slice(&text[head..]);
+            } else {
+                let tag = b"0123456789abcdefghijklmnopqrstuvwxyz"[c % 36];
+                for line in text[head..].split_inclusive(|&b| b == b'\n') {
+                    // tag the first two fields (after an opening quote, and only if not empty)
+                    let mut at = 0;
+                    for _ in 0..2 {
+                        let end = line[at..].iter().position(|&b| b == b',' || b == b'\n').map(|p| at + p).unwrap_or(line.len());
+                        let f = &line[at..end];
+                        if f.is_empty() || f == b"\"\"" {
+                            out.extend_from_slice(f);
+                        } else if f[0] == b'"' {
+                            out.push(b'"');
+                            out.push(tag);
+                            out.extend_from_slice(&f[1..]);
+                        } else {
+                            out.push(tag);
+                            out.extend_from_slice(f);
+                        }
+                        if end < line.len() && line[end] == b',' {
+                            out.push(b',');
+                            at = end + 1;
+                        } else {
+                            at = end;
+                            break;
+                        }
+                    }
+                    out.extend_from_slice(&line[at..]);
+                }
+            }
+            let p = jobs[i].1.with_file_name(format!("{}-{c:02}.csv", jobs[i].1.file_name().unwrap().to_string_lossy()));
+            fs::write(&p, &out).unwrap();
+            total.fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    total.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Runs this binary as a child on `data` with extra environment; prints its
+/// phase lines and returns the wall time in ms.
+fn child(data: &Path, out: &Path, envs: &[(&str, &str)], show: bool) -> f64 {
+    let _ = fs::remove_dir_all(out);
+    let _ = fs::create_dir_all(out);
+    let exe = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
+    let mut cmd = std::process::Command::new(exe);
+    cmd.env("SS_CHILD", "1").env("SS_VERBOSE", "1").env("DATA_DIR", data).env("OUTPUT_DIR", out);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+    let t = Instant::now();
+    let r = cmd.output();
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    match r {
+        Ok(o) => {
+            if show || !o.status.success() {
+                let text = String::from_utf8_lossy(&o.stderr);
+                let mut line = String::new();
+                for l in text.lines() {
+                    if l.contains(" ms  ") && !l.contains("small inputs") && !l.contains("chunks") {
+                        let mut it = l.split_whitespace();
+                        let at = it.next().unwrap_or("");
+                        let what: Vec<&str> = it.skip(1).take_while(|w| !w.starts_with('(')).collect();
+                        line.push_str(&format!("{}={} ", what.join("_"), at));
+                        if let (Some(a), Some(b)) = (l.find("(user"), l.find("minflt")) {
+                            if l.contains("done") {
+                                line.push_str(&l[a..b.min(l.len())]);
+                            }
+                        }
+                    }
+                }
+                eprintln!("[diag]     {} status={:?} | {}", envs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "), o.status.code(), line);
+            }
+        }
+        Err(e) => eprintln!("[diag]     child failed: {e}"),
+    }
+    ms
+}
+
+fn variants(data: &Path, scratch: &Path, nt: usize) {
+    let syn = scratch.join("syn");
+    let t = Instant::now();
+    let bytes = synthesize(data, &syn, 20, nt);
+    eprintln!("[diag] synthetic x20 data: {} MB in {:.0} ms", bytes >> 20, t.elapsed().as_secs_f64() * 1e3);
+    let out = scratch.join("synout");
+    let nts = nt.to_string();
+    let half = (nt / 2).max(1).to_string();
+    let twice = (nt * 2).to_string();
+    let sets: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        ("default", vec![]),
+        ("thp arena", vec![("SS_THP", "1")]),
+        ("thp tables", vec![("SS_THP", "2")]),
+        ("thp both", vec![("SS_THP", "3")]),
+        ("scan line", vec![("SS_SCAN", "1")]),
+        ("scan line aligned", vec![("SS_SCAN", "2")]),
+        ("regular stores", vec![("SS_NT", "0")]),
+        ("read() 1MB", vec![("SS_NO_MMAP", "1"), ("SS_CHUNK_KB", "1024")]),
+        ("chunk 1MB", vec![("SS_CHUNK_KB", "1024")]),
+        ("chunk 16MB", vec![("SS_CHUNK_KB", "16384")]),
+        ("bits 8/8", vec![("SS_ABITS", "8"), ("SS_CBITS", "8")]),
+        ("bits 10/10", vec![("SS_ABITS", "10"), ("SS_CBITS", "10")]),
+        ("bits 10/8", vec![("SS_ABITS", "10"), ("SS_CBITS", "8")]),
+        ("half threads", vec![("NCPU", &half)]),
+        ("2x threads", vec![("NCPU", &twice)]),
+        ("default again", vec![("NCPU", &nts)]),
+    ];
+    for (name, envs) in &sets {
+        let mut times = Vec::new();
+        for r in 0..3 {
+            times.push(child(&syn, &out, envs, r == 2));
+        }
+        eprintln!("[diag] variant {name}: {:.0} {:.0} {:.0} ms", times[0], times[1], times[2]);
+    }
+    let _ = fs::remove_dir_all(&out);
+    let _ = fs::remove_dir_all(&syn);
+}
+
 pub fn run(data: &Path, out: &Path, nt: usize) {
     let t0 = Instant::now();
     eprintln!("[diag] ---- machine");
@@ -410,5 +563,7 @@ pub fn run(data: &Path, out: &Path, nt: usize) {
     eprintln!("[diag] ---- memory ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
     mem_tests(1);
     mem_tests(nt);
+    eprintln!("[diag] ---- pipeline variants on 20x the dev set ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
+    variants(data, &scratch, nt);
     eprintln!("[diag] ---- done ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
 }

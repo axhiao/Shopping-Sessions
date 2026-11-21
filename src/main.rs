@@ -281,7 +281,7 @@ impl<T: Copy, const K: usize> Parts<T, K> {
                 let mut i = 0;
                 while i < bytes {
                     let v = _mm256_loadu_si256(src.add(i) as *const __m256i);
-                    if NT_STORES {
+                    if NT_STORES && nt_on() {
                         _mm256_stream_si256(dst.add(i) as *mut __m256i, v);
                     } else {
                         _mm256_storeu_si256(dst.add(i) as *mut __m256i, v);
@@ -309,6 +309,18 @@ impl<T: Copy, const K: usize> Parts<T, K> {
         }
         self.out
     }
+}
+
+#[inline(always)]
+fn nt_on() -> bool {
+    static V: AtomicU32 = AtomicU32::new(2);
+    let v = V.load(Ordering::Relaxed);
+    if v != 2 {
+        return v != 0;
+    }
+    let m = (std::env::var("SS_NT").map(|v| v != "0").unwrap_or(true)) as u32;
+    V.store(m, Ordering::Relaxed);
+    m != 0
 }
 
 /// Prefetch with intent to write (PREFETCHW; a no-op hint where unsupported).
@@ -896,6 +908,19 @@ fn pext128(v: u128, m: u128) -> u64 {
     }
 }
 
+/// Scanner choice (SS_SCAN): 0 plain, 1 line-at-a-time, 2 the same from aligned blocks.
+#[inline(always)]
+fn scan_mode() -> u32 {
+    static V: AtomicU32 = AtomicU32::new(u32::MAX);
+    let v = V.load(Ordering::Relaxed);
+    if v != u32::MAX {
+        return v;
+    }
+    let m = std::env::var("SS_SCAN").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    V.store(m, Ordering::Relaxed);
+    m
+}
+
 /// One line with the plain scanner (lines too long for the masks).
 #[cold]
 #[inline(never)]
@@ -914,7 +939,8 @@ fn scan_fast<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], begin:
     if begin >= n {
         return;
     }
-    if option_env!("SS_NEWSCAN").is_none() {
+    let mode = scan_mode();
+    if mode == 0 {
         return scan_lines::<N, F>(buf, begin, limit, f);
     }
     debug_assert!(buf[n - 1] == b'\n');
@@ -923,7 +949,7 @@ fn scan_fast<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], begin:
     let mut ls = begin;
     let mut fields: [&'a [u8]; N] = [&[]; N];
     while ls < limit && ls < n {
-        let (sep, nl, qt) = if option_env!("SS_ALIGNED").is_some() {
+        let (sep, nl, qt) = if mode == 2 {
             // aligned blocks, shifted to the line start
             let o = (ls & 63) as u32;
             let b = unsafe { ptr.add(ls & !63) };
@@ -2103,7 +2129,9 @@ fn main() {
     SUBS.store(nthreads + 1, Ordering::Relaxed);
     let verbose = cfg!(feature = "diag") || std::env::var("SS_VERBOSE").is_ok();
     #[cfg(feature = "diag")]
-    diag::run(&data, &out, nthreads);
+    if std::env::var_os("SS_CHILD").is_none() {
+        diag::run(&data, &out, nthreads);
+    }
     #[cfg(feature = "diag")]
     let t0 = Instant::now();
     let lap = |what: &str| {
@@ -2755,7 +2783,7 @@ fn main() {
         }
     }
     #[cfg(feature = "diag")]
-    {
+    if std::env::var_os("SS_CHILD").is_none() {
         // a diagnostic build must never be scored: one extra row
         n += 1;
         cols[0].push_str(b"diag");
