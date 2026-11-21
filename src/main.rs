@@ -456,9 +456,8 @@ struct Slot {
 struct LinkMap {
     slots: *mut Slot,
     mask: usize,
-    /// Build-time state: parent (slot + 1, 0 = unclaimed) and best (slot + 1).
+    /// Build-time state: parent (slot + 1, 0 = unclaimed).
     parent: &'static [AtomicU32],
-    best: &'static [AtomicU32],
     /// One bit per hash (top 24 bits) of every ID whose person is not itself:
     /// a clear bit means "the person is the ID", with no table probe.
     filter: &'static [AtomicU64],
@@ -478,7 +477,6 @@ impl LinkMap {
             slots,
             mask: size - 1,
             parent: zeroed_slice(size),
-            best: zeroed_slice(size),
             filter: zeroed_slice(1 << (FILTER_BITS - 6)),
         }
     }
@@ -587,7 +585,8 @@ impl LinkMap {
             if a == b {
                 return;
             }
-            let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+            // the root is always the byte-wise smallest key, i.e. the name
+            let (hi, lo) = if cmp_key(&self.slot(a as usize).k, &self.slot(b as usize).k).is_gt() { (a, b) } else { (b, a) };
             if self.parent[hi as usize]
                 .compare_exchange(hi + 1, lo + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
@@ -620,35 +619,13 @@ impl LinkMap {
         }
     }
 
-    /// For the slots in [from, to): record the smallest key of each root.
-    fn pick_best(&self, from: usize, to: usize) {
-        for i in from..to {
-            if self.parent[i].load(Ordering::Relaxed) == 0 {
-                continue;
-            }
-            let r = self.find(i as u32) as usize;
-            let k = self.slot(i).k;
-            let mut cur = self.best[r].load(Ordering::Acquire);
-            loop {
-                if cur != 0 && cmp_key(&self.slot(cur as usize - 1).k, &k).is_le() {
-                    break;
-                }
-                match self.best[r].compare_exchange_weak(cur, i as u32 + 1, Ordering::AcqRel, Ordering::Acquire) {
-                    Ok(_) => break,
-                    Err(c) => cur = c,
-                }
-            }
-        }
-    }
-
     /// For the slots in [from, to): store the person name as the value.
     fn finish(&self, from: usize, to: usize) {
         for i in from..to {
             if self.parent[i].load(Ordering::Relaxed) == 0 {
                 continue;
             }
-            let r = self.find(i as u32) as usize;
-            let b = self.best[r].load(Ordering::Relaxed) as usize - 1;
+            let b = self.find(i as u32) as usize;
             let name = self.slot(b).k;
             unsafe { (*self.slots.add(i)).v = name };
             if b != i {
@@ -2097,7 +2074,6 @@ fn main() {
                 let (a, b) = (i * PS2, ((i + 1) * PS2).min(lm.size()));
                 touch(unsafe { lm.slots.add(a) } as *const u8, (b - a) * std::mem::size_of::<Slot>());
                 touch(lm.parent[a..b].as_ptr() as *const u8, (b - a) * 4);
-                touch(lm.best[a..b].as_ptr() as *const u8, (b - a) * 4);
             }
             barrier.wait();
             if w == 0 && verbose {
@@ -2124,21 +2100,14 @@ fn main() {
         // L2: smallest key per person; L3: store names
         const SS: usize = 1 << 16;
         let nslices = lm.size().div_ceil(SS);
-        for (ci, f) in [(2usize, 0u8), (3, 1)] {
-            loop {
-                let i = counters[ci].fetch_add(1, Ordering::Relaxed);
-                if i >= nslices {
-                    break;
-                }
-                let (a, b) = (i * SS, ((i + 1) * SS).min(lm.size()));
-                if f == 0 {
-                    lm.pick_best(a, b);
-                } else {
-                    lm.finish(a, b);
-                }
+        loop {
+            let i = counters[3].fetch_add(1, Ordering::Relaxed);
+            if i >= nslices {
+                break;
             }
-            barrier.wait();
+            lm.finish(i * SS, ((i + 1) * SS).min(lm.size()));
         }
+        barrier.wait();
         if w == 0 && verbose {
             eprintln!("{:>8.1} ms  link map built ({} pairs)", t0.elapsed().as_secs_f64() * 1e3, total_pairs.load(Ordering::Relaxed));
         }
