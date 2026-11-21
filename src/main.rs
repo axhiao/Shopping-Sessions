@@ -918,16 +918,19 @@ struct RecD {
     loc: u64,
 }
 
-/// Payload of a valid event copy, partitioned by person. meta == 0 means dead.
+/// Payload of a valid event copy, partitioned by person. `x` is 0 for a view
+/// or cart; for a purchase it is PURCHASE | index into the partition's side
+/// table of (price, category). ts == DEAD marks a copy that lost the dedup.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct RecP {
     person: Key,
     ts: u32,
-    meta: u32, // VALID | type << 24 | price
-    cat: u32,
-    pid: u32, // scratch: local person id in phase 3
+    x: u32,
 }
+
+const PURCHASE: u32 = 1 << 31;
+const DEAD: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -1109,14 +1112,16 @@ static LINKS: Mutex<Vec<Vec<(Key, Key)>>> = Mutex::new(Vec::new());
 static LINKMAP: OnceLock<LinkMap> = OnceLock::new();
 
 struct P1Work {
-    dd: Parts<RecD, 8>,  // by event-id partition
-    pay: Parts<RecP, 4>, // by person partition
-    clq: Parts<RecC, 8>, // by person partition
+    dd: Parts<RecD, 8>,          // by event-id partition
+    pay: Parts<RecP, 8>,         // by person partition
+    pur: Vec<PVec<(u32, u32)>>,  // per person partition: (price, category) of purchases
+    clq: Parts<RecC, 8>,         // by person partition
 }
 
 struct P1Out {
     dd: Vec<PVec<RecD>>,
     pay: Vec<PVec<RecP>>,
+    pur: Vec<PVec<(u32, u32)>>,
     clq: Vec<PVec<RecC>>,
 }
 
@@ -1140,6 +1145,7 @@ const EB: usize = 16;
 struct EvBatch {
     n: usize,
     pay: [RecP; EB],
+    pc: [(u32, u32); EB],
     h: [u64; EB],
     dd: [RecD; EB],
 }
@@ -1150,6 +1156,11 @@ fn flush_batch(b: &mut EvBatch, lm: &LinkMap, w: usize, o: &mut P1Work) {
         let mut p = b.pay[j];
         p.person = lm.person(&p.person, b.h[j]);
         let q = (hk(&p.person) >> (64 - PC_BITS)) as usize;
+        if p.x != 0 {
+            let side = unsafe { o.pur.get_unchecked_mut(q) };
+            p.x = PURCHASE | side.len() as u32;
+            side.push(b.pc[j]);
+        }
         let mut d = b.dd[j];
         d.loc = HAS_PAY | ((w as u64) << 48) | ((q as u64) << 32) | o.pay.next_index(q) as u64;
         o.pay.push(q, p);
@@ -1162,7 +1173,8 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, w: usize, lm:
     let (ws, we) = (ctx.ws, ctx.we);
     let mut b = EvBatch {
         n: 0,
-        pay: [RecP { person: ZERO, ts: 0, meta: 0, cat: 0, pid: 0 }; EB],
+        pay: [RecP { person: ZERO, ts: 0, x: 0 }; EB],
+        pc: [(0, 0); EB],
         h: [0; EB],
         dd: [RecD { fp: 0, fp2: 0, ingest: 0, loc: 0 }; EB],
     };
@@ -1201,9 +1213,9 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, w: usize, lm:
                 },
                 _ => break 'v,
             };
-            let cat = ctx.products.get(&key_of(f[5])).unwrap_or(ctx.unknown_cat);
+            let cat = if ty == T_PURCHASE { ctx.products.get(&key_of(f[5])).unwrap_or(ctx.unknown_cat) } else { 0 };
             let user = key_of(f[1]);
-            let p = RecP { person: user, ts: (ts - ws) as u32, meta: VALID | (ty << 24) | price, cat, pid: 0 };
+            let p = RecP { person: user, ts: (ts - ws) as u32, x: (ty == T_PURCHASE) as u32 };
             if stop_push {
                 std::hint::black_box((&p, &d));
                 return;
@@ -1211,6 +1223,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, w: usize, lm:
             let h = hk(&user);
             lm.prefetch(h);
             b.pay[b.n] = p;
+            b.pc[b.n] = (price, cat);
             b.h[b.n] = h;
             b.dd[b.n] = d;
             b.n += 1;
@@ -1294,7 +1307,9 @@ struct Geo {
     organic: u32,
 }
 
-fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[RecP], cls: &[RecC]) {
+/// `evs`: the person's events as ts << 32 | x, sorted; `pur`: (price, cat)
+/// for the purchase indices in x.
+fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u32)], cls: &[RecC]) {
     let ndays = g.ndays;
     let mut lo = 0usize;
     let mut hi = 0usize;
@@ -1362,8 +1377,8 @@ fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[RecP], cls: &[RecC])
         }};
     }
 
-    for e in evs {
-        let t = e.ts as i64;
+    for &e in evs {
+        let t = (e >> 32) as i64;
         if s_start < 0 || t - prev_t > GAP {
             if s_start >= 0 {
                 finish_session!();
@@ -1386,12 +1401,13 @@ fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[RecP], cls: &[RecC])
         }
         prev_t = t;
         d_events += 1;
-        if (e.meta >> 24) & 3 == T_PURCHASE {
-            let p = (e.meta & 0xFF_FFFF) as u64;
+        if e as u32 & PURCHASE != 0 {
+            let (p, c) = unsafe { *pur.get_unchecked((e as u32 & !PURCHASE) as usize) };
+            let p = p as u64;
             s_rev += p;
             s_purch = true;
             d_rev += p;
-            let c = e.cat as usize;
+            let c = c as usize;
             if st.catsum[c] == 0 {
                 st.touched.push(c as u32);
             }
@@ -1664,7 +1680,12 @@ fn main() {
         if w == 0 && verbose {
             eprintln!("{:>8.1} ms  link map built ({} pairs)", t0.elapsed().as_secs_f64() * 1e3, total_pairs.load(Ordering::Relaxed));
         }
-        let mut o = P1Work { dd: Parts::new(PA, res_dd), pay: Parts::new(PC, res_pay), clq: Parts::new(PC, res_cl) };
+        let mut o = P1Work {
+            dd: Parts::new(PA, res_dd),
+            pay: Parts::new(PC, res_pay),
+            pur: (0..PC).map(|_| PVec::with_capacity(res_pay / 24 + 16)).collect(),
+            clq: Parts::new(PC, res_cl),
+        };
         loop {
             let i = counters[4].fetch_add(1, Ordering::Relaxed);
             if i >= data_chunks.len() {
@@ -1682,7 +1703,7 @@ fn main() {
                 release(unsafe { inf.map.add(c.start as usize) }, (c.end - c.start) as usize);
             }
         }
-        P1Out { dd: o.dd.finish(), pay: o.pay.finish(), clq: o.clq.finish() }
+        P1Out { dd: o.dd.finish(), pay: o.pay.finish(), pur: o.pur, clq: o.clq.finish() }
     });
     lap("phase 1 parse");
     let linkmap = LINKMAP.get().unwrap();
@@ -1696,7 +1717,7 @@ fn main() {
         let w = ((loc >> 48) & 0x3FFF) as usize;
         let q = ((loc >> 32) & 0xFFFF) as usize;
         let i = (loc & 0xFFFF_FFFF) as usize;
-        unsafe { (*p1[w].pay[q].ptr.add(i)).meta = 0 };
+        unsafe { (*p1[w].pay[q].ptr.add(i)).ts = DEAD };
     };
     let lm_slices = linkmap.size().div_ceil(1 << 16);
     let next_lm = AtomicUsize::new(0);
@@ -1784,8 +1805,10 @@ fn main() {
         };
         let mut lid = LocalIds::new();
         lid.reset(max_part);
-        let mut evs: Vec<RecP> = Vec::with_capacity(max_part);
-        let mut sorted: Vec<RecP> = Vec::with_capacity(max_part);
+        let mut evs: Vec<u64> = Vec::with_capacity(max_part);
+        let mut sorted: Vec<u64> = Vec::with_capacity(max_part);
+        let mut pids: Vec<u32> = Vec::with_capacity(max_part);
+        let mut lpur: Vec<(u32, u32)> = Vec::with_capacity(max_part / 16 + 16);
         let mut cls: Vec<RecC> = Vec::with_capacity(max_clicks);
         let mut csorted: Vec<RecC> = Vec::with_capacity(max_clicks);
         let mut cpid: Vec<u32> = Vec::with_capacity(max_clicks);
@@ -1812,25 +1835,37 @@ fn main() {
             if ne == 0 {
                 continue;
             }
+            // gather live events: local person id + packed value
+            lid.reset(ne);
             evs.clear();
+            pids.clear();
+            lpur.clear();
             for o in p1.iter() {
-                evs.extend(o.pay[q].as_slice().iter().filter(|e| e.meta != 0));
+                let side = o.pur[q].as_slice();
+                for e in o.pay[q].as_slice() {
+                    if e.ts == DEAD {
+                        continue;
+                    }
+                    pids.push(lid.intern(&e.person));
+                    let x = if e.x != 0 {
+                        lpur.push(unsafe { *side.get_unchecked((e.x & !PURCHASE) as usize) });
+                        PURCHASE | (lpur.len() - 1) as u32
+                    } else {
+                        0
+                    };
+                    evs.push(((e.ts as u64) << 32) | x as u64);
+                }
             }
             if evs.is_empty() {
                 continue;
             }
             tick!(0);
-            // local person ids, in first-seen order
-            lid.reset(evs.len());
-            for e in evs.iter_mut() {
-                e.pid = lid.intern(&e.person);
-            }
             let np = lid.persons.len();
             // counting sort by pid
             start.clear();
             start.resize(np + 1, 0);
-            for e in &evs {
-                start[e.pid as usize + 1] += 1;
+            for &p in &pids {
+                start[p as usize + 1] += 1;
             }
             for k in 0..np {
                 start[k + 1] += start[k];
@@ -1840,9 +1875,9 @@ fn main() {
             unsafe { sorted.set_len(evs.len()) };
             fill.clear();
             fill.extend_from_slice(&start[..np]);
-            for e in &evs {
-                let f = &mut fill[e.pid as usize];
-                sorted[*f as usize] = *e;
+            for (&e, &p) in evs.iter().zip(&pids) {
+                let f = unsafe { fill.get_unchecked_mut(p as usize) };
+                unsafe { *sorted.get_unchecked_mut(*f as usize) = e };
                 *f += 1;
             }
             tick!(1);
@@ -1879,17 +1914,18 @@ fn main() {
             for p in 0..np {
                 let ev = &mut sorted[start[p] as usize..start[p + 1] as usize];
                 if ev.len() > 1 {
-                    ev.sort_unstable_by_key(|e| e.ts);
+                    ev.sort_unstable();
                 }
                 let cl = &mut csorted[cstart[p] as usize..cstart[p + 1] as usize];
                 if cl.len() > 1 {
                     cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| cmp_key(&b.cid, &a.cid)));
                 }
-                process_person(&geo, &mut st, lid.persons[p], ev, cl);
+                process_person(&geo, &mut st, lid.persons[p], ev, &lpur, cl);
             }
             tick!(3);
             for o in p1.iter() {
                 o.pay[q].release();
+                o.pur[q].release();
                 o.clq[q].release();
             }
             tick!(4);
