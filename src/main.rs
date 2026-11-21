@@ -1142,6 +1142,76 @@ fn call_cold<A, F: FnMut(&A)>(f: &mut F, a: &A) {
     f(a)
 }
 
+/// Where the fields of one well-formed line are: `e` is the offset of its
+/// newline from the line start, `r` the offset just past the K-th separator;
+/// bit i of `cs` / `ce` is set where a field of the low side (the first K)
+/// starts / ends at byte i, and `csw` / `cew` are the same for the other
+/// fields, relative to byte r. Quotes around a field are already excluded.
+#[derive(Clone, Copy)]
+struct LineCur {
+    e: usize,
+    r: usize,
+    cs: u64,
+    ce: u64,
+    csw: u64,
+    cew: u64,
+}
+
+enum Line {
+    /// Does not fit the windows: needs the reference scanner.
+    Slow,
+    /// Not N fields or stray quotes: dropped; the newline is at this offset.
+    Bad(usize),
+    Good(LineCur),
+}
+
+/// Finds the fields of the line at `p` (N fields, the first K within 63
+/// bytes, the rest within 64 more). `p` needs WIN readable bytes.
+#[inline(always)]
+unsafe fn line_cursors<const N: usize, const K: usize>(p: *const u8) -> Line {
+    let (sep, nl, qt) = win_masks(p);
+    // the line ends at the first newline (128: none in the window)
+    let e = if nl[0] != 0 { nl[0].trailing_zeros() } else { 64 + nl[1].trailing_zeros() } as usize;
+    // s1: the low separators without the first K - 1; r: just past the K-th
+    let mut s1 = sep[0];
+    for _ in 1..K {
+        s1 &= s1.wrapping_sub(1);
+    }
+    let r = s1.trailing_zeros() as usize + 1;
+    if r > 63 || e.wrapping_sub(r) >= 64 {
+        return Line::Slow;
+    }
+    // Per side: `seps` its separators, `starts` its field starts, `q` the
+    // quotes. A quote must open a field (o) or close one (c), and a field
+    // has both or neither: adding o to !seps carries from an opening quote
+    // to the field's separator, which must then have a closing quote
+    // before it. Quotes are stripped by moving the start/end bits.
+    let s2 = s1 & s1.wrapping_sub(1);
+    let seps = sep[0] ^ s2;
+    let starts = ((sep[0] ^ s1) << 1) | 1;
+    let q = qt[0] & (s1 ^ s1.wrapping_sub(1));
+    let (o, c) = (q & starts, q & (seps >> 1));
+    let bad_lo = (q ^ o ^ c) | (((!seps).wrapping_add(o) ^ (c << 1)) & seps);
+    // high side: fields K..N, bit 0 = the byte at r
+    let w = (sep[0] >> r) | (sep[1] << (64 - r));
+    let mut t1 = w;
+    for _ in 1..N - K {
+        t1 &= t1.wrapping_sub(1);
+    }
+    let t2 = t1 & t1.wrapping_sub(1);
+    let sepw = w ^ t2;
+    let startw = ((w ^ t1) << 1) | 1;
+    let qw = ((qt[0] >> r) | (qt[1] << (64 - r))) & (t1 ^ t1.wrapping_sub(1));
+    let (ow, cw) = (qw & startw, qw & (sepw >> 1));
+    let bad_hi = (qw ^ ow ^ cw) | (((!sepw).wrapping_add(ow) ^ (cw << 1)) & sepw);
+    // well-formed: quotes only around whole fields, and the N-th separator is the newline
+    if (bad_lo | bad_hi) != 0 || r + t1.trailing_zeros() as usize != e {
+        return Line::Bad(e);
+    }
+    // first and one-past-last content byte of each field (inside the quotes)
+    Line::Good(LineCur { e, r, cs: starts + o, ce: seps - c, csw: startw + ow, cew: sepw - cw })
+}
+
 /// Same contract as `scan_lines`; `buf` needs 128 readable bytes past its end
 /// and `begin` must be a line start. 1 <= K < N.
 #[inline(always)]
@@ -1160,70 +1230,99 @@ fn scan_lean<'a, const N: usize, const K: usize, F: FnMut(&[&'a [u8]; N])>(buf: 
         // prefetcher restarts at every page, and on the scorer the loads below
         // waited for memory (phase 1 is 9% faster with this one hint per line).
         prefetch(p.wrapping_add(INPUT_AHEAD));
-        let (sep, nl, qt) = unsafe { win_masks(p) };
-        // the line ends at the first newline (128: none in the window)
-        let e = if nl[0] != 0 { nl[0].trailing_zeros() } else { 64 + nl[1].trailing_zeros() } as usize;
-        // s1: the low separators without the first K - 1; r: just past the K-th
-        let mut s1 = sep[0];
-        for _ in 1..K {
-            s1 &= s1.wrapping_sub(1);
-        }
-        let r = s1.trailing_zeros() as usize + 1;
-        if r > 63 || e.wrapping_sub(r) >= 64 {
-            let (end, res) = slow_line::<N>(buf, ls);
-            if let Some(res) = res {
-                call_cold(&mut f, &res);
-            }
-            ls = end + 1;
-            continue;
-        }
-        // Per side: `seps` its separators, `starts` its field starts, `q` the
-        // quotes. A quote must open a field (o) or close one (c), and a field
-        // has both or neither: adding o to !seps carries from an opening quote
-        // to the field's separator, which must then have a closing quote
-        // before it. Quotes are stripped by moving the start/end bits.
-        let s2 = s1 & s1.wrapping_sub(1);
-        let seps = sep[0] ^ s2;
-        let starts = ((sep[0] ^ s1) << 1) | 1;
-        let q = qt[0] & (s1 ^ s1.wrapping_sub(1));
-        let (o, c) = (q & starts, q & (seps >> 1));
-        let bad_lo = (q ^ o ^ c) | (((!seps).wrapping_add(o) ^ (c << 1)) & seps);
-        // high side: fields K..N, bit 0 = the byte at r
-        let w = (sep[0] >> r) | (sep[1] << (64 - r));
-        let mut t1 = w;
-        for _ in 1..N - K {
-            t1 &= t1.wrapping_sub(1);
-        }
-        let t2 = t1 & t1.wrapping_sub(1);
-        let sepw = w ^ t2;
-        let startw = ((w ^ t1) << 1) | 1;
-        let qw = ((qt[0] >> r) | (qt[1] << (64 - r))) & (t1 ^ t1.wrapping_sub(1));
-        let (ow, cw) = (qw & startw, qw & (sepw >> 1));
-        let bad_hi = (qw ^ ow ^ cw) | (((!sepw).wrapping_add(ow) ^ (cw << 1)) & sepw);
-        // well-formed: quotes only around whole fields, and the N-th separator is the newline
-        if (bad_lo | bad_hi) == 0 && r + t1.trailing_zeros() as usize == e {
-            // first and one-past-last content byte of each field (inside the quotes)
-            let mut fields: [&'a [u8]; N] = [&[]; N];
-            let (mut cs, mut ce) = (starts + o, seps - c);
-            unsafe {
-                for i in 0..K {
-                    let (a, b) = (cs.trailing_zeros() as usize, ce.trailing_zeros() as usize);
-                    *fields.get_unchecked_mut(i) = std::slice::from_raw_parts(p.add(a), b.wrapping_sub(a));
-                    cs &= cs.wrapping_sub(1);
-                    ce &= ce.wrapping_sub(1);
+        match unsafe { line_cursors::<N, K>(p) } {
+            Line::Slow => {
+                let (end, res) = slow_line::<N>(buf, ls);
+                if let Some(res) = res {
+                    call_cold(&mut f, &res);
                 }
-                let pr = p.add(r);
-                let (mut cs, mut ce) = (startw + ow, sepw - cw);
-                for i in K..N {
-                    let (a, b) = (cs.trailing_zeros() as usize, ce.trailing_zeros() as usize);
-                    *fields.get_unchecked_mut(i) = std::slice::from_raw_parts(pr.add(a), b.wrapping_sub(a));
-                    cs &= cs.wrapping_sub(1);
-                    ce &= ce.wrapping_sub(1);
-                }
+                ls = end + 1;
             }
-            f(&fields);
+            Line::Bad(e) => ls += e + 1,
+            Line::Good(c) => {
+                let mut fields: [&'a [u8]; N] = [&[]; N];
+                let (mut cs, mut ce) = (c.cs, c.ce);
+                unsafe {
+                    for i in 0..K {
+                        let (a, b) = (cs.trailing_zeros() as usize, ce.trailing_zeros() as usize);
+                        *fields.get_unchecked_mut(i) = std::slice::from_raw_parts(p.add(a), b.wrapping_sub(a));
+                        cs &= cs.wrapping_sub(1);
+                        ce &= ce.wrapping_sub(1);
+                    }
+                    let pr = p.add(c.r);
+                    let (mut cs, mut ce) = (c.csw, c.cew);
+                    for i in K..N {
+                        let (a, b) = (cs.trailing_zeros() as usize, ce.trailing_zeros() as usize);
+                        *fields.get_unchecked_mut(i) = std::slice::from_raw_parts(pr.add(a), b.wrapping_sub(a));
+                        cs &= cs.wrapping_sub(1);
+                        ce &= ce.wrapping_sub(1);
+                    }
+                }
+                f(&fields);
+                ls += c.e + 1;
+            }
         }
-        ls += e + 1;
+    }
+}
+
+/// The fields of a line, handed out in order: the first K with `lo`, the
+/// others with `hi`.
+trait Fields<'a> {
+    fn lo(&mut self) -> &'a [u8];
+    fn hi(&mut self) -> &'a [u8];
+}
+
+/// Fields taken one at a time from the cursors of a line (nothing is
+/// computed for a field before it is asked for, so few values stay live).
+struct MaskFields<'a> {
+    p: *const u8,
+    pr: *const u8,
+    cs: u64,
+    ce: u64,
+    csw: u64,
+    cew: u64,
+    _buf: std::marker::PhantomData<&'a [u8]>,
+}
+
+impl<'a> MaskFields<'a> {
+    #[inline(always)]
+    unsafe fn new(p: *const u8, c: &LineCur) -> Self {
+        MaskFields { p, pr: p.add(c.r), cs: c.cs, ce: c.ce, csw: c.csw, cew: c.cew, _buf: std::marker::PhantomData }
+    }
+}
+
+impl<'a> Fields<'a> for MaskFields<'a> {
+    #[inline(always)]
+    fn lo(&mut self) -> &'a [u8] {
+        let (a, b) = (self.cs.trailing_zeros() as usize, self.ce.trailing_zeros() as usize);
+        self.cs &= self.cs.wrapping_sub(1);
+        self.ce &= self.ce.wrapping_sub(1);
+        unsafe { std::slice::from_raw_parts(self.p.add(a), b.wrapping_sub(a)) }
+    }
+    #[inline(always)]
+    fn hi(&mut self) -> &'a [u8] {
+        let (a, b) = (self.csw.trailing_zeros() as usize, self.cew.trailing_zeros() as usize);
+        self.csw &= self.csw.wrapping_sub(1);
+        self.cew &= self.cew.wrapping_sub(1);
+        unsafe { std::slice::from_raw_parts(self.pr.add(a), b.wrapping_sub(a)) }
+    }
+}
+
+/// Fields from an array (lines that went through the reference scanner).
+struct ArrFields<'a, 'b, const N: usize> {
+    f: &'b [&'a [u8]; N],
+    i: usize,
+}
+
+impl<'a, 'b, const N: usize> Fields<'a> for ArrFields<'a, 'b, N> {
+    #[inline(always)]
+    fn lo(&mut self) -> &'a [u8] {
+        self.i += 1;
+        self.f[self.i - 1]
+    }
+    #[inline(always)]
+    fn hi(&mut self) -> &'a [u8] {
+        self.lo()
     }
 }
 
@@ -2073,14 +2172,29 @@ fn parse_links(buf: &[u8], begin: usize, limit: usize) -> Vec<(Key, Key)> {
 
 const EB: usize = 16;
 
+/// One parsed event waiting in the batch (one cache line). The parser writes
+/// each part as soon as it has it, so nothing is kept in registers or on the
+/// stack across the rest of the line.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct EvSlot {
+    /// The user as written; resolved to the person when the batch is flushed.
+    person: Key,
+    /// Hash of the user key.
+    h: u64,
+    dd: RecD,
+    /// Event time, ms from the window start.
+    ts: u32,
+    purchase: u32,
+    /// (price, category) of a purchase.
+    pc: (u32, u32),
+    linked: bool,
+}
+
 #[derive(Clone, Copy)]
 struct EvBatch {
     n: usize,
-    pay: [Pend; EB],
-    pc: [(u32, u32); EB],
-    h: [u64; EB],
-    linked: [bool; EB],
-    dd: [RecD; EB],
+    s: [EvSlot; EB],
 }
 
 /// Pipeline stage 2: the filter words were prefetched while parsing; decide
@@ -2088,29 +2202,31 @@ struct EvBatch {
 #[inline(always)]
 fn stage2(b: &mut EvBatch, lm: &LinkMap) {
     for j in 0..b.n {
-        let linked = lm.maybe_linked(b.h[j]);
+        let e = unsafe { b.s.get_unchecked_mut(j) };
+        let linked = lm.maybe_linked(e.h);
         if linked {
-            lm.prefetch(b.h[j]);
+            lm.prefetch(e.h);
         }
-        b.linked[j] = linked;
+        e.linked = linked;
     }
 }
 
 #[inline(always)]
 fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
     for j in 0..b.n {
-        let mut p = b.pay[j];
-        let mut ph = b.h[j];
-        if b.linked[j] {
-            p.person = lm.person(&p.person, ph);
-            ph = hk(&p.person);
+        let e = unsafe { b.s.get_unchecked(j) };
+        let mut person = e.person;
+        let mut ph = e.h;
+        if e.linked {
+            person = lm.person(&person, ph);
+            ph = hk(&person);
         }
         let q = (ph >> (64 - pc_bits())) as usize;
-        if p.purchase {
-            unsafe { o.pur.get_unchecked_mut(q) }.push(b.pc[j]);
+        if e.purchase != 0 {
+            unsafe { o.pur.get_unchecked_mut(q) }.push(e.pc);
         }
-        let rec = RecP { p: compact(&p.person, unsafe { o.pesc.get_unchecked_mut(q) }), t: p.ts | ((p.purchase as u32) << 31) };
-        let mut d = b.dd[j];
+        let rec = RecP { p: compact(&person, unsafe { o.pesc.get_unchecked_mut(q) }), t: e.ts | (e.purchase << 31) };
+        let mut d = e.dd;
         let idx = o.pay.next_index(q) as u64;
         if idx >= 1 << IDX_BITS {
             IDX_OVERFLOW.store(true, Ordering::Relaxed);
@@ -2122,74 +2238,154 @@ fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
     b.n = 0;
 }
 
-fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, o: &mut P1Work) {
-    let (ws, we) = (ctx.ws, ctx.we);
-    let empty = EvBatch {
-        n: 0,
-        pay: [Pend { person: ZERO, ts: 0, purchase: false }; EB],
-        pc: [(0, 0); EB],
-        h: [0; EB],
-        linked: [false; EB],
-        dd: [RecD { fp: 0, b: 0 }; EB],
-    };
-    // two batches: `bs[cur]` fills while `bs[cur ^ 1]` waits for its slots
-    let mut bs = [empty, empty];
-    let mut cur = 0usize;
-    let mut dc = DateCache::new();
-    scan_lean::<7, 3, _>(buf, begin, limit, #[inline(always)] |f| {
-        if f[0].is_empty() {
-            return;
+/// What an event line is: nothing (no event id), a copy that only takes part
+/// in the dedup (anything invalid), or a valid event.
+const EV_SKIP: u32 = 0;
+const EV_DEDUP: u32 = 1;
+const EV_VALID: u32 = 2;
+
+/// Parses the seven fields of an event line, in order, into `slot`. `dd` is
+/// complete for EV_DEDUP and EV_VALID; the rest only matters for EV_VALID.
+#[inline(always)]
+unsafe fn event_fields<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &LinkMap, src: &mut S, slot: *mut EvSlot) -> u32 {
+    // event_id
+    let f0 = src.lo();
+    if f0.is_empty() {
+        return EV_SKIP;
+    }
+    let (fp, fp2) = eid_fp(&key_of(f0));
+    (*slot).dd.fp = fp;
+    // user_id
+    let f1 = src.lo();
+    let mut ok = !f1.is_empty();
+    // (the key of an empty string is ZERO)
+    let user = key_of(f1);
+    (*slot).person = user;
+    let h = hk(&user);
+    (*slot).h = h;
+    lm.prefetch_filter(h);
+    // ts: inside the window
+    let f2 = src.lo();
+    let ts = match parse_ts_dc(dc, f2) {
+        Some(t) if t >= ctx.ws && t < ctx.we => t,
+        _ => {
+            ok = false;
+            ctx.ws
         }
-        let (fp, fp2) = eid_fp(&key_of(f[0]));
-        let (ingest_s, ingest_ms) = parse_ingest_dc(&mut dc, f[3]).unwrap_or((i64::MAX / 2000, i64::MAX / 2));
-        let ingest = (ingest_s - ctx.ingest_base_s).clamp(0, 0xFF_FFFF) as u64;
-        let d = RecD { fp, b: ((fp2 as u64) << 56) | (ingest << 32) };
-        let part = (fp >> (64 - pa_bits())) as usize;
-        'v: {
-            if f[1].is_empty() || f[5].is_empty() {
-                break 'v;
-            }
-            let ts = match parse_ts_dc(&mut dc, f[2]) {
-                Some(t) if t >= ws && t < we => t,
-                _ => break 'v,
-            };
-            if ingest_ms - ts > DAY {
-                break 'v;
-            }
-            let ty = event_type(f[4]);
-            let price = match ty {
-                0 | 1 => 0,
-                2 => match parse_price(f[6]) {
-                    Some(p) => p,
-                    None => break 'v,
-                },
-                _ => break 'v,
-            };
-            let cat = if ty == T_PURCHASE { ctx.products.get(&key_of(f[5])).unwrap_or(ctx.unknown_cat) } else { 0 };
-            let user = key_of(f[1]);
-            let p = Pend { person: user, ts: (ts - ws) as u32, purchase: ty == T_PURCHASE };
-            let h = hk(&user);
-            lm.prefetch_filter(h);
-            let b = &mut bs[cur];
-            b.pay[b.n] = p;
-            b.pc[b.n] = (price, cat);
-            b.h[b.n] = h;
-            b.dd[b.n] = d;
+    };
+    (*slot).ts = (ts - ctx.ws) as u32;
+    // ingest_ts: the dedup order; an event more than a day late is dropped
+    let f3 = src.hi();
+    let (ingest_s, ingest_ms) = parse_ingest_dc(dc, f3).unwrap_or((i64::MAX / 2000, i64::MAX / 2));
+    let ingest = (ingest_s - ctx.ingest_base_s).clamp(0, 0xFF_FFFF) as u64;
+    (*slot).dd.b = ((fp2 as u64) << 56) | (ingest << 32);
+    ok &= ingest_ms - ts <= DAY;
+    // event_type, product_id, price_cents
+    let ty = event_type(src.hi());
+    let f5 = src.hi();
+    ok &= !f5.is_empty();
+    let f6 = src.hi();
+    let mut pc = (0u32, 0u32);
+    if ty == T_PURCHASE {
+        match parse_price(f6) {
+            Some(p) if ok => pc = (p, ctx.products.get(&key_of(f5)).unwrap_or(ctx.unknown_cat)),
+            _ => ok = false,
+        }
+    } else {
+        ok &= ty < T_PURCHASE;
+    }
+    (*slot).purchase = (ty == T_PURCHASE) as u32;
+    (*slot).pc = pc;
+    if ok {
+        EV_VALID
+    } else {
+        EV_DEDUP
+    }
+}
+
+/// The two parse batches: `bs[cur]` fills while `bs[cur ^ 1]` waits for the
+/// link-map slots prefetched for it.
+struct EvQueue {
+    bs: [EvBatch; 2],
+    cur: usize,
+}
+
+impl EvQueue {
+    fn new() -> Self {
+        let slot = EvSlot { person: ZERO, h: 0, dd: RecD { fp: 0, b: 0 }, ts: 0, purchase: 0, pc: (0, 0), linked: false };
+        let empty = EvBatch { n: 0, s: [slot; EB] };
+        EvQueue { bs: [empty, empty], cur: 0 }
+    }
+    /// The slot the next event is parsed into.
+    #[inline(always)]
+    fn slot(&mut self) -> *mut EvSlot {
+        unsafe {
+            let b = self.bs.get_unchecked_mut(self.cur);
+            b.s.as_mut_ptr().add(b.n)
+        }
+    }
+    /// Takes what `event_fields` left in the slot.
+    #[inline(always)]
+    fn commit(&mut self, kind: u32, lm: &LinkMap, o: &mut P1Work) {
+        if kind == EV_VALID {
+            let cur = self.cur;
+            let b = unsafe { self.bs.get_unchecked_mut(cur) };
             b.n += 1;
             if b.n == EB {
                 stage2(b, lm);
-                let [b0, b1] = &mut bs;
-                let prev = if cur == 0 { b1 } else { b0 };
-                flush_batch(prev, lm, o);
-                cur ^= 1;
+                flush_batch(unsafe { self.bs.get_unchecked_mut(cur ^ 1) }, lm, o);
+                self.cur = cur ^ 1;
             }
-            return;
+        } else if kind == EV_DEDUP {
+            let d = unsafe { (*self.slot()).dd };
+            o.dd.push((d.fp >> (64 - pa_bits())) as usize, d);
         }
-        o.dd.push(part, d);
-    });
-    stage2(&mut bs[cur], lm);
-    flush_batch(&mut bs[cur ^ 1], lm, o);
-    flush_batch(&mut bs[cur], lm, o);
+    }
+    fn finish(&mut self, lm: &LinkMap, o: &mut P1Work) {
+        let cur = self.cur;
+        stage2(&mut self.bs[cur], lm);
+        flush_batch(&mut self.bs[cur ^ 1], lm, o);
+        flush_batch(&mut self.bs[cur], lm, o);
+    }
+}
+
+/// A line that did not fit the scanner's windows: reference scanner.
+#[cold]
+#[inline(never)]
+fn event_slow(ctx: &Ctx, buf: &[u8], ls: usize, dc: &mut DateCache, lm: &LinkMap, q: &mut EvQueue, o: &mut P1Work) -> usize {
+    let (end, res) = slow_line::<7>(buf, ls);
+    if let Some(f) = res {
+        let kind = unsafe { event_fields(ctx, dc, lm, &mut ArrFields { f: &f, i: 0 }, q.slot()) };
+        q.commit(kind, lm, o);
+    }
+    end + 1
+}
+
+fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, o: &mut P1Work) {
+    let n = buf.len();
+    if begin >= n {
+        return;
+    }
+    debug_assert!(buf[n - 1] == b'\n');
+    let mut q = EvQueue::new();
+    let mut dc = DateCache::new();
+    let ptr = buf.as_ptr();
+    let mut ls = begin;
+    while ls < limit && ls < n {
+        let p = unsafe { ptr.add(ls) };
+        // (see scan_lean)
+        prefetch(p.wrapping_add(INPUT_AHEAD));
+        match unsafe { line_cursors::<7, 3>(p) } {
+            Line::Slow => ls = event_slow(ctx, buf, ls, &mut dc, lm, &mut q, o),
+            Line::Bad(e) => ls += e + 1,
+            Line::Good(c) => {
+                ls += c.e + 1;
+                let kind = unsafe { event_fields(ctx, &mut dc, lm, &mut MaskFields::new(p, &c), q.slot()) };
+                q.commit(kind, lm, o);
+            }
+        }
+    }
+    q.finish(lm, o);
 }
 
 fn parse_clicks(
