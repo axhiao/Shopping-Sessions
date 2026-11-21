@@ -3038,13 +3038,15 @@ fn person_add_run(st: &mut P3, words: &[u32], pur0: u32) {
 }
 
 /// The sessions and days of the person whose events were added to `st`.
+/// With `ordered`, the person's events are instead that one run of words
+/// (ts | PURCHASE), in time order, and `st.purs` already holds its purchases.
 /// Events are not sorted: two events less than 30 minutes apart are always in
 /// one session, so events are summarized per 30-minute bucket (min, max,
 /// count) and sessions are built from the buckets in time order: a session
 /// breaks between two used buckets iff min(next) - max(previous) > 30 min.
 /// `cls`: the person's clicks as ts << 32 | index into `camps`, sorted by ts,
 /// ties by click id descending (so the last of equal ts has the smallest id).
-fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u64], camps: &[u32]) {
+fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u64], camps: &[u32], ordered: Option<&[u32]>) {
     let mut lo = 0usize;
     let mut hi = 0usize;
     // day accumulators
@@ -3135,21 +3137,12 @@ fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u
         }};
     }
 
-    if st.purs.len() > 1 {
-        st.purs.sort_unstable();
-    }
     let mut pi = 0usize;
-    for wi in 0..st.bits.len() {
-        let mut word = st.bits[wi];
-        if word == 0 {
-            continue;
-        }
-        st.bits[wi] = 0;
-        while word != 0 {
-            let b = wi * 64 + word.trailing_zeros() as usize;
-            word &= word - 1;
-            let c = std::mem::replace(unsafe { st.cell.get_unchecked_mut(b) }, [u32::MAX, 0, 0, 0]);
-            let (t, last) = (c[0] as i64, c[1] as i64);
+    // A stretch of events from `t` to `last` (less than 30 minutes): it goes
+    // on the open session unless it starts more than 30 minutes after it.
+    macro_rules! stretch {
+        ($t:expr, $last:expr, $n:expr) => {{
+            let (t, last): (i64, i64) = ($t, $last);
             if s_start < 0 || t - prev_t > GAP {
                 if s_start >= 0 {
                     finish_session!();
@@ -3171,8 +3164,8 @@ fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u
                 d_sessions += 1;
             }
             prev_t = last;
-            d_events += c[2];
-            // the purchases of this bucket
+            d_events += $n;
+            // the purchases of this stretch
             while pi < st.purs.len() && (st.purs[pi] >> 32) as i64 <= last {
                 let e = st.purs[pi];
                 pi += 1;
@@ -3186,6 +3179,30 @@ fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u
                     st.touched.push(c as u32);
                 }
                 st.catsum[c] += p;
+            }
+        }};
+    }
+    if let Some(words) = ordered {
+        // already in time order: every event is its own stretch
+        for &w in words {
+            let t = (w & TS_DEAD) as i64;
+            stretch!(t, t, 1);
+        }
+    } else {
+        if st.purs.len() > 1 {
+            st.purs.sort_unstable();
+        }
+        for wi in 0..st.bits.len() {
+            let mut word = st.bits[wi];
+            if word == 0 {
+                continue;
+            }
+            st.bits[wi] = 0;
+            while word != 0 {
+                let b = wi * 64 + word.trailing_zeros() as usize;
+                word &= word - 1;
+                let c = std::mem::replace(unsafe { st.cell.get_unchecked_mut(b) }, [u32::MAX, 0, 0, 0]);
+                stretch!(c[0] as i64, c[1] as i64, c[2]);
             }
         }
     }
@@ -4210,17 +4227,45 @@ fn main() {
             tick!(6);
             let loose_pur = lpur.len();
             for p in 0..np {
-                person_add(&mut st, &sorted[start[p] as usize..start[p + 1] as usize]);
-                for r in &rsorted[rstart[p] as usize..rstart[p + 1] as usize] {
+                let loose = &sorted[start[p] as usize..start[p + 1] as usize];
+                let prs = &rsorted[rstart[p] as usize..rstart[p + 1] as usize];
+                let cl = &csorted[cstart[p] as usize..cstart[p + 1] as usize];
+                let mut ordered = None;
+                if loose.is_empty() && prs.len() == 1 {
+                    // the usual case: one run. If it is in time order (it is,
+                    // from the generator) its events need no sorting at all.
+                    let r = &prs[0];
                     let o = &pb[r.src as usize];
                     let words = &o.words[q].as_slice()[r.off as usize..(r.off + r.len) as usize];
                     // (lpur has room for every event of the partition)
-                    let pur0 = lpur.len() as u32;
                     lpur.extend_from_slice(&o.pur[q].as_slice()[r.pur0 as usize..(r.pur0 + r.npur) as usize]);
-                    person_add_run(&mut st, words, pur0);
+                    let (mut in_order, mut prev, mut k) = (true, 0u32, loose_pur as u32);
+                    for &w in words {
+                        let t = w & TS_DEAD;
+                        in_order &= t >= prev;
+                        prev = t;
+                        if w & PURCHASE != 0 {
+                            st.purs.push(((t as u64) << 32) | (PURCHASE | k) as u64);
+                            k += 1;
+                        }
+                    }
+                    if in_order {
+                        ordered = Some(words);
+                    } else {
+                        st.purs.clear();
+                        person_add_run(&mut st, words, loose_pur as u32);
+                    }
+                } else {
+                    person_add(&mut st, loose);
+                    for r in prs {
+                        let o = &pb[r.src as usize];
+                        let words = &o.words[q].as_slice()[r.off as usize..(r.off + r.len) as usize];
+                        let pur0 = lpur.len() as u32;
+                        lpur.extend_from_slice(&o.pur[q].as_slice()[r.pur0 as usize..(r.pur0 + r.npur) as usize]);
+                        person_add_run(&mut st, words, pur0);
+                    }
                 }
-                let cl = &csorted[cstart[p] as usize..cstart[p + 1] as usize];
-                person_finish(&geo, &mut st, lid.persons[p], &lpur, cl, &ccamp);
+                person_finish(&geo, &mut st, lid.persons[p], &lpur, cl, &ccamp, ordered);
                 unsafe { lpur.set_len(loose_pur) };
             }
             tick!(3);
