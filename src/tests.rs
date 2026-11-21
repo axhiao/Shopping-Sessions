@@ -155,3 +155,163 @@ fn year_table_matches() {
         }
     }
 }
+
+/// Random CSV text with every kind of dirt the dialect knows.
+fn random_csv(x: &mut u64, lines: usize, nf: usize) -> Vec<u8> {
+    let mut rnd = |m: u64| {
+        *x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*x >> 33) % m
+    };
+    let mut out = b"h1,h2\n".to_vec();
+    for _ in 0..lines {
+        let kind = rnd(100);
+        if kind == 0 {
+            // empty line
+        } else if kind == 1 {
+            // a very long line of separators or text
+            let n = rnd(3000) as usize;
+            let c = [b',', b'x', b'"'][rnd(3) as usize];
+            out.extend(std::iter::repeat(c).take(n));
+        } else {
+            let count = match rnd(40) {
+                0 => nf + 1,
+                1 => nf - 1,
+                2 => rnd(12) as usize + 1,
+                _ => nf,
+            };
+            for i in 0..count {
+                if i > 0 {
+                    out.push(b',');
+                }
+                let len = match rnd(10) {
+                    0 => 0,
+                    1 => 1,
+                    2 => rnd(70) as usize,
+                    _ => rnd(12) as usize,
+                };
+                let quoted = rnd(5) == 0;
+                if quoted {
+                    out.push(b'"');
+                }
+                for _ in 0..len {
+                    let c = match rnd(60) {
+                        0 => b'"',
+                        1 => b'\r',
+                        2 => b' ',
+                        3 => 0xC3,
+                        v => b'a' + (v % 26) as u8,
+                    };
+                    out.push(c);
+                }
+                if quoted && rnd(50) != 0 {
+                    out.push(b'"');
+                }
+                if rnd(80) == 0 {
+                    out.push(b'"');
+                }
+            }
+        }
+        out.push(b'\n');
+    }
+    out
+}
+
+fn collect<const N: usize>(fast: bool, buf: &[u8], begin: usize, limit: usize) -> Vec<Vec<Vec<u8>>> {
+    let mut rows = Vec::new();
+    let mut f = |fs: &[&[u8]; N]| rows.push(fs.iter().map(|v| v.to_vec()).collect::<Vec<_>>());
+    if fast {
+        scan_fast::<N, _>(buf, begin, limit, &mut f);
+    } else {
+        scan_lines::<N, _>(buf, begin, limit, &mut f);
+    }
+    rows
+}
+
+#[test]
+fn fast_scanner_matches_reference() {
+    let mut x: u64 = 0x5EED;
+    for round in 0..600 {
+        let lines = [1usize, 3, 40, 400, 3000][round % 5];
+        for nf in [2usize, 4, 7] {
+            let text = random_csv(&mut x, lines, nf);
+            let buf = pad_buffer(text);
+            let n = buf.len();
+            // every line start is a possible begin; a few limits
+            let starts: Vec<usize> = (0..n).filter(|&i| buf[i] == b'\n').map(|i| i + 1).collect();
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let begin = starts[(x >> 33) as usize % starts.len().min(8)];
+            for limit in [n, begin + 1, begin + (n - begin) / 2, begin + (n - begin) / 3 + 1] {
+                // the buffer handed to a scanner ends with the first '\n' at or after limit - 1
+                let stop = if limit >= n { n } else { find_byte(&buf, limit - 1, b'\n') + 1 };
+                let b = &buf[..stop.min(n)];
+                macro_rules! check {
+                    ($n:expr) => {
+                        assert_eq!(collect::<$n>(true, b, begin, limit), collect::<$n>(false, b, begin, limit), "round {round} nf {nf} begin {begin} limit {limit}")
+                    };
+                }
+                match nf {
+                    2 => check!(2),
+                    4 => check!(4),
+                    _ => check!(7),
+                }
+            }
+        }
+    }
+}
+
+/// Hand-picked quote cases: the fast scanner agrees with the plain one.
+#[test]
+fn fast_scanner_quote_cases() {
+    let cases: [&[u8]; 16] = [
+        b"a,b", b"\"a\",b", b"a,\"b\"", b"\"\",\"\"", b"\",b", b"a,\"", b"\"a,b", b"a\",b", b"a,b\"", b"\"a\"b,c",
+        b"\"a\"\",c", b"\"\"a,c", b"\"\"\",c", b"\"\"\"\",c", b"a\"\"b,c", b"a,b,c",
+    ];
+    // all pairs of cases on consecutive lines, at many alignments
+    for pad in 0..70 {
+        for a in cases {
+            for b in cases {
+                let mut text = b"h\n".to_vec();
+                text.extend(std::iter::repeat(b'x').take(pad));
+                text.extend_from_slice(b",y\n");
+                text.extend_from_slice(a);
+                text.push(b'\n');
+                text.extend_from_slice(b);
+                text.push(b'\n');
+                let buf = pad_buffer(text);
+                assert_eq!(collect::<2>(true, &buf, 2, buf.len()), collect::<2>(false, &buf, 2, buf.len()), "{:?}", String::from_utf8_lossy(&buf));
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_scan() {
+    let path = std::env::var("SS_BENCH_FILE").expect("SS_BENCH_FILE");
+    let mut text = std::fs::read(path).unwrap();
+    text.truncate(text.len().min(1 << 20));
+    while text.last() != Some(&b'\n') {
+        text.pop();
+    }
+    let buf = pad_buffer(text);
+    let begin = find_byte(&buf, 0, b'\n') + 1;
+    for round in 0..3 {
+        for fast in [false, true] {
+            let t = std::time::Instant::now();
+            let (mut lines, mut acc) = (0u64, 0u64);
+            for _ in 0..200 {
+                let mut f = |fs: &[&[u8]; 7]| {
+                    lines += 1;
+                    acc = acc.wrapping_add(fs[0].len() as u64 + fs[3].as_ptr() as u64 + fs[6].len() as u64);
+                };
+                if fast {
+                    scan_fast::<7, _>(&buf, begin, buf.len(), &mut f);
+                } else {
+                    scan_lines::<7, _>(&buf, begin, buf.len(), &mut f);
+                }
+            }
+            let e = t.elapsed().as_secs_f64();
+            eprintln!("round {round} fast={fast}: {:.2} ns/line, {:.2} GB/s ({lines} {acc})", e * 1e9 / lines as f64, buf.len() as f64 * 200.0 / e / 1e9);
+        }
+    }
+}

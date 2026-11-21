@@ -8,6 +8,9 @@ publish = false
 name = "shopping"
 path = "src/main.rs"
 
+[features]
+diag = []
+
 [profile.release]
 opt-level = 3
 lto = "fat"

@@ -1,5 +1,7 @@
 //! Shopping Sessions pipeline. See README.md for the design.
 
+#[cfg(feature = "diag")]
+mod diag;
 mod pq;
 mod prof;
 #[cfg(test)]
@@ -30,8 +32,15 @@ fn pc_bits() -> u32 {
 }
 const MAX_PC_BITS: u32 = 10;
 const NT_STORES: bool = true;
-const CHUNK: u64 = 4 << 20;
+fn chunk_size() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("SS_CHUNK_KB").ok().and_then(|v| v.parse::<u64>().ok()).map(|k| k << 10).unwrap_or(4 << 20))
+}
 const PAD: usize = 128;
+static XF: AtomicU32 = AtomicU32::new(0);
+static XS: AtomicU64 = AtomicU64::new(0);
+#[inline(always)]
+fn xf(b: u32) -> bool { XF.load(Ordering::Relaxed) & b != 0 }
 
 // ---------------------------------------------------------------------------
 // Memory helpers
@@ -49,11 +58,26 @@ fn zeroed_slice<T>(n: usize) -> &'static mut [T] {
     // over-aligned blocks on one thread.
     let n = n.max(1);
     let bytes = (std::mem::size_of::<T>() * n + 4095) & !4095;
+    const HP: usize = 2 << 20;
     unsafe {
+        if bytes >= HP && thp_mask() & 2 != 0 {
+            // 2 MB aligned so the whole array can be backed by huge pages
+            let p = mmap(std::ptr::null_mut(), bytes + HP, 3, 0x02 | 0x20 | 0x4000, -1, 0);
+            assert!(p as isize != -1 && !p.is_null(), "mmap failed");
+            let a = (p as usize + HP - 1) & !(HP - 1);
+            madvise(a as *mut _, (bytes + HP - 1) & !(HP - 1), 14 /* MADV_HUGEPAGE */);
+            return std::slice::from_raw_parts_mut(a as *mut T, n);
+        }
         let p = mmap(std::ptr::null_mut(), bytes, 3, 0x02 | 0x20 | 0x4000, -1, 0);
         assert!(p as isize != -1 && !p.is_null(), "mmap failed");
         std::slice::from_raw_parts_mut(p as *mut T, n)
     }
+}
+
+/// Huge-page advice, off by default (bit 0: arena, bit 1: big tables).
+fn thp_mask() -> u32 {
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("SS_THP").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
 /// One big lazily-backed region split into per-thread sub-arenas, each
@@ -90,7 +114,10 @@ fn arena() -> &'static Arena {
             let p = unsafe { mmap(std::ptr::null_mut(), cap, 3, 0x02 | 0x20 | 0x4000, -1, 0) };
             if p as isize != -1 && !p.is_null() {
                 let base = (p as usize + (2 << 20) - 1) & !((2 << 20) - 1);
-                let sub = ((cap - (2 << 20)) / subs) & !4095;
+                let sub = ((cap - (2 << 20)) / subs) & !((2 << 20) - 1);
+                if thp_mask() & 1 != 0 {
+                    unsafe { madvise(base as *mut _, sub * subs, 14 /* MADV_HUGEPAGE */) };
+                }
                 let z = || (0..subs).map(|_| AtomicUsize::new(0)).collect();
                 return Arena { base, sub, used: z(), recycle_next: z(), recycle_end: z() };
             }
@@ -805,6 +832,160 @@ fn scan_lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], begin
     }
 }
 
+// --- line-at-a-time scanner ---------------------------------------------------
+// One line per step, from the masks of the 128 bytes at its start: its end is
+// the first newline; it has N fields iff the masks hold N separators up to and
+// including that newline; quotes are checked and stripped with bit tricks
+// (PEXT lines the quote bits up with the fields). Lines of 128 bytes or more
+// take the plain scanner.
+
+/// (separators, newlines, quotes) in the 64 bytes at p.
+#[inline(always)]
+unsafe fn block_masks3(p: *const u8) -> (u64, u64, u64) {
+    #[cfg(target_feature = "avx2")]
+    {
+        use std::arch::x86_64::*;
+        let a = _mm256_loadu_si256(p as *const __m256i);
+        let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let (nl, cm, qt) = (_mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8));
+        let (na, nb) = (_mm256_cmpeq_epi8(a, nl), _mm256_cmpeq_epi8(b, nl));
+        let (sa, sb) = (_mm256_or_si256(na, _mm256_cmpeq_epi8(a, cm)), _mm256_or_si256(nb, _mm256_cmpeq_epi8(b, cm)));
+        let (qa, qb) = (_mm256_cmpeq_epi8(a, qt), _mm256_cmpeq_epi8(b, qt));
+        let m = |x: __m256i, y: __m256i| (_mm256_movemask_epi8(x) as u32 as u64) | ((_mm256_movemask_epi8(y) as u32 as u64) << 32);
+        (m(sa, sb), m(na, nb), m(qa, qb))
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        let (mut s, mut n, mut q) = (0u64, 0u64, 0u64);
+        for i in 0..64 {
+            let c = *p.add(i);
+            s |= ((c == b',' || c == b'\n') as u64) << i;
+            n |= ((c == b'\n') as u64) << i;
+            q |= ((c == b'"') as u64) << i;
+        }
+        (s, n, q)
+    }
+}
+
+#[inline(always)]
+unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
+    let (s0, n0, q0) = block_masks3(p);
+    let (s1, n1, q1) = block_masks3(p.add(64));
+    ((s0 as u128) | ((s1 as u128) << 64), (n0 as u128) | ((n1 as u128) << 64), (q0 as u128) | ((q1 as u128) << 64))
+}
+
+/// The bits of `v` selected by `m`, packed to the low end.
+#[inline(always)]
+fn pext128(v: u128, m: u128) -> u64 {
+    #[cfg(target_feature = "bmi2")]
+    unsafe {
+        use std::arch::x86_64::_pext_u64;
+        let lo = _pext_u64(v as u64, m as u64);
+        let hi = _pext_u64((v >> 64) as u64, (m >> 64) as u64);
+        lo | (hi << ((m as u64).count_ones() & 63))
+    }
+    #[cfg(not(target_feature = "bmi2"))]
+    {
+        let (mut m, mut out, mut k) = (m, 0u64, 0);
+        while m != 0 {
+            let b = m.trailing_zeros();
+            out |= (((v >> b) & 1) as u64) << k;
+            k += 1;
+            m &= m - 1;
+        }
+        out
+    }
+}
+
+/// One line with the plain scanner (lines too long for the masks).
+#[cold]
+#[inline(never)]
+fn slow_line<'a, const N: usize>(buf: &'a [u8], ls: usize) -> (usize, Option<[&'a [u8]; N]>) {
+    let e = find_byte(buf, ls, b'\n');
+    let mut out = None;
+    scan_lines::<N, _>(&buf[..e + 1], ls, e + 1, |f| out = Some(*f));
+    (e, out)
+}
+
+/// Same contract as `scan_lines`; `buf` needs 128 readable bytes past its end
+/// and `begin` must be a line start.
+#[inline(always)]
+fn scan_fast<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], begin: usize, limit: usize, mut f: F) {
+    let n = buf.len();
+    if begin >= n {
+        return;
+    }
+    if option_env!("SS_OLDSCAN").is_some() {
+        return scan_lines::<N, F>(buf, begin, limit, f);
+    }
+    debug_assert!(buf[n - 1] == b'\n');
+    debug_assert!(N >= 1 && N <= 16);
+    let ptr = buf.as_ptr();
+    let mut ls = begin;
+    let mut fields: [&'a [u8]; N] = [&[]; N];
+    while ls < limit && ls < n {
+        let (sep, nl, qt) = if option_env!("SS_ALIGNED").is_some() {
+            // aligned blocks, shifted to the line start
+            let o = (ls & 63) as u32;
+            let b = unsafe { ptr.add(ls & !63) };
+            let (s0, n0, q0) = unsafe { block_masks3(b) };
+            let (s1, n1, q1) = unsafe { block_masks3(b.add(64)) };
+            let (s2, n2, q2) = unsafe { block_masks3(b.add(128)) };
+            let w = |a: u64, b: u64, c: u64| -> u128 {
+                let lo = (a >> o) | ((b << 1) << (63 - o));
+                let hi = (b >> o) | ((c << 1) << (63 - o));
+                (lo as u128) | ((hi as u128) << 64)
+            };
+            (w(s0, s1, s2), w(n0, n1, n2), w(q0, q1, q2))
+        } else {
+            unsafe { masks128(ptr.add(ls)) }
+        };
+        if nl == 0 {
+            let (e, r) = slow_line::<N>(buf, ls);
+            if let Some(r) = r {
+                f(&r);
+            }
+            ls = e + 1;
+            continue;
+        }
+        let e = nl.trailing_zeros() as usize;
+        let keep = 2u128.wrapping_shl(e as u32).wrapping_sub(1);
+        let sep = sep & keep;
+        let qt = qt & keep;
+        // positions right after a separator (or at the line start) / right before one
+        let after = (sep << 1) | 1;
+        let before = sep >> 1;
+        let opens = pext128(qt, after);
+        let closes = pext128(qt << 1, sep);
+        let bad = (qt & !(after ^ before)) != 0 || opens != closes || sep.count_ones() as usize != N;
+        if !bad {
+            // separator positions: those of the low word, then those of the high word
+            let mut pos = [0u32; 32];
+            let (mut lo, mut hi) = (sep as u64, (sep >> 64) as u64);
+            let c = lo.count_ones() as usize;
+            unsafe {
+                for i in 0..N {
+                    *pos.get_unchecked_mut(i) = lo.trailing_zeros();
+                    lo &= lo.wrapping_sub(1);
+                }
+                for i in 0..N {
+                    *pos.get_unchecked_mut(c + i) = 64 + hi.trailing_zeros();
+                    hi &= hi.wrapping_sub(1);
+                }
+                let mut s = ls;
+                for i in 0..N {
+                    let en = ls + *pos.get_unchecked(i) as usize;
+                    let q = ((opens >> i) & 1) as usize;
+                    fields[i] = std::slice::from_raw_parts(ptr.add(s + q), en - s - 2 * q);
+                    s = en + 1;
+                }
+            }
+            f(&fields);
+        }
+        ls += e + 1;
+    }
+}
+
 /// Pads a whole-file buffer: guarantees a final '\n' and PAD zero bytes.
 fn pad_buffer(mut v: Vec<u8>) -> Vec<u8> {
     if v.last() != Some(&b'\n') {
@@ -1407,7 +1588,9 @@ fn chunk_bytes<'a>(inf: &'a InFile, c: &Chunk, buf: &'a mut Vec<u8>) -> (&'a [u8
         // populate the page tables for this range in one go
         let s = (c.start as usize) & !4095;
         let e = ((c.end as usize + 65536).min(inf.len as usize) + 4095) & !4095;
-        unsafe { madvise(inf.map.add(s) as *mut _, e - s, 22 /* MADV_POPULATE_READ */) };
+        if std::env::var_os("SS_NO_POP").is_none() {
+            unsafe { madvise(inf.map.add(s) as *mut _, e - s, 22 /* MADV_POPULATE_READ */) };
+        }
         let begin = if c.start == 0 {
             find_byte(all, 0, b'\n') + 1
         } else {
@@ -1450,7 +1633,7 @@ struct P1Out {
 
 fn parse_links(buf: &[u8], begin: usize, limit: usize) -> Vec<(Key, Key)> {
     let mut out = Vec::new();
-    scan_lines::<2, _>(buf, begin, limit, |f| {
+    scan_fast::<2, _>(buf, begin, limit, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
@@ -1493,7 +1676,7 @@ fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
     for j in 0..b.n {
         let mut p = b.pay[j];
         let mut ph = b.h[j];
-        if b.linked[j] {
+        if b.linked[j] && !xf(4) {
             p.person = lm.person(&p.person, ph);
             ph = hk(&p.person);
         }
@@ -1508,8 +1691,8 @@ fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
             IDX_OVERFLOW.store(true, Ordering::Relaxed);
         }
         d.b |= HAS_PAY | ((q as u64) << IDX_BITS) | (idx & ((1 << IDX_BITS) - 1));
-        o.pay.push(q, rec);
-        o.dd.push((d.fp >> (64 - pa_bits())) as usize, d);
+        if !xf(2) { o.pay.push(q, rec); }
+        if !xf(1) { o.dd.push((d.fp >> (64 - pa_bits())) as usize, d); }
     }
     b.n = 0;
 }
@@ -1527,8 +1710,8 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
     // two batches: `bs[cur]` fills while `bs[cur ^ 1]` waits for its slots
     let mut bs = [empty, empty];
     let mut cur = 0usize;
-    scan_lines::<7, _>(buf, begin, limit, |f| {
-        if f[0].is_empty() {
+    scan_fast::<7, _>(buf, begin, limit, |f| {
+        if f[0].is_empty() || xf(16) {
             return;
         }
         let (fp, fp2) = eid_fp(&key_of(f[0]));
@@ -1536,6 +1719,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
         let ingest = (ingest_s - ctx.ingest_base_s).clamp(0, 0xFF_FFFF) as u64;
         let d = RecD { fp, b: ((fp2 as u64) << 56) | (ingest << 32) };
         let part = (fp >> (64 - pa_bits())) as usize;
+        if xf(32) { XS.fetch_add(d.fp ^ d.b, Ordering::Relaxed); return; }
         'v: {
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
@@ -1557,10 +1741,12 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
                 _ => break 'v,
             };
             let cat = if ty == T_PURCHASE { ctx.products.get(&key_of(f[5])).unwrap_or(ctx.unknown_cat) } else { 0 };
+            if xf(64) { XS.fetch_add(d.fp ^ d.b ^ ts as u64 ^ price as u64 ^ cat as u64, Ordering::Relaxed); return; }
             let user = key_of(f[1]);
             let p = Pend { person: user, ts: (ts - ws) as u32, purchase: ty == T_PURCHASE };
             let h = hk(&user);
             lm.prefetch_filter(h);
+            if xf(8) { return; }
             let b = &mut bs[cur];
             b.pay[b.n] = p;
             b.pc[b.n] = (price, cat);
@@ -1576,7 +1762,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
             }
             return;
         }
-        o.dd.push(part, d);
+        if !xf(1) { o.dd.push(part, d); }
     });
     stage2(&mut bs[cur], lm);
     flush_batch(&mut bs[cur ^ 1], lm, o);
@@ -1611,7 +1797,7 @@ fn parse_clicks(
             clq.push(q, rec);
         }
     };
-    scan_lines::<4, _>(buf, begin, limit, |f| {
+    scan_fast::<4, _>(buf, begin, limit, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
@@ -1927,7 +2113,12 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
         .clamp(1, 31);
     SUBS.store(nthreads + 1, Ordering::Relaxed);
-    let verbose = std::env::var("SS_VERBOSE").is_ok();
+    let verbose = cfg!(feature = "diag") || std::env::var("SS_VERBOSE").is_ok();
+    #[cfg(feature = "diag")]
+    diag::run(&data, &out, nthreads);
+    #[cfg(feature = "diag")]
+    let t0 = Instant::now();
+    XF.store(std::env::var("SS_X").ok().and_then(|v| v.parse().ok()).unwrap_or(0), Ordering::Relaxed);
     let lap = |what: &str| {
         if verbose {
             let mut ru = [0i64; 18];
@@ -2036,7 +2227,7 @@ fn main() {
     for (fi, f) in files.iter().enumerate() {
         let mut s = 0;
         while s < f.len {
-            let e = (s + CHUNK).min(f.len);
+            let e = (s + chunk_size()).min(f.len);
             chunks.push(Chunk { kind: f.kind, file: fi, start: s, end: e });
             s = e;
         }
@@ -2048,9 +2239,11 @@ fn main() {
     let per = |n: usize, parts: usize| n / parts / nthreads + n / parts / nthreads / 3 + 64;
     // about 40k events per partition, between 256 and 1024 partitions
     let bits = ((est_events / 40_000).max(1) as f64).log2().round().clamp(8.0, MAX_PC_BITS as f64) as u32;
-    PA_BITS_V.store(bits, Ordering::Relaxed);
+    let abits = std::env::var("SS_ABITS").ok().and_then(|v| v.parse().ok()).unwrap_or(bits);
+    let bits = std::env::var("SS_CBITS").ok().and_then(|v| v.parse().ok()).unwrap_or(bits);
+    PA_BITS_V.store(abits, Ordering::Relaxed);
     PC_BITS_V.store(bits, Ordering::Relaxed);
-    let (pa, pc) = (1usize << bits, 1usize << bits);
+    let (pa, pc) = (1usize << abits, 1usize << bits);
     if verbose {
         eprintln!("  partitions: {pa} x {pc} (estimated {est_events} events)");
     }
@@ -2168,13 +2361,14 @@ fn main() {
             }
             let c = &chunks[data_chunks[i]];
             let (bytes, b, l) = chunk_bytes(&files[c.file], c, &mut buf);
+            if xf(128) && c.kind == Kind::Click { continue; }
             match c.kind {
                 Kind::Event => parse_events(ctx, bytes, b, l, lm, &mut o),
                 Kind::Click => parse_clicks(ctx, bytes, b, l, lm, &mut o.clq, &mut o.cesc),
                 Kind::Link => unreachable!(),
             }
             let inf = &files[c.file];
-            if !inf.map.is_null() {
+            if !inf.map.is_null() && std::env::var_os("SS_NO_REL").is_none() {
                 release(unsafe { inf.map.add(c.start as usize) }, (c.end - c.start) as usize);
             }
         }
@@ -2596,6 +2790,17 @@ fn main() {
             for k in 0..4 {
                 cols[3 + k].push_i64(a[k] as i64);
             }
+        }
+    }
+    #[cfg(feature = "diag")]
+    {
+        // a diagnostic build must never be scored: one extra row
+        n += 1;
+        cols[0].push_str(b"diag");
+        cols[1].push_str(b"diag");
+        cols[2].push_i32(day0 as i32);
+        for k in 0..4 {
+            cols[3 + k].push_i64(k as i64);
         }
     }
     pq::write_file(&out.join("campaign_daily").join("part-000.parquet"), &cols, n).expect("write campaign_daily");
