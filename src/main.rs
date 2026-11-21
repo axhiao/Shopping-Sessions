@@ -288,6 +288,26 @@ impl<T: Copy, const K: usize> Parts<T, K> {
             c as usize
         }
     }
+    /// Appends `vs` to partition q.
+    #[inline(always)]
+    fn extend(&mut self, q: usize, vs: &[T]) {
+        unsafe {
+            let c = *self.cnt.get_unchecked(q) as usize;
+            *self.cnt.get_unchecked_mut(q) = (c + vs.len()) as u32;
+            let mut k = c & (K - 1);
+            let mut i = 0;
+            while i < vs.len() {
+                let m = (K - k).min(vs.len() - i);
+                std::ptr::copy_nonoverlapping(vs.as_ptr().add(i), self.buf.get_unchecked_mut(q).as_mut_ptr().add(k), m);
+                i += m;
+                k += m;
+                if k == K {
+                    self.flush(q);
+                    k = 0;
+                }
+            }
+        }
+    }
     /// Writes out partition q's staged K - 1 records followed by `v`. The last
     /// record goes from registers straight into the output vector: storing it
     /// in the staging buffer and loading the whole line back would make the
@@ -2914,13 +2934,55 @@ struct Geo {
 /// `evs`: the person's events as ts << 32 | x, in any order; `pur`: (price,
 /// cat) for the purchase indices in x.
 ///
+/// Adds events (ts << 32 | PURCHASE | index of the purchase) to the person
+/// being put together in `st`.
+#[inline(always)]
+fn person_add(st: &mut P3, evs: &[u64]) {
+    for &e in evs {
+        let t = (e >> 32) as u32;
+        let b = (t / GAP as u32) as usize;
+        unsafe {
+            *st.bits.get_unchecked_mut(b >> 6) |= 1 << (b & 63);
+            let c = st.cell.get_unchecked_mut(b);
+            c[0] = c[0].min(t);
+            c[1] = c[1].max(t);
+            c[2] += 1;
+        }
+        if e as u32 & PURCHASE != 0 {
+            st.purs.push(e);
+        }
+    }
+}
+
+/// Adds a run of events (ts | PURCHASE); its purchases are numbered from `pur0`.
+#[inline(always)]
+fn person_add_run(st: &mut P3, words: &[u32], pur0: u32) {
+    let mut k = pur0;
+    for &w in words {
+        let t = w & TS_DEAD;
+        let b = (t / GAP as u32) as usize;
+        unsafe {
+            *st.bits.get_unchecked_mut(b >> 6) |= 1 << (b & 63);
+            let c = st.cell.get_unchecked_mut(b);
+            c[0] = c[0].min(t);
+            c[1] = c[1].max(t);
+            c[2] += 1;
+        }
+        if w & PURCHASE != 0 {
+            st.purs.push(((t as u64) << 32) | (PURCHASE | k) as u64);
+            k += 1;
+        }
+    }
+}
+
+/// The sessions and days of the person whose events were added to `st`.
 /// Events are not sorted: two events less than 30 minutes apart are always in
 /// one session, so events are summarized per 30-minute bucket (min, max,
 /// count) and sessions are built from the buckets in time order: a session
 /// breaks between two used buckets iff min(next) - max(previous) > 30 min.
 /// `cls`: the person's clicks as ts << 32 | index into `camps`, sorted by ts,
 /// ties by click id descending (so the last of equal ts has the smallest id).
-fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u32)], cls: &[u64], camps: &[u32]) {
+fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u64], camps: &[u32]) {
     let mut lo = 0usize;
     let mut hi = 0usize;
     // day accumulators
@@ -3011,20 +3073,6 @@ fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u
         }};
     }
 
-    for &e in evs {
-        let t = (e >> 32) as u32;
-        let b = (t / GAP as u32) as usize;
-        unsafe {
-            *st.bits.get_unchecked_mut(b >> 6) |= 1 << (b & 63);
-            let c = st.cell.get_unchecked_mut(b);
-            c[0] = c[0].min(t);
-            c[1] = c[1].max(t);
-            c[2] += 1;
-        }
-        if e as u32 & PURCHASE != 0 {
-            st.purs.push(e);
-        }
-    }
     if st.purs.len() > 1 {
         st.purs.sort_unstable();
     }
@@ -3724,15 +3772,19 @@ fn main() {
     // time; then, in number order, the valid ones go to their person's
     // partition. (Numbers follow users, so the link map is read user by user.)
     struct PbOut {
-        pay: Vec<PVec<RecP>>,
+        /// Per person partition, runs of events of one person: the number
+        /// of events, the person (compact key), the number of purchases, then
+        /// one word per event (ts | PURCHASE).
+        words: Vec<PVec<u32>>,
         pur: Vec<PVec<(u32, u32)>>,
         pesc: Vec<PVec<Key>>,
     }
+    const RUN_MAX: usize = 1 << 16;
     let next_ix = AtomicUsize::new(0);
     let pb_barrier = std::sync::Barrier::new(nthreads);
     let pb: Vec<PbOut> = if ix.on {
         run_workers(nthreads, |_| {
-            let mut pay: Parts<RecP, 4> = Parts::new(pc, res_pay);
+            let mut words: Parts<u32, 16> = Parts::new(pc, res_pay * 2 + 64);
             let mut pur: Vec<PVec<(u32, u32)>> = (0..pc).map(|_| PVec::with_capacity(res_pay / 24 + 16)).collect();
             let mut pesc: Vec<PVec<Key>> = (0..pc).map(|_| PVec::with_capacity(16)).collect();
             let mut table = vec![u64::MAX; 1usize << ix.shift];
@@ -3740,6 +3792,22 @@ fn main() {
             // users resolved lately: (number, person, person's hash), by the number's low bits
             const UC: usize = 256;
             let mut cache = [(u64::MAX, ZERO, 0u64); UC];
+            // the run being collected: its person and partition, its events
+            let mut run: Vec<u32> = Vec::with_capacity(RUN_MAX);
+            let (mut run_person, mut run_q, mut run_npur) = (ZERO, 0usize, 0u32);
+            // the user field of the last event (number and flag)
+            let mut last_user = u64::MAX;
+            macro_rules! flush_run {
+                () => {
+                    if !run.is_empty() {
+                        let ck = compact(&run_person, unsafe { pesc.get_unchecked_mut(run_q) });
+                        words.extend(run_q, &[run.len() as u32, ck[0], ck[1], ck[2], run_npur]);
+                        words.extend(run_q, &run);
+                        run.clear();
+                        run_npur = 0;
+                    }
+                };
+            }
             loop {
                 let i = next_ix.fetch_add(1, Ordering::Relaxed);
                 if i >= ix.parts {
@@ -3777,38 +3845,53 @@ fn main() {
                         continue;
                     }
                     let user = r.user();
-                    let (person, ph) = if r.b & X_ODD != 0 {
-                        let key = src.ixodd[i].as_slice()[user as usize];
-                        let h = hk(&key);
-                        if linkmap.maybe_linked(h) {
-                            let p = linkmap.person(&key, h);
-                            (p, hk(&p))
-                        } else {
-                            (key, h)
-                        }
-                    } else {
-                        let ce = unsafe { cache.get_unchecked_mut(user as usize % UC) };
-                        if ce.0 != user {
-                            let key = id_key(b'u', user);
+                    let field = user | (r.b & X_ODD);
+                    if field != last_user || r.b & X_ODD != 0 {
+                        let (person, ph) = if r.b & X_ODD != 0 {
+                            let key = src.ixodd[i].as_slice()[user as usize];
                             let h = hk(&key);
-                            *ce = if linkmap.maybe_linked(h) {
+                            if linkmap.maybe_linked(h) {
                                 let p = linkmap.person(&key, h);
-                                (user, p, hk(&p))
+                                (p, hk(&p))
                             } else {
-                                (user, key, h)
-                            };
+                                (key, h)
+                            }
+                        } else {
+                            let ce = unsafe { cache.get_unchecked_mut(user as usize % UC) };
+                            if ce.0 != user {
+                                let key = id_key(b'u', user);
+                                let h = hk(&key);
+                                *ce = if linkmap.maybe_linked(h) {
+                                    let p = linkmap.person(&key, h);
+                                    (user, p, hk(&p))
+                                } else {
+                                    (user, key, h)
+                                };
+                            }
+                            (ce.1, ce.2)
+                        };
+                        last_user = field;
+                        if person != run_person {
+                            flush_run!();
+                            run_person = person;
+                            run_q = (ph >> pc_shift) as usize;
                         }
-                        (ce.1, ce.2)
-                    };
-                    let q = (ph >> pc_shift) as usize;
+                    }
+                    if run.len() == RUN_MAX {
+                        flush_run!();
+                    }
                     let purchase = (r.b & X_PURCHASE != 0) as u32;
                     if purchase != 0 {
                         let x = unsafe { recs.get_unchecked(pos + 1) };
-                        unsafe { pur.get_unchecked_mut(q) }.push((x.a as u32, (x.a >> 32) as u32));
+                        unsafe { pur.get_unchecked_mut(run_q) }.push((x.a as u32, (x.a >> 32) as u32));
+                        run_npur += 1;
                     }
-                    let rec = RecP { p: compact(&person, unsafe { pesc.get_unchecked_mut(q) }), t: r.ts() | (purchase << 31) };
-                    pay.push(q, rec);
+                    run.push(r.ts() | (purchase << 31));
                 }
+                // (a person's events may go on in the next partition, which
+                // another thread may have: that is a second run)
+                flush_run!();
+                last_user = u64::MAX;
             }
             // nobody reads the link map any more: free it, a slice each
             pb_barrier.wait();
@@ -3820,7 +3903,7 @@ fn main() {
                 let n = (1usize << 16).min(linkmap.size() - (j << 16));
                 release(unsafe { linkmap.slots.add(j << 16) } as *const u8, n * std::mem::size_of::<Slot>());
             }
-            PbOut { pay: pay.finish(), pur, pesc }
+            PbOut { words: words.finish(), pur, pesc }
         })
     } else {
         Vec::new()
@@ -3834,13 +3917,17 @@ fn main() {
             recycle(w, o.dd_region.0, o.dd_region.1);
         }
     }
-    // the payloads of every person partition: from phase 1, then from phase 2b
-    type PaySrc<'a> = (&'a [PVec<RecP>], &'a [PVec<(u32, u32)>], &'a [PVec<Key>]);
-    let pay_srcs: Vec<PaySrc> = p1
-        .iter()
-        .map(|o| (&o.pay[..], &o.pur[..], &o.pesc[..]))
-        .chain(pb.iter().map(|o| (&o.pay[..], &o.pur[..], &o.pesc[..])))
-        .collect();
+    /// A run of phase 2b in a person partition: the local person, where its
+    /// event words and its purchases are.
+    #[derive(Clone, Copy, Default)]
+    struct RunRef {
+        pid: u32,
+        src: u32,
+        off: u32,
+        len: u32,
+        pur0: u32,
+        npur: u32,
+    }
 
 
     // --- phase 3: sessionize per person partition
@@ -3854,7 +3941,7 @@ fn main() {
     let _ = fs::create_dir_all(out.join("campaign_daily"));
     // biggest partitions first for load balance
     let mut order: Vec<(usize, usize)> = (0..pc)
-        .map(|q| (pay_srcs.iter().map(|o| o.0[q].len()).sum::<usize>(), q))
+        .map(|q| (p1.iter().map(|o| o.pay[q].len()).sum::<usize>() + pb.iter().map(|o| o.words[q].len()).sum::<usize>(), q))
         .collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let max_part = order[0].0;
@@ -3893,6 +3980,9 @@ fn main() {
         let mut ccid = arena_vec::<Key>(max_clicks);
         let mut cpid = arena_vec::<u32>(max_clicks);
         let mut start: Vec<u32> = Vec::new();
+        let mut runs: Vec<RunRef> = Vec::new();
+        let mut rsorted: Vec<RunRef> = Vec::new();
+        let mut rstart: Vec<u32> = Vec::new();
         let mut cstart: Vec<u32> = Vec::new();
         let mut fill: Vec<u32> = Vec::new();
         let mut tm = [0f64; 7];
@@ -3920,11 +4010,11 @@ fn main() {
             evs.clear();
             pids.clear();
             lpur.clear();
-            for o in pay_srcs.iter() {
-                let side = o.1[q].as_slice();
-                let esc = o.2[q].as_slice();
+            for o in p1.iter() {
+                let side = o.pur[q].as_slice();
+                let esc = o.pesc[q].as_slice();
                 let mut pk = 0usize;
-                for e in o.0[q].as_slice() {
+                for e in o.pay[q].as_slice() {
                     let purchase = e.t >> 31;
                     let ts = e.t & TS_DEAD;
                     if ts == TS_DEAD {
@@ -3942,11 +4032,43 @@ fn main() {
                     evs.push(((ts as u64) << 32) | x as u64);
                 }
             }
-            if evs.is_empty() {
+            // the runs of the sequence-number path: one person each
+            runs.clear();
+            for (src, o) in pb.iter().enumerate() {
+                let words = o.words[q].as_slice();
+                let esc = o.pesc[q].as_slice();
+                let (mut at, mut pk) = (0usize, 0u32);
+                while at < words.len() {
+                    let (len, npur) = (words[at], words[at + 4]);
+                    let pid = lid.intern(&[words[at + 1], words[at + 2], words[at + 3]], esc);
+                    runs.push(RunRef { pid, src: src as u32, off: at as u32 + 5, len, pur0: pk, npur });
+                    pk += npur;
+                    at += 5 + len as usize;
+                }
+            }
+            if evs.is_empty() && runs.is_empty() {
                 continue;
             }
             tick!(0);
             let np = lid.persons.len();
+            // the runs by person
+            rstart.clear();
+            rstart.resize(np + 1, 0);
+            for r in runs.iter() {
+                rstart[r.pid as usize + 1] += 1;
+            }
+            for k in 0..np {
+                rstart[k + 1] += rstart[k];
+            }
+            rsorted.clear();
+            rsorted.resize(runs.len(), RunRef::default());
+            fill.clear();
+            fill.extend_from_slice(&rstart[..np]);
+            for r in runs.iter() {
+                let f = &mut fill[r.pid as usize];
+                rsorted[*f as usize] = *r;
+                *f += 1;
+            }
             // counting sort by pid
             start.clear();
             start.resize(np + 1, 0);
@@ -4022,10 +4144,20 @@ fn main() {
                 }
             }
             tick!(6);
+            let loose_pur = lpur.len();
             for p in 0..np {
-                let ev = &sorted[start[p] as usize..start[p + 1] as usize];
+                person_add(&mut st, &sorted[start[p] as usize..start[p + 1] as usize]);
+                for r in &rsorted[rstart[p] as usize..rstart[p + 1] as usize] {
+                    let o = &pb[r.src as usize];
+                    let words = &o.words[q].as_slice()[r.off as usize..(r.off + r.len) as usize];
+                    // (lpur has room for every event of the partition)
+                    let pur0 = lpur.len() as u32;
+                    lpur.extend_from_slice(&o.pur[q].as_slice()[r.pur0 as usize..(r.pur0 + r.npur) as usize]);
+                    person_add_run(&mut st, words, pur0);
+                }
                 let cl = &csorted[cstart[p] as usize..cstart[p + 1] as usize];
-                process_person(&geo, &mut st, lid.persons[p], ev, &lpur, cl, &ccamp);
+                person_finish(&geo, &mut st, lid.persons[p], &lpur, cl, &ccamp);
+                unsafe { lpur.set_len(loose_pur) };
             }
             tick!(3);
             tick!(4);
