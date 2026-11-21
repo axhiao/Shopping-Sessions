@@ -19,62 +19,65 @@ macro_rules! dl {
     }};
 }
 
-fn squeeze(l: &str) -> String {
-    let mut t = l.replace('\t', " ");
-    for (a, b) in [
-        ("/sys/kernel/mm/transparent_hugepage/", "thp_"),
-        ("/proc/self/status: ", ""),
-        ("/proc/cpuinfo: ", ""),
-        ("/proc/version: ", ""),
-        ("/proc/self/mountinfo: ", "mnt "),
-        ("threads=", "t"),
-        (" ms wall", "ms"),
-        ("AnonHugePages:", "AHP"),
-        ("us/4K-page cpu", "us/pg"),
-        ("status=Some(0) signal=None | ", ""),
-        ("phase_3_sessions_+_user_daily", "p3"),
-        ("phase_2a_dedup", "dd"),
-        ("phase_1_parse", "p1"),
-        ("link_map_built", "lm"),
-    ] {
-        t = t.replace(a, b);
-    }
-    while t.contains("  ") {
-        t = t.replace("  ", " ");
-    }
-    t.trim().chars().take(200).collect()
+/// The numbers after the first ": " of a log line.
+fn nums(l: &str) -> Vec<f64> {
+    let rest = l.split_once(": ").map(|x| x.1).unwrap_or(l);
+    rest.split_whitespace().filter_map(|t| t.trim_matches(|c| c == ',' || c == ';' || c == '[' || c == ']').parse().ok()).collect()
 }
 
-/// Text for the extra output rows: first the key facts, then the whole log in pieces.
+fn threads_of(l: &str) -> String {
+    l.split("threads=").nth(1).map(|r| r.chars().take_while(|c| c.is_ascii_digit()).collect()).unwrap_or_default()
+}
+
+/// Text for the one extra output row (the scorer shows about 1700 characters
+/// of it): the pipeline variants, then the micro-benchmarks, as tersely as possible.
 pub fn rows() -> Vec<String> {
     let log = LOG.lock().unwrap().clone();
-    let pick = |keys: &[&str], max: usize| -> Vec<String> {
-        let mut v = Vec::new();
-        for k in keys {
-            for l in log.lines().filter(|l| l.contains(k)).take(max) {
-                let t = squeeze(l);
-                if !v.contains(&t) {
-                    v.push(t);
-                }
-            }
+    let mut t = String::from("v3;");
+    t.push_str(&COMPACT.lock().unwrap().join(";"));
+    t.push_str(";;");
+    let g = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(-1.0);
+    for l in log.lines() {
+        let v = nums(l);
+        let nt = threads_of(l);
+        if l.contains("shmem_enabled") {
+            let cur = l.split('[').nth(1).and_then(|r| r.split(']').next()).unwrap_or("?");
+            t.push_str(&format!("shm={cur};"));
+        } else if l.contains("cpu MHz") && !t.contains("MHz=") {
+            t.push_str(&format!("MHz={:.0};", g(&v, 0)));
+        } else if l.starts_with("pmd ") {
+            t.push_str(&format!("{};", l.replace(' ', "")));
+        } else if l.starts_with("fault ") {
+            // GB/s, us per 4K page, huge pages in use
+            let thp = l.contains("thp=true");
+            t.push_str(&format!("F{}{nt}:{:.1},{:.2},{};", if thp { "h" } else { "k" }, g(&v, 3), g(&v, 4), (g(&v, 5) > 0.0) as u8));
+        } else if l.starts_with("bandwidth ") {
+            let k = l.split_whitespace().nth(1).unwrap_or("?");
+            let k = match k {
+                "read" => "r",
+                "write" => "w",
+                "write-nt" => "n",
+                _ => "s",
+            };
+            t.push_str(&format!("B{k}{nt}:{:.1};", g(&v, 0)));
+        } else if l.starts_with("random read") {
+            t.push_str(&format!("R{}{nt}:{:.1};", if l.contains("thp") { "h" } else { "k" }, g(&v, 0)));
+        } else if l.starts_with("dontneed ") {
+            t.push_str(&format!("D{}{nt}:{:.0};", if l.contains("thp=true") { "h" } else { "k" }, g(&v, 0)));
+        } else if l.starts_with("pread pass") {
+            let pass = if l.contains("pass 0") { 0 } else { 1 };
+            t.push_str(&format!("P{pass}:{:.1};", g(&v, 1)));
+        } else if l.starts_with("mmap+populate") {
+            t.push_str(&format!("M:{:.1},{:.2};", g(&v, 1), g(&v, 3)));
+        } else if l.starts_with("write output") || l.starts_with("write scratch") {
+            t.push_str(&format!("W{}:{:.0},{:.0};", if l.contains("output") { "o" } else { "s" }, g(&v, 0), g(&v, 4)));
+        } else if l.starts_with("scan fast") {
+            t.push_str(&format!("S{}{nt}:{:.1};", if l.contains("fast=true") { "n" } else { "o" }, g(&v, 0)));
+        } else if l.starts_with("synthetic") {
+            t.push_str(&format!("syn:{:.0};", g(&v, 1)));
         }
-        v
-    };
-    let mut out = Vec::new();
-    let mut a = pick(&["model name"], 1);
-    a.extend(pick(&["flags of interest", "Cpus_allowed_list", "processors listed"], 1));
-    a.extend(pick(&["siblings "], 8));
-    a.extend(pick(&["cache index", "Linux version", "hugepage/enabled", "hugepage/defrag", " /data ", " /output ", " /scratch ", "page cache before", "cpu.max", "memory.max"], 4));
-    out.push(a.join("; "));
-    out.push(pick(&["variant ", "synthetic"], 40).join("; "));
-    out.push(pick(&["fault ", "bandwidth ", "random read", "dontneed "], 40).join("; "));
-    out.push(pick(&["pread", "mmap+populate", "write output", "write scratch", "scan fast", "events:", "clicks:", "links:"], 40).join("; "));
-    out.push(pick(&["phase_1_parse="], 40).join("; "));
-    let flat: Vec<char> = log.replace('\t', " ").replace('\n', " | ").chars().collect();
-    for c in flat.chunks(1800) {
-        out.push(c.iter().collect());
     }
-    out
+    vec![t.chars().take(1700).collect()]
 }
 
 extern "C" {
@@ -341,6 +344,18 @@ fn io_tests(data: &Path, out: &Path, scratch: &Path, nt: usize) {
             munmap(m, len);
         }
     });
+    // are the input files mapped with huge pages?
+    if let Some((p, len)) = files.iter().max_by_key(|f| f.1) {
+        let f = fs::File::open(p).unwrap();
+        unsafe {
+            let m = mmap(std::ptr::null_mut(), *len as usize, 1, 0x02, f.as_raw_fd(), 0);
+            madvise(m, *len as usize, 22);
+            let roll = fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+            let kb = |k: &str| roll.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1).map(|v| v.to_string())).unwrap_or_default();
+            dl!("[diag] pmd shmem={} file={} of={}", kb("ShmemPmdMapped"), kb("FilePmdMapped"), len >> 10);
+            munmap(m, *len as usize);
+        }
+    }
     dl!("[diag] mmap+populate+touch+release threads={nt}: {:.1} ms, {:.2} GB/s, user {:.2} sys {:.2}", w * 1e3, total as f64 / w / 1e9, u, s);
     for (name, dir) in [("output", out), ("scratch", scratch)] {
         let _ = fs::create_dir_all(dir);
@@ -482,7 +497,13 @@ fn synthesize(src: &Path, dst: &Path, copies: usize, nt: usize) -> u64 {
 
 /// Runs this binary as a child on `data` with extra environment; prints its
 /// phase lines and returns the wall time in ms.
-fn child(data: &Path, out: &Path, envs: &[(&str, &str)], show: bool) -> f64 {
+/// Compact records of the pipeline variants, for the output row.
+static COMPACT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Runs this binary as a child on `data` with extra environment. Returns the
+/// wall time in ms and [link map, phase 1 end, dedup end, phase 3 end, user s, sys s]
+/// from its phase lines (zeros if it failed).
+fn child(data: &Path, out: &Path, envs: &[(&str, &str)]) -> (f64, [f64; 6]) {
     let _ = fs::remove_dir_all(out);
     let _ = fs::create_dir_all(out);
     let exe = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
@@ -495,77 +516,125 @@ fn child(data: &Path, out: &Path, envs: &[(&str, &str)], show: bool) -> f64 {
     let t = Instant::now();
     let r = cmd.output();
     let ms = t.elapsed().as_secs_f64() * 1e3;
+    let mut laps = [0f64; 6];
     match r {
         Ok(o) => {
-            if show || !o.status.success() {
-                let text = String::from_utf8_lossy(&o.stderr);
-                let mut line = String::new();
-                for l in text.lines() {
-                    if l.contains(" ms  ") && !l.contains("small inputs") && !l.contains("chunks") {
-                        let mut it = l.split_whitespace();
-                        let at = it.next().unwrap_or("");
-                        let what: Vec<&str> = it.skip(1).take_while(|w| !w.starts_with('(')).collect();
-                        line.push_str(&format!("{}={} ", what.join("_"), at));
-                        if let (Some(a), Some(b)) = (l.find("(user"), l.find("minflt")) {
-                            if l.contains("done") {
-                                line.push_str(&l[a..b.min(l.len())]);
-                            }
-                        }
+            let text = String::from_utf8_lossy(&o.stderr);
+            for l in text.lines() {
+                let at: f64 = l.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                let k = if l.contains("link map built") {
+                    0
+                } else if l.contains("phase 1 parse") {
+                    1
+                } else if l.contains("phase 2a dedup") {
+                    2
+                } else if l.contains("phase 3 sessions") {
+                    3
+                } else {
+                    if l.contains("ms  done") {
+                        let num = |key: &str| -> f64 {
+                            l.find(key).and_then(|p| l[p + key.len()..].split('s').next().and_then(|v| v.trim().parse().ok())).unwrap_or(0.0)
+                        };
+                        laps[4] = num("(user ");
+                        laps[5] = num(" sys ");
                     }
-                }
+                    continue;
+                };
+                laps[k] = at;
+            }
+            if !o.status.success() {
                 use std::os::unix::process::ExitStatusExt;
-                dl!(
-                    "[diag]     {} status={:?} signal={:?} | {}",
-                    envs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "),
-                    o.status.code(),
-                    o.status.signal(),
-                    line
-                );
-                if !o.status.success() {
-                    for l in text.lines().rev().take(6) {
-                        dl!("[diag]       child: {l}");
-                    }
+                dl!("[diag]     child failed: status={:?} signal={:?}", o.status.code(), o.status.signal());
+                for l in text.lines().rev().take(4) {
+                    dl!("[diag]       child: {l}");
                 }
+                laps = [0.0; 6];
             }
         }
         Err(e) => dl!("[diag]     child failed: {e}"),
     }
-    ms
+    (ms, laps)
 }
 
-fn variants(data: &Path, scratch: &Path, nt: usize) {
+fn variants(data: &Path, scratch: &Path, nt: usize, t0: Instant) {
     let syn = scratch.join("syn");
     let t = Instant::now();
     let bytes = synthesize(data, &syn, 20, nt);
     dl!("[diag] synthetic x20 data: {} MB in {:.0} ms", bytes >> 20, t.elapsed().as_secs_f64() * 1e3);
     let out = scratch.join("synout");
-    let nts = nt.to_string();
-    let half = (nt / 2).max(1).to_string();
-    let twice = (nt * 2).to_string();
+    let n = |k: usize| k.to_string();
+    let (n4, n6, n12, n16) = (n(nt / 2), n(nt * 3 / 4), n(nt * 3 / 2), n(nt * 2));
+    // code, environment; the codes are what the output row shows
     let sets: Vec<(&str, Vec<(&str, &str)>)> = vec![
-        ("default", vec![]),
-        ("thp arena", vec![("SS_THP", "1")]),
-        ("thp tables", vec![("SS_THP", "2")]),
-        ("thp both", vec![("SS_THP", "3")]),
-        ("scan line", vec![("SS_SCAN", "1")]),
-        ("scan line aligned", vec![("SS_SCAN", "2")]),
-        ("regular stores", vec![("SS_NT", "0")]),
-        ("read() 1MB", vec![("SS_NO_MMAP", "1"), ("SS_CHUNK_KB", "1024")]),
-        ("chunk 1MB", vec![("SS_CHUNK_KB", "1024")]),
-        ("chunk 16MB", vec![("SS_CHUNK_KB", "16384")]),
-        ("bits 8/8", vec![("SS_ABITS", "8"), ("SS_CBITS", "8")]),
-        ("bits 10/10", vec![("SS_ABITS", "10"), ("SS_CBITS", "10")]),
-        ("bits 10/8", vec![("SS_ABITS", "10"), ("SS_CBITS", "8")]),
-        ("half threads", vec![("NCPU", &half)]),
-        ("2x threads", vec![("NCPU", &twice)]),
-        ("default again", vec![("NCPU", &nts)]),
+        ("d", vec![]),
+        ("t1", vec![("SS_THP", "1")]),
+        ("t2", vec![("SS_THP", "2")]),
+        ("t3", vec![("SS_THP", "3")]),
+        ("s1", vec![("SS_SCAN", "1")]),
+        ("s2", vec![("SS_SCAN", "2")]),
+        ("t3s1", vec![("SS_THP", "3"), ("SS_SCAN", "1")]),
+        ("nt0", vec![("SS_NT", "0")]),
+        ("rd1m", vec![("SS_NO_MMAP", "1"), ("SS_CHUNK_KB", "1024")]),
+        ("rd256", vec![("SS_NO_MMAP", "1"), ("SS_CHUNK_KB", "256")]),
+        ("np", vec![("SS_K", "1")]),
+        ("nr", vec![("SS_K", "2")]),
+        ("na", vec![("SS_K", "4")]),
+        ("c1m", vec![("SS_CHUNK_KB", "1024")]),
+        ("c16m", vec![("SS_CHUNK_KB", "16384")]),
+        ("b88", vec![("SS_ABITS", "8"), ("SS_CBITS", "8")]),
+        ("b99", vec![("SS_ABITS", "9"), ("SS_CBITS", "9")]),
+        ("baa", vec![("SS_ABITS", "10"), ("SS_CBITS", "10")]),
+        ("bca", vec![("SS_ABITS", "12"), ("SS_CBITS", "10")]),
+        ("ba8", vec![("SS_ABITS", "10"), ("SS_CBITS", "8")]),
+        ("n4", vec![("NCPU", &n4)]),
+        ("n6", vec![("NCPU", &n6)]),
+        ("n12", vec![("NCPU", &n12)]),
+        ("n16", vec![("NCPU", &n16)]),
+        ("t3b88", vec![("SS_THP", "3"), ("SS_ABITS", "8"), ("SS_CBITS", "8")]),
+        ("t3baa", vec![("SS_THP", "3"), ("SS_ABITS", "10"), ("SS_CBITS", "10")]),
+        ("d2", vec![]),
     ];
     for (name, envs) in &sets {
-        let mut times = Vec::new();
-        for r in 0..3 {
-            times.push(child(&syn, &out, envs, r == 2));
+        // stay well inside the dev check's time limit
+        if t0.elapsed().as_secs_f64() > 120.0 {
+            COMPACT.lock().unwrap().push(format!("{name}:skip"));
+            continue;
         }
-        dl!("[diag] variant {name}: {:.0} {:.0} {:.0} ms", times[0], times[1], times[2]);
+        let mut best = (f64::MAX, [0f64; 6]);
+        let mut all = Vec::new();
+        for _ in 0..2 {
+            let r = child(&syn, &out, envs);
+            all.push(r.0);
+            if r.0 < best.0 && r.1[3] > 0.0 {
+                best = r;
+            }
+        }
+        if best.0 == f64::MAX {
+            best.0 = 0.0;
+        }
+        let l = best.1;
+        dl!(
+            "[diag] variant {name}: {:.0} {:.0} ms | lm {:.0} p1 {:.0} dd {:.0} p3 {:.0} user {:.2} sys {:.2}",
+            all[0],
+            all[1],
+            l[0],
+            l[1] - l[0],
+            l[2] - l[1],
+            l[3] - l[2],
+            l[4],
+            l[5]
+        );
+        // code:wall,link map,phase 1,dedup,phase 3,user,sys
+        COMPACT.lock().unwrap().push(format!(
+            "{name}:{:.0},{:.0},{:.0},{:.0},{:.0},{:.1},{:.1}",
+            best.0,
+            l[0],
+            l[1] - l[0],
+            l[2] - l[1],
+            l[3] - l[2],
+            l[4],
+            l[5]
+        ));
     }
     let _ = fs::remove_dir_all(&out);
     let _ = fs::remove_dir_all(&syn);
@@ -647,6 +716,6 @@ pub fn run(data: &Path, out: &Path, nt: usize) {
     mem_tests(1);
     mem_tests(nt);
     dl!("[diag] ---- pipeline variants on 20x the dev set ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
-    variants(data, &scratch, nt);
+    variants(data, &scratch, nt, t0);
     dl!("[diag] ---- done ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
 }

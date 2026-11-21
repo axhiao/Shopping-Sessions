@@ -958,6 +958,13 @@ fn pext128(v: u128, m: u128) -> u64 {
     }
 }
 
+/// Experiment switches (SS_K): 1 no populate of input, 2 no release of input, 4 no arena release.
+static KNOBS: AtomicU32 = AtomicU32::new(0);
+#[inline(always)]
+fn knob(b: u32) -> bool {
+    KNOBS.load(Ordering::Relaxed) & b != 0
+}
+
 /// Scanner choice (SS_SCAN): 0 plain, 1 line-at-a-time, 2 the same from aligned blocks.
 #[inline(always)]
 fn scan_mode() -> u32 {
@@ -1670,7 +1677,9 @@ fn chunk_bytes<'a>(inf: &'a InFile, c: &Chunk, buf: &'a mut Vec<u8>) -> (&'a [u8
         // populate the page tables for this range in one go
         let s = (c.start as usize) & !4095;
         let e = ((c.end as usize + 65536).min(inf.len as usize) + 4095) & !4095;
-        unsafe { madvise(inf.map.add(s) as *mut _, e - s, 22 /* MADV_POPULATE_READ */) };
+        if !knob(1) {
+            unsafe { madvise(inf.map.add(s) as *mut _, e - s, 22 /* MADV_POPULATE_READ */) };
+        }
         let begin = if c.start == 0 {
             find_byte(all, 0, b'\n') + 1
         } else {
@@ -2202,6 +2211,7 @@ fn run_workers<R: Send, F: Fn(usize) -> R + Sync>(n: usize, f: F) -> Vec<R> {
 fn main() {
     let t0 = Instant::now();
     raise_fd_limit();
+    KNOBS.store(std::env::var("SS_K").ok().and_then(|v| v.parse().ok()).unwrap_or(0), Ordering::Relaxed);
     let data = PathBuf::from(env_or("DATA_DIR", "/data"));
     let out = PathBuf::from(env_or("OUTPUT_DIR", "/output"));
     let nthreads: usize = std::env::var("NCPU")
@@ -2471,7 +2481,7 @@ fn main() {
                 Kind::Link => unreachable!(),
             }
             let inf = &files[c.file];
-            if !inf.map.is_null() {
+            if !inf.map.is_null() && !knob(2) {
                 release(unsafe { inf.map.add(c.start as usize) }, (c.end - c.start) as usize);
             }
         }
@@ -2825,7 +2835,9 @@ fn main() {
         }
         end_barrier.wait();
         let tr = Instant::now();
-        release_sub_arena(w);
+        if !knob(4) {
+            release_sub_arena(w);
+        }
         if verbose {
             eprintln!("  w{w} arena release {:.1} ms ({} MB)", tr.elapsed().as_secs_f64() * 1e3, arena().used[w].load(Ordering::Relaxed) >> 20);
         }
