@@ -2185,6 +2185,9 @@ fn main() {
     let next_lm = AtomicUsize::new(0);
     run_workers(nthreads, |_| {
         let mut table: Vec<u64> = Vec::new();
+        let mut seen1: Vec<u64> = Vec::new();
+        let mut seen2: Vec<u64> = Vec::new();
+        let mut cand: Vec<u64> = Vec::new();
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= pa {
@@ -2200,47 +2203,74 @@ fn main() {
             if total == 0 {
                 continue;
             }
-            let size = (total * 2).next_power_of_two().max(16);
+            // Pass 1: two bitmaps ("seen", "seen twice") over fingerprint bits;
+            // nearly every event id is unique, so only the copies whose bit was
+            // seen twice (true duplicates plus a few collisions) need the exact
+            // table in pass 2.
+            let m = (total * 16).next_power_of_two().max(64);
+            let pmask = m - 1;
+            seen1.clear();
+            seen1.resize(m / 64, 0);
+            seen2.clear();
+            seen2.resize(m / 64, 0);
+            for o in p1.iter() {
+                for r in o.dd[i].as_slice() {
+                    let pos = (r.fp >> 24) as usize & pmask;
+                    let (wi, bit) = (pos >> 6, 1u64 << (pos & 63));
+                    unsafe {
+                        let s1 = *seen1.get_unchecked(wi);
+                        if s1 & bit != 0 {
+                            *seen2.get_unchecked_mut(wi) |= bit;
+                        } else {
+                            *seen1.get_unchecked_mut(wi) = s1 | bit;
+                        }
+                    }
+                }
+            }
+            cand.clear();
+            for (w, o) in p1.iter().enumerate() {
+                for (j, r) in o.dd[i].as_slice().iter().enumerate() {
+                    let pos = (r.fp >> 24) as usize & pmask;
+                    if unsafe { *seen2.get_unchecked(pos >> 6) } >> (pos & 63) & 1 != 0 {
+                        cand.push(((w as u64) << 32) | j as u64);
+                    }
+                }
+            }
+            if cand.len() < 2 {
+                continue;
+            }
+            let size = (cand.len() * 2).next_power_of_two().max(16);
             let mask = size - 1;
             table.clear();
             table.resize(size, 0);
             // entry: tag (24 bits of fp) << 40 | worker << 32 | index, never 0
-            for (w, o) in p1.iter().enumerate() {
-                let recs = o.dd[i].as_slice();
-                const AHEAD: usize = 16;
-                for k in 0..recs.len().min(AHEAD) {
-                    prefetch(unsafe { table.as_ptr().add((recs[k].fp >> 24) as usize & mask) });
-                }
-                for (j, r) in recs.iter().enumerate() {
-                    if j + AHEAD < recs.len() {
-                        let f = unsafe { recs.get_unchecked(j + AHEAD) }.fp;
-                        prefetch(unsafe { table.as_ptr().add((f >> 24) as usize & mask) });
+            for &c in &cand {
+                let (w, j) = ((c >> 32) as usize, (c & 0xFFFF_FFFF) as usize);
+                let r = unsafe { p1.get_unchecked(w).dd.get_unchecked(i).as_slice().get_unchecked(j) };
+                let tag = (r.fp & 0xFF_FFFF) | 0x80_0000;
+                let entry = (tag << 40) | c;
+                let mut sl = (r.fp >> 24) as usize & mask;
+                loop {
+                    let e = unsafe { *table.get_unchecked(sl) };
+                    if e == 0 {
+                        unsafe { *table.get_unchecked_mut(sl) = entry };
+                        break;
                     }
-                    let tag = (r.fp & 0xFF_FFFF) | 0x80_0000;
-                    let entry = (tag << 40) | ((w as u64) << 32) | j as u64;
-                    let mut sl = (r.fp >> 24) as usize & mask;
-                    loop {
-                        let e = unsafe { *table.get_unchecked(sl) };
-                        if e == 0 {
-                            unsafe { *table.get_unchecked_mut(sl) = entry };
+                    if e >> 40 == tag {
+                        let ow = ((e >> 32) & 0xFF) as usize;
+                        let oj = (e & 0xFFFF_FFFF) as usize;
+                        let other = unsafe { p1.get_unchecked(ow).dd.get_unchecked(i).as_slice().get_unchecked(oj) };
+                        if other.same_event(r) {
+                            if r.ingest() < other.ingest() {
+                                kill(ow, other.b);
+                                unsafe { *table.get_unchecked_mut(sl) = entry };
+                            } else {
+                                kill(w, r.b);
+                            }
                             break;
                         }
-                        if e >> 40 == tag {
-                            let ow = ((e >> 32) & 0xFF) as usize;
-                            let oj = (e & 0xFFFF_FFFF) as usize;
-                            let other = unsafe { p1.get_unchecked(ow).dd.get_unchecked(i).as_slice().get_unchecked(oj) };
-                            if other.same_event(r) {
-                                if r.ingest() < other.ingest() {
-                                    kill(ow, other.b);
-                                    unsafe { *table.get_unchecked_mut(sl) = entry };
-                                } else {
-                                    kill(w, r.b);
-                                }
-                                break;
-                            }
-                        }
-                        sl = (sl + 1) & mask;
                     }
+                    sl = (sl + 1) & mask;
                 }
             }
         }
