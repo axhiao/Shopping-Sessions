@@ -1206,24 +1206,71 @@ impl RecD {
     }
 }
 
-/// Payload of a valid event copy, partitioned by person. `x` is 0 for a view
-/// or cart; for a purchase it is PURCHASE | index into the partition's side
-/// table of (price, category). ts == DEAD marks a copy that lost the dedup.
+/// A key in 12 bytes: exact for strings whose bytes 11..14 are zero (all
+/// strings of up to 11 bytes); otherwise an escape (third word 0xFE) holding
+/// an index into a side table of full keys.
+type Ck = [u32; 3];
+
+const ESCAPE: u32 = 0xFE;
+
+#[inline(always)]
+fn compact(k: &Key, esc: &mut PVec<Key>) -> Ck {
+    if (k[1] >> 8) & 0xFFFF_FFFF == 0 {
+        [(k[0] >> 32) as u32, k[0] as u32, (((k[1] >> 32) as u32) & 0xFFFF_FF00) | (k[1] as u32 & 0xFF)]
+    } else {
+        let i = esc.len() as u32;
+        esc.push(*k);
+        [i, 0, ESCAPE]
+    }
+}
+
+#[inline(always)]
+fn expand(c: &Ck, esc: &[Key]) -> Key {
+    if c[2] & 0xFF == ESCAPE {
+        unsafe { *esc.get_unchecked(c[0] as usize) }
+    } else {
+        [((c[0] as u64) << 32) | c[1] as u64, (((c[2] & 0xFFFF_FF00) as u64) << 32) | (c[2] & 0xFF) as u64]
+    }
+}
+
+/// Payload of a valid event copy (16 bytes), partitioned by person: the
+/// person and ts | PURCHASE. Purchases' (price, category) go, in the same
+/// order, to the partition's side table. A copy that lost the dedup has its
+/// ts bits set to TS_DEAD (keeping the PURCHASE bit, so the side table stays
+/// aligned).
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct RecP {
-    person: Key,
-    ts: u32,
-    x: u32,
+    p: Ck,
+    t: u32,
 }
 
 const PURCHASE: u32 = 1 << 31;
-const DEAD: u32 = u32::MAX;
+const TS_DEAD: u32 = 0x7FFF_FFFF;
 
+/// A pending payload in the parse batch, before its person is resolved.
+#[derive(Clone, Copy)]
+struct Pend {
+    person: Key,
+    ts: u32,
+    purchase: bool,
+}
+
+/// A click as stored by phase 1 (32 bytes), partitioned by person.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RecCc {
+    p: Ck,
+    c: Ck,
+    ts: u32,
+    camp: u32,
+}
+
+/// A click in phase 3.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct RecC {
-    user: Key, // the person after phase 2
+    user: Key, // the person
     cid: Key,
     ts: u32, // ms since window start - 7 days
     camp: u32,
@@ -1399,9 +1446,11 @@ static LINKMAP: OnceLock<LinkMap> = OnceLock::new();
 
 struct P1Work {
     dd: Parts<RecD, 4>,          // by event-id partition
-    pay: Parts<RecP, 8>,         // by person partition
-    pur: Vec<PVec<(u32, u32)>>,  // per person partition: (price, category) of purchases
-    clq: Parts<RecC, 8>,         // by person partition
+    pay: Parts<RecP, 4>,         // by person partition
+    pur: Vec<PVec<(u32, u32)>>,  // per person partition: (price, category) of purchases, in order
+    pesc: Vec<PVec<Key>>,        // per person partition: escaped payload keys
+    clq: Parts<RecCc, 2>,        // by person partition
+    cesc: Vec<PVec<Key>>,        // per person partition: escaped click keys
 }
 
 struct P1Out {
@@ -1409,7 +1458,9 @@ struct P1Out {
     dd: Vec<PVec<RecD>>,
     pay: Vec<PVec<RecP>>,
     pur: Vec<PVec<(u32, u32)>>,
-    clq: Vec<PVec<RecC>>,
+    pesc: Vec<PVec<Key>>,
+    clq: Vec<PVec<RecCc>>,
+    cesc: Vec<PVec<Key>>,
 }
 
 fn parse_links(buf: &[u8], begin: usize, limit: usize) -> Vec<(Key, Key)> {
@@ -1432,7 +1483,7 @@ const EB: usize = 16;
 #[derive(Clone, Copy)]
 struct EvBatch {
     n: usize,
-    pay: [RecP; EB],
+    pay: [Pend; EB],
     pc: [(u32, u32); EB],
     h: [u64; EB],
     linked: [bool; EB],
@@ -1460,18 +1511,17 @@ fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
             p.person = lm.person(&p.person, b.h[j]);
         }
         let q = (hk(&p.person) >> (64 - pc_bits())) as usize;
-        if p.x != 0 {
-            let side = unsafe { o.pur.get_unchecked_mut(q) };
-            p.x = PURCHASE | side.len() as u32;
-            side.push(b.pc[j]);
+        if p.purchase {
+            unsafe { o.pur.get_unchecked_mut(q) }.push(b.pc[j]);
         }
+        let rec = RecP { p: compact(&p.person, unsafe { o.pesc.get_unchecked_mut(q) }), t: p.ts | ((p.purchase as u32) << 31) };
         let mut d = b.dd[j];
         let idx = o.pay.next_index(q) as u64;
         if idx >= 1 << IDX_BITS {
             IDX_OVERFLOW.store(true, Ordering::Relaxed);
         }
         d.b |= HAS_PAY | ((q as u64) << IDX_BITS) | (idx & ((1 << IDX_BITS) - 1));
-        o.pay.push(q, p);
+        o.pay.push(q, rec);
         o.dd.push((d.fp >> (64 - pa_bits())) as usize, d);
     }
     b.n = 0;
@@ -1481,7 +1531,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
     let (ws, we) = (ctx.ws, ctx.we);
     let empty = EvBatch {
         n: 0,
-        pay: [RecP { person: ZERO, ts: 0, x: 0 }; EB],
+        pay: [Pend { person: ZERO, ts: 0, purchase: false }; EB],
         pc: [(0, 0); EB],
         h: [0; EB],
         linked: [false; EB],
@@ -1521,7 +1571,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
             };
             let cat = if ty == T_PURCHASE { ctx.products.get(&key_of(f[5])).unwrap_or(ctx.unknown_cat) } else { 0 };
             let user = key_of(f[1]);
-            let p = RecP { person: user, ts: (ts - ws) as u32, x: (ty == T_PURCHASE) as u32 };
+            let p = Pend { person: user, ts: (ts - ws) as u32, purchase: ty == T_PURCHASE };
             let h = hk(&user);
             lm.prefetch_filter(h);
             let b = &mut bs[cur];
@@ -1546,20 +1596,30 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
     flush_batch(&mut bs[cur], lm, o);
 }
 
-fn parse_clicks(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, clq: &mut Parts<RecC, 8>) {
+fn parse_clicks(
+    ctx: &Ctx,
+    buf: &[u8],
+    begin: usize,
+    limit: usize,
+    lm: &LinkMap,
+    clq: &mut Parts<RecCc, 2>,
+    cesc: &mut [PVec<Key>],
+) {
     let lo = ctx.ws - WEEK;
     const B: usize = 16;
     let mut batch = [RecC { user: ZERO, cid: ZERO, ts: 0, camp: 0 }; B];
     let mut hs = [0u64; B];
     let mut n = 0usize;
-    let flush = |batch: &[RecC], hs: &[u64], clq: &mut Parts<RecC, 8>| {
+    let flush = |batch: &[RecC], hs: &[u64], clq: &mut Parts<RecCc, 2>, cesc: &mut [PVec<Key>]| {
         for (r, &h) in batch.iter().zip(hs) {
             let mut r = *r;
             if lm.maybe_linked(h) {
                 r.user = lm.person(&r.user, h);
             }
             let q = (hk(&r.user) >> (64 - pc_bits())) as usize;
-            clq.push(q, r);
+            let esc = unsafe { cesc.get_unchecked_mut(q) };
+            let rec = RecCc { p: compact(&r.user, esc), c: compact(&r.cid, esc), ts: r.ts, camp: r.camp };
+            clq.push(q, rec);
         }
     };
     scan_lines::<4, _>(buf, begin, limit, |f| {
@@ -1583,11 +1643,11 @@ fn parse_clicks(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
         hs[n] = h;
         n += 1;
         if n == B {
-            flush(&batch, &hs, clq);
+            flush(&batch, &hs, clq, cesc);
             n = 0;
         }
     });
-    flush(&batch[..n], &hs[..n], clq);
+    flush(&batch[..n], &hs[..n], clq, cesc);
 }
 
 // ---------------------------------------------------------------------------
@@ -1617,7 +1677,6 @@ struct P3 {
 struct Geo {
     ws: i64,
     day0: i64,
-    ndays: usize,
     organic: u32,
 }
 
@@ -1877,6 +1936,8 @@ fn main() {
     let manifest = fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let ws = manifest_value(&manifest, "window_start");
     let we = manifest_value(&manifest, "window_end");
+    // event times are stored as 31-bit offsets from the window start
+    assert!(we - ws < TS_DEAD as i64, "window longer than 24 days");
 
     // products and campaigns are parsed by one worker while the others parse links
     let build_ctx = || {
@@ -2082,7 +2143,9 @@ fn main() {
             dd: Parts::new(pa, res_dd),
             pay: Parts::new(pc, res_pay),
             pur: (0..pc).map(|_| PVec::with_capacity(res_pay / 24 + 16)).collect(),
+            pesc: (0..pc).map(|_| PVec::with_capacity(16)).collect(),
             clq: Parts::new(pc, res_cl),
+            cesc: (0..pc).map(|_| PVec::with_capacity(16)).collect(),
         };
         // the dedup buffers were allocated first, contiguously; they are dead
         // after phase 2a and phase 3 reuses that memory
@@ -2101,7 +2164,7 @@ fn main() {
             let (bytes, b, l) = chunk_bytes(&files[c.file], c, &mut buf);
             match c.kind {
                 Kind::Event => parse_events(ctx, bytes, b, l, lm, &mut o),
-                Kind::Click => parse_clicks(ctx, bytes, b, l, lm, &mut o.clq),
+                Kind::Click => parse_clicks(ctx, bytes, b, l, lm, &mut o.clq, &mut o.cesc),
                 Kind::Link => unreachable!(),
             }
             let inf = &files[c.file];
@@ -2109,7 +2172,15 @@ fn main() {
                 release(unsafe { inf.map.add(c.start as usize) }, (c.end - c.start) as usize);
             }
         }
-        let r = P1Out { dd_region, dd: o.dd.finish(), pay: o.pay.finish(), pur: o.pur, clq: o.clq.finish() };
+        let r = P1Out {
+            dd_region,
+            dd: o.dd.finish(),
+            pay: o.pay.finish(),
+            pur: o.pur,
+            pesc: o.pesc,
+            clq: o.clq.finish(),
+            cesc: o.cesc,
+        };
         if verbose {
             eprintln!("  p1 w{w} done at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
         }
@@ -2129,7 +2200,10 @@ fn main() {
         }
         let q = ((b >> IDX_BITS) as usize) & (pc - 1);
         let i = (b as usize) & ((1 << IDX_BITS) - 1);
-        unsafe { (*p1[w].pay[q].ptr.add(i)).ts = DEAD };
+        unsafe {
+            let r = &mut *p1[w].pay[q].ptr.add(i);
+            r.t = (r.t & PURCHASE) | TS_DEAD;
+        }
     };
     for v in all_pairs.get().unwrap() {
         release_vec(v);
@@ -2208,7 +2282,7 @@ fn main() {
     // --- phase 3: sessionize per person partition
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
-    let geo = Geo { ws, day0, ndays, organic: ncamp as u32 };
+    let geo = Geo { ws, day0, organic: ncamp as u32 };
     let ncat = ctx.cat_names.len();
     let _ = fs::create_dir_all(out.join("user_daily"));
     let _ = fs::create_dir_all(out.join("campaign_daily"));
@@ -2273,18 +2347,24 @@ fn main() {
             lpur.clear();
             for o in p1.iter() {
                 let side = o.pur[q].as_slice();
+                let esc = o.pesc[q].as_slice();
+                let mut pk = 0usize;
                 for e in o.pay[q].as_slice() {
-                    if e.ts == DEAD {
+                    let purchase = e.t >> 31;
+                    let ts = e.t & TS_DEAD;
+                    if ts == TS_DEAD {
+                        pk += purchase as usize;
                         continue;
                     }
-                    pids.push(lid.intern(&e.person));
-                    let x = if e.x != 0 {
-                        lpur.push(unsafe { *side.get_unchecked((e.x & !PURCHASE) as usize) });
+                    pids.push(lid.intern(&expand(&e.p, esc)));
+                    let x = if purchase != 0 {
+                        lpur.push(unsafe { *side.get_unchecked(pk) });
+                        pk += 1;
                         PURCHASE | (lpur.len() - 1) as u32
                     } else {
                         0
                     };
-                    evs.push(((e.ts as u64) << 32) | x as u64);
+                    evs.push(((ts as u64) << 32) | x as u64);
                 }
             }
             if evs.is_empty() {
@@ -2316,9 +2396,11 @@ fn main() {
             cls.clear();
             cpid.clear();
             for o in p1.iter() {
+                let esc = o.cesc[q].as_slice();
                 for c in o.clq[q].as_slice() {
-                    if let Some(id) = lid.get(&c.user) {
-                        cls.push(*c);
+                    let user = expand(&c.p, esc);
+                    if let Some(id) = lid.get(&user) {
+                        cls.push(RecC { user, cid: expand(&c.c, esc), ts: c.ts, camp: c.camp });
                         cpid.push(id);
                     }
                 }
