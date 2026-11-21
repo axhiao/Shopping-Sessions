@@ -69,10 +69,37 @@ fn fast_ts_matches_reference() {
         let sg = if x & 1 == 0 { '+' } else { '-' };
         seeds.push(format!("{iso}{sg}{oh:02}:{om:02}").into_bytes());
     }
+    let mut dc = DateCache::new();
     for v in &seeds {
         let p = padded(v);
         let f = &p[..v.len()];
         assert_eq!(parse_ts_fast(f), parse_ts(f), "{:?}", String::from_utf8_lossy(v));
+        assert_eq!(parse_ts_dc(&mut dc, f), parse_ts(f), "dc {:?}", String::from_utf8_lossy(v));
+    }
+    // again in another order (other cache states), and with other junk after the field
+    for v in seeds.iter().rev() {
+        let mut p = v.to_vec();
+        p.extend_from_slice(b"Z:+-T0123456789,\"\n00000000000000000000000");
+        let f = &p[..v.len()];
+        assert_eq!(parse_ts_dc(&mut dc, f), parse_ts(f), "dc rev {:?}", String::from_utf8_lossy(v));
+    }
+}
+
+#[test]
+fn key_of_matches_reference() {
+    let mut x: u64 = 77;
+    for _ in 0..200_000 {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let n = (x >> 60) as usize; // 0..=15
+        let mut b = [0u8; 48];
+        for (i, c) in b.iter_mut().enumerate() {
+            *c = (x.rotate_left(i as u32 * 7) >> 11) as u8 | 1;
+        }
+        let s = &b[..n];
+        let raw = u128::from_be_bytes(b[..16].try_into().unwrap());
+        let mask = if n == 0 { 0 } else { !0u128 << (128 - 8 * n) };
+        let v = (raw & mask) | n as u128;
+        assert_eq!(key_of(s), [(v >> 64) as u64, v as u64], "n {n}");
     }
 }
 
@@ -127,6 +154,7 @@ fn days_fast_matches() {
 
 #[test]
 fn ingest_matches_on_valid_f1() {
+    let mut dc = DateCache::new();
     let mut x: u64 = 7;
     for _ in 0..300_000 {
         x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -137,6 +165,8 @@ fn ingest_matches_on_valid_f1() {
         let v = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{se:02}Z").into_bytes();
         let p = padded(&v);
         assert_eq!(parse_ingest(&p[..20]), parse_ts(&p[..20]));
+        assert_eq!(parse_ingest_dc(&mut dc, &p[..20]).map(|v| v.1), parse_ts(&p[..20]));
+        assert_eq!(parse_ingest_dc(&mut dc, &p[..20]).map(|v| v.0 * 1000), parse_ts(&p[..20]));
     }
     for v in [&b"2028-02-29T23:59:59Z"[..], b"2027-12-31T23:59:59Z", b"2026-10-03T23:58:10Z"] {
         let p = padded(v);
@@ -216,11 +246,11 @@ fn random_csv(x: &mut u64, lines: usize, nf: usize) -> Vec<u8> {
     out
 }
 
-fn collect<const N: usize>(fast: bool, buf: &[u8], begin: usize, limit: usize) -> Vec<Vec<Vec<u8>>> {
+fn collect<const N: usize, const K: usize>(fast: bool, buf: &[u8], begin: usize, limit: usize) -> Vec<Vec<Vec<u8>>> {
     let mut rows = Vec::new();
     let mut f = |fs: &[&[u8]; N]| rows.push(fs.iter().map(|v| v.to_vec()).collect::<Vec<_>>());
     if fast {
-        scan_fast::<N, _>(buf, begin, limit, &mut f);
+        scan_lean::<N, K, _>(buf, begin, limit, &mut f);
     } else {
         scan_lines::<N, _>(buf, begin, limit, &mut f);
     }
@@ -245,14 +275,23 @@ fn fast_scanner_matches_reference() {
                 let stop = if limit >= n { n } else { find_byte(&buf, limit - 1, b'\n') + 1 };
                 let b = &buf[..stop.min(n)];
                 macro_rules! check {
-                    ($n:expr) => {
-                        assert_eq!(collect::<$n>(true, b, begin, limit), collect::<$n>(false, b, begin, limit), "round {round} nf {nf} begin {begin} limit {limit}")
+                    ($n:expr, $k:expr) => {
+                        assert_eq!(collect::<$n, $k>(true, b, begin, limit), collect::<$n, $k>(false, b, begin, limit), "round {round} nf {nf} begin {begin} limit {limit}")
                     };
                 }
                 match nf {
-                    2 => check!(2),
-                    4 => check!(4),
-                    _ => check!(7),
+                    2 => check!(2, 1),
+                    4 => {
+                        check!(4, 1);
+                        check!(4, 2);
+                        check!(4, 3)
+                    }
+                    _ => {
+                        check!(7, 4);
+                        check!(7, 3);
+                        check!(7, 6);
+                        check!(7, 1)
+                    }
                 }
             }
         }
@@ -278,7 +317,7 @@ fn fast_scanner_quote_cases() {
                 text.extend_from_slice(b);
                 text.push(b'\n');
                 let buf = pad_buffer(text);
-                assert_eq!(collect::<2>(true, &buf, 2, buf.len()), collect::<2>(false, &buf, 2, buf.len()), "{:?}", String::from_utf8_lossy(&buf));
+                assert_eq!(collect::<2, 1>(true, &buf, 2, buf.len()), collect::<2, 1>(false, &buf, 2, buf.len()), "{:?}", String::from_utf8_lossy(&buf));
             }
         }
     }
@@ -313,5 +352,98 @@ fn bench_scan() {
             let e = t.elapsed().as_secs_f64();
             eprintln!("round {round} fast={fast}: {:.2} ns/line, {:.2} GB/s ({lines} {acc})", e * 1e9 / lines as f64, buf.len() as f64 * 200.0 / e / 1e9);
         }
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_scan2() {
+    let path = std::env::var("SS_BENCH_FILE").expect("SS_BENCH_FILE");
+    let mut text = std::fs::read(path).unwrap();
+    text.truncate(text.len().min(1 << 20));
+    while text.last() != Some(&b'\n') {
+        text.pop();
+    }
+    let buf = pad_buffer(text);
+    let begin = find_byte(&buf, 0, b'\n') + 1;
+    let mut dc = DateCache::new();
+    for mode in 0..4 {
+        for fast in [0, 1, 2] {
+            let t = std::time::Instant::now();
+            let (mut lines, mut acc) = (0u64, 0u64);
+            for _ in 0..200 {
+                let mut f = |fs: &[&[u8]; 7]| {
+                    lines += 1;
+                    match mode {
+                        0 => acc = acc.wrapping_add(fs[0].len() as u64 + fs[3].as_ptr() as u64 + fs[6].len() as u64),
+                        1 => {
+                            for x in fs {
+                                acc = acc.wrapping_add(x.len() as u64 ^ x.as_ptr() as u64);
+                            }
+                        }
+                        3 => {
+                            let k = key_of(fs[0]);
+                            let u = key_of(fs[1]);
+                            let ts = parse_ts_dc(&mut dc, fs[2]).unwrap_or(1);
+                            let ing = parse_ingest_dc(&mut dc, fs[3]).unwrap_or((2, 2));
+                            let ty = event_type(fs[4]);
+                            let pr = if ty == 2 { parse_price(fs[6]).unwrap_or(7) } else { 0 };
+                            let p = key_of(fs[5]);
+                            acc = acc.wrapping_add(k[0] ^ k[1] ^ u[0] ^ u[1] ^ ts as u64 ^ ing.0 as u64 ^ ing.1 as u64 ^ ty as u64 ^ pr as u64 ^ p[0] ^ p[1]);
+                        }
+                        _ => {
+                            let k = key_of(fs[0]);
+                            let u = key_of(fs[1]);
+                            let ts = parse_ts_fast(fs[2]).unwrap_or(1);
+                            let ing = parse_ingest_s(fs[3]).unwrap_or((2, 2));
+                            let ty = event_type(fs[4]);
+                            let pr = if ty == 2 { parse_price(fs[6]).unwrap_or(7) } else { 0 };
+                            let p = key_of(fs[5]);
+                            acc = acc.wrapping_add(k[0] ^ k[1] ^ u[0] ^ u[1] ^ ts as u64 ^ ing.0 as u64 ^ ing.1 as u64 ^ ty as u64 ^ pr as u64 ^ p[0] ^ p[1]);
+                        }
+                    }
+                };
+                match fast {
+                    0 => scan_lines::<7, _>(&buf, begin, buf.len(), &mut f),
+                    1 => scan_fast::<7, _>(&buf, begin, buf.len(), &mut f),
+                    _ => scan_lean::<7, 3, _>(&buf, begin, buf.len(), &mut f),
+                }
+            }
+            let e = t.elapsed().as_secs_f64();
+            eprintln!("mode {mode} scanner={fast}: {:.2} ns/line ({lines} {acc})", e * 1e9 / lines as f64);
+        }
+    }
+}
+
+#[inline(never)]
+pub fn probe_lean(buf: &[u8], begin: usize) -> u64 {
+    let mut acc = 0u64;
+    scan_lean::<7, 3, _>(buf, begin, buf.len(), |fs| {
+        for x in fs {
+            acc = acc.wrapping_add(x.len() as u64 ^ x.as_ptr() as u64);
+        }
+    });
+    acc
+}
+
+#[test]
+#[ignore]
+fn bench_probe() {
+    let path = std::env::var("SS_BENCH_FILE").expect("SS_BENCH_FILE");
+    let mut text = std::fs::read(path).unwrap();
+    text.truncate(text.len().min(1 << 20));
+    while text.last() != Some(&b'\n') {
+        text.pop();
+    }
+    let buf = pad_buffer(text);
+    let begin = find_byte(&buf, 0, b'\n') + 1;
+    let lines = buf.iter().filter(|&&c| c == b'\n').count() - 1;
+    for _ in 0..3 {
+        let t = std::time::Instant::now();
+        let mut acc = 0;
+        for _ in 0..200 {
+            acc ^= probe_lean(std::hint::black_box(&buf), begin);
+        }
+        eprintln!("probe: {:.2} ns/line {acc}", t.elapsed().as_secs_f64() * 1e9 / 200.0 / lines as f64);
     }
 }

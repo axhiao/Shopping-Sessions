@@ -401,11 +401,12 @@ fn key_of(s: &[u8]) -> Key {
     if n > 15 {
         return long_key(s);
     }
-    let raw = unsafe { (s.as_ptr() as *const u128).read_unaligned() };
-    let v = u128::from_be(raw);
-    let mask = if n == 0 { 0 } else { !0u128 << (128 - 8 * n) };
-    let v = (v & mask) | n as u128;
-    [(v >> 64) as u64, v as u64]
+    // the first n bytes, big-endian, zero-padded; n in the last byte
+    let lo = unsafe { (s.as_ptr() as *const u64).read_unaligned() };
+    let hi = unsafe { (s.as_ptr().add(8) as *const u64).read_unaligned() };
+    let lo = if n >= 8 { lo } else { lo & !(!0u64 << (8 * n)) };
+    let hi = if n > 8 { hi & !(!0u64 << (8 * n - 64)) } else { 0 };
+    [lo.swap_bytes(), hi.swap_bytes() | n as u64]
 }
 
 #[inline(always)]
@@ -1037,6 +1038,140 @@ fn scan_fast<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], begin:
     }
 }
 
+// --- lean line-at-a-time scanner ---------------------------------------------
+// The scorer runs two hyperthreads per core flat out, so what counts is the
+// number of micro-ops per line. One line per step from the masks of the bytes
+// at its start; the first K separators come from the low 64 bits, the other
+// N - K from the masks shifted to start right after the K-th (so each side is
+// plain 64-bit arithmetic). Quotes are checked with two PEXTs per side and
+// stripped by moving the field start/end bits, so a field costs two TZCNTs.
+// Anything unusual (a long line, a long field) takes the plain scanner.
+
+/// (separators, newlines, quotes) of the WIN bytes at p, as [bits 0..64, bits 64..].
+#[inline(always)]
+unsafe fn win_masks(p: *const u8) -> ([u64; 2], [u64; 2], [u64; 2]) {
+    #[cfg(target_feature = "avx2")]
+    {
+        use std::arch::x86_64::*;
+        let (nl, cm, qt) = (_mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8));
+        let a = _mm256_loadu_si256(p as *const __m256i);
+        let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let c = _mm256_loadu_si256(p.add(64) as *const __m256i);
+        let m = |x: __m256i| _mm256_movemask_epi8(x) as u32 as u64;
+        let (na, nb, nc) = (_mm256_cmpeq_epi8(a, nl), _mm256_cmpeq_epi8(b, nl), _mm256_cmpeq_epi8(c, nl));
+        let sa = _mm256_or_si256(na, _mm256_cmpeq_epi8(a, cm));
+        let sb = _mm256_or_si256(nb, _mm256_cmpeq_epi8(b, cm));
+        let sc = _mm256_or_si256(nc, _mm256_cmpeq_epi8(c, cm));
+        let (qa, qb, qc) = (_mm256_cmpeq_epi8(a, qt), _mm256_cmpeq_epi8(b, qt), _mm256_cmpeq_epi8(c, qt));
+        ([m(sa) | (m(sb) << 32), m(sc)], [m(na) | (m(nb) << 32), m(nc)], [m(qa) | (m(qb) << 32), m(qc)])
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        let (s0, n0, q0) = block_masks3(p);
+        let (s1, n1, q1) = block_masks3(p.add(64));
+        ([s0, s1], [n0, n1], [q0, q1])
+    }
+}
+
+#[inline(always)]
+fn pext64(v: u64, m: u64) -> u64 {
+    #[cfg(target_feature = "bmi2")]
+    unsafe {
+        std::arch::x86_64::_pext_u64(v, m)
+    }
+    #[cfg(not(target_feature = "bmi2"))]
+    {
+        pext128(v as u128, m as u128)
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn call_cold<A, F: FnMut(&A)>(f: &mut F, a: &A) {
+    f(a)
+}
+
+/// Same contract as `scan_lines`; `buf` needs 128 readable bytes past its end
+/// and `begin` must be a line start. 1 <= K < N.
+#[inline(always)]
+fn scan_lean<'a, const N: usize, const K: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], begin: usize, limit: usize, mut f: F) {
+    let n = buf.len();
+    if begin >= n {
+        return;
+    }
+    debug_assert!(buf[n - 1] == b'\n');
+    debug_assert!(K >= 1 && K < N);
+    let ptr = buf.as_ptr();
+    let mut ls = begin;
+    let mut fields: [&'a [u8]; N] = [&[]; N];
+    while ls < limit && ls < n {
+        let p = unsafe { ptr.add(ls) };
+        let (sep, nl, qt) = unsafe { win_masks(p) };
+        // the line ends at the first newline (128: none in the window)
+        let e = if nl[0] != 0 { nl[0].trailing_zeros() } else { 64 + nl[1].trailing_zeros() } as usize;
+        // s1: the low separators without the first K - 1; r: just past the K-th
+        let mut s1 = sep[0];
+        for _ in 1..K {
+            s1 &= s1.wrapping_sub(1);
+        }
+        let r = s1.trailing_zeros() as usize + 1;
+        if r > 63 || e.wrapping_sub(r) >= 64 {
+            let (end, res) = slow_line::<N>(buf, ls);
+            if let Some(res) = res {
+                call_cold(&mut f, &res);
+            }
+            ls = end + 1;
+            continue;
+        }
+        // Per side: `seps` its separators, `starts` its field starts, `q` the
+        // quotes. A quote must open a field (o) or close one (c), and a field
+        // has both or neither: adding o to !seps carries from an opening quote
+        // to the field's separator, which must then have a closing quote
+        // before it. Quotes are stripped by moving the start/end bits.
+        let s2 = s1 & s1.wrapping_sub(1);
+        let seps = sep[0] ^ s2;
+        let starts = ((sep[0] ^ s1) << 1) | 1;
+        let q = qt[0] & (s1 ^ s1.wrapping_sub(1));
+        let (o, c) = (q & starts, q & (seps >> 1));
+        let bad_lo = (q ^ o ^ c) | (((!seps).wrapping_add(o) ^ (c << 1)) & seps);
+        // high side: fields K..N, bit 0 = the byte at r
+        let w = (sep[0] >> r) | (sep[1] << (64 - r));
+        let mut t1 = w;
+        for _ in 1..N - K {
+            t1 &= t1.wrapping_sub(1);
+        }
+        let t2 = t1 & t1.wrapping_sub(1);
+        let sepw = w ^ t2;
+        let startw = ((w ^ t1) << 1) | 1;
+        let qw = ((qt[0] >> r) | (qt[1] << (64 - r))) & (t1 ^ t1.wrapping_sub(1));
+        let (ow, cw) = (qw & startw, qw & (sepw >> 1));
+        let bad_hi = (qw ^ ow ^ cw) | (((!sepw).wrapping_add(ow) ^ (cw << 1)) & sepw);
+        // well-formed: quotes only around whole fields, and the N-th separator is the newline
+        if (bad_lo | bad_hi) == 0 && r + t1.trailing_zeros() as usize == e {
+            // first and one-past-last content byte of each field (inside the quotes)
+            let (mut cs, mut ce) = (starts + o, seps - c);
+            unsafe {
+                for i in 0..K {
+                    let (a, b) = (cs.trailing_zeros() as usize, ce.trailing_zeros() as usize);
+                    *fields.get_unchecked_mut(i) = std::slice::from_raw_parts(p.add(a), b.wrapping_sub(a));
+                    cs &= cs.wrapping_sub(1);
+                    ce &= ce.wrapping_sub(1);
+                }
+                let pr = p.add(r);
+                let (mut cs, mut ce) = (startw + ow, sepw - cw);
+                for i in K..N {
+                    let (a, b) = (cs.trailing_zeros() as usize, ce.trailing_zeros() as usize);
+                    *fields.get_unchecked_mut(i) = std::slice::from_raw_parts(pr.add(a), b.wrapping_sub(a));
+                    cs &= cs.wrapping_sub(1);
+                    ce &= ce.wrapping_sub(1);
+                }
+            }
+            f(&fields);
+        }
+        ls += e + 1;
+    }
+}
+
 /// Pads a whole-file buffer: guarantees a final '\n' and PAD zero bytes.
 fn pad_buffer(mut v: Vec<u8>) -> Vec<u8> {
     if v.last() != Some(&b'\n') {
@@ -1346,6 +1481,189 @@ fn parse_ts_fast(s: &[u8]) -> Option<i64> {
         return Some((eight_digits(hi) * 100_000_000 + eight_digits(lo)) as i64);
     }
     parse_ts(s)
+}
+
+// --- lean timestamp parsing ---------------------------------------------------
+// Timestamps are most of the per-line work. The data holds a few dozen
+// distinct dates, so "YYYY-MM-DDT" goes through a small validated cache
+// (two compares instead of the calendar arithmetic); "HH:MM:SS" is one SWAR
+// multiply; digit strings are parsed 16 at a time with SSE.
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct DateEnt {
+    a: u64,
+    b: u32,
+    _pad: u32,
+    secs: i64,
+}
+
+/// Dates seen by this thread: "YYYY-MM-" and "-DDT" -> seconds at 00:00:00 UTC.
+/// Direct-mapped on the day and the parity of the month; only valid dates get in.
+struct DateCache([DateEnt; 128]);
+
+impl DateCache {
+    fn new() -> DateCache {
+        DateCache([DateEnt { a: 0, b: 0, _pad: 0, secs: 0 }; 128])
+    }
+
+    /// Seconds at midnight of the date at `s` ("YYYY-MM-DDT", 11 readable
+    /// bytes), or None if it is not a valid date followed by 'T'.
+    #[inline(always)]
+    fn secs(&mut self, s: *const u8) -> Option<i64> {
+        let a = unsafe { (s as *const u64).read_unaligned() };
+        let b = unsafe { (s.add(7) as *const u32).read_unaligned() };
+        let i = ((pext64(b as u64, 0x000F_0300) ^ ((a >> 42) & 0x40)) & 127) as usize;
+        let e = unsafe { self.0.get_unchecked(i) };
+        if e.a == a && e.b == b {
+            return Some(e.secs);
+        }
+        self.miss(i, a, b)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn miss(&mut self, i: usize, a: u64, b: u32) -> Option<i64> {
+        // a = "YYYY-MM-", b = "-DDT"
+        const A_SEP: u64 = 0xFF00_00FF_0000_0000;
+        const A_VAL: u64 = (b'-' as u64) << 32 | (b'-' as u64) << 56;
+        if a & A_SEP != A_VAL || !all_digits(a, !A_SEP) || b >> 24 != b'T' as u32 || !all_digits(b as u64, 0x00FF_FF00) {
+            return None;
+        }
+        let dg = |v: u64, i: u32| ((v >> (8 * i)) & 0xF) as u32;
+        let y = dg(a, 0) * 1000 + dg(a, 1) * 100 + dg(a, 2) * 10 + dg(a, 3);
+        let mo = dg(a, 5) * 10 + dg(a, 6);
+        let d = dg(b as u64, 1) * 10 + dg(b as u64, 2);
+        if mo.wrapping_sub(1) > 11 || d < 1 {
+            return None;
+        }
+        let (before, leap) = year_info(y);
+        const DIM: [u32; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        if d > DIM[mo as usize] + (leap && mo == 2) as u32 {
+            return None;
+        }
+        let secs = days_from_parts(before, leap, mo, d) * 86_400;
+        self.0[i] = DateEnt { a, b, _pad: 0, secs };
+        Some(secs)
+    }
+}
+
+/// "HH:MM:SS" (the 8 bytes at s) -> (seconds of the day, well-formed and in range).
+#[inline(always)]
+fn clock(s: *const u8) -> (i64, bool) {
+    let w = unsafe { (s as *const u64).read_unaligned() };
+    // digits to their values, ':' to 0
+    let t = w ^ 0x3030_3A30_303A_3030;
+    let digits_ok = ((t.wrapping_add(0x7676_0076_7600_7676) | t) & 0x8080_0080_8000_8080) == 0 && t & 0x0000_FF00_00FF_0000 == 0;
+    // lanes 0, 3, 6 = HH, MM, SS
+    const L: u64 = 0x00FF_0000_FF00_00FF;
+    let p = (t.wrapping_mul(10).wrapping_add(t >> 8)) & L;
+    // 23 + 104 = 59 + 68 = 127: a lane over its maximum sets its top bit
+    let range_ok = p.wrapping_add(104 | 68 << 24 | 68 << 48) & 0x0080_0000_8000_0080 == 0;
+    // lanes are 24 bits apart: one multiply sums 1800 HH + 30 MM into the top
+    // 16 bits (the full count of seconds would need 17)
+    let half = p.wrapping_mul(1800 << 48 | 30 << 24) >> 48;
+    ((2 * half + (p >> 48)) as i64, digits_ok && range_ok)
+}
+
+/// 1..=16 ASCII digits -> value, None if any byte is not a digit. 16 bytes
+/// from s must be readable.
+#[inline(always)]
+fn digits16(s: &[u8]) -> Option<u64> {
+    #[cfg(target_feature = "avx2")]
+    unsafe {
+        use std::arch::x86_64::*;
+        // CTL[n] right-aligns the first n bytes (zeros to their left)
+        static CTL: [[u8; 16]; 17] = {
+            let mut t = [[0x80u8; 16]; 17];
+            let mut n = 0;
+            while n <= 16 {
+                let mut i = 0;
+                while i < n {
+                    t[n][16 - n + i] = i as u8;
+                    i += 1;
+                }
+                n += 1;
+            }
+            t
+        };
+        let n = s.len();
+        debug_assert!(n >= 1 && n <= 16);
+        let x = _mm_loadu_si128(s.as_ptr() as *const __m128i);
+        let x = _mm_sub_epi8(x, _mm_set1_epi8(b'0' as i8));
+        let x = _mm_shuffle_epi8(x, _mm_loadu_si128(CTL.get_unchecked(n).as_ptr() as *const __m128i));
+        let over = _mm_subs_epu8(x, _mm_set1_epi8(9));
+        if _mm_testz_si128(over, over) == 0 {
+            return None;
+        }
+        let m = _mm_maddubs_epi16(x, _mm_set1_epi16(0x010A));
+        let m = _mm_madd_epi16(m, _mm_set1_epi32(0x0001_0064));
+        let m = _mm_packus_epi32(m, m);
+        let m = _mm_madd_epi16(m, _mm_set1_epi32(0x0001_2710));
+        let r = _mm_cvtsi128_si64(m) as u64;
+        Some((r & 0xFFFF_FFFF) * 100_000_000 + (r >> 32))
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        let mut v = 0u64;
+        for &c in s {
+            let d = dig(c);
+            if d > 9 {
+                return None;
+            }
+            v = v * 10 + d as u64;
+        }
+        Some(v)
+    }
+}
+
+/// Same contract (and results) as `parse_ts`.
+#[inline(always)]
+fn parse_ts_dc(dc: &mut DateCache, s: &[u8]) -> Option<i64> {
+    let n = s.len();
+    let p = s.as_ptr();
+    if n == 20 {
+        // YYYY-MM-DDTHH:MM:SSZ
+        if let Some(day) = dc.secs(p) {
+            let (sod, ok) = clock(unsafe { p.add(11) });
+            if ok && unsafe { *p.add(19) } == b'Z' {
+                return Some((day + sod) * 1000);
+            }
+        }
+    } else if n.wrapping_sub(1) < 16 {
+        return digits16(s).map(|v| v as i64);
+    } else if n == 25 {
+        // YYYY-MM-DDTHH:MM:SS+HH:MM
+        if let Some(day) = dc.secs(p) {
+            let (sod, ok) = clock(unsafe { p.add(11) });
+            // "SS+HH:MM": sign in lane 2, HH in lanes 3-4, ':' in 5, MM in 6-7
+            let w = unsafe { (p.add(17) as *const u64).read_unaligned() };
+            let t = w ^ 0x3030_3A30_3000_0000;
+            let digits_ok = ((t.wrapping_add(0x7676_0076_7600_0000) | t) & 0x8080_0080_8000_0000) == 0 && t & 0x0000_FF00_0000_0000 == 0;
+            let d = t & 0xFFFF_00FF_FF00_0000;
+            let pr = d.wrapping_mul(10).wrapping_add(d >> 8);
+            let (oh, om) = ((pr >> 24) & 0xFF, (pr >> 48) & 0xFF);
+            let sign = (w >> 16) & 0xFF;
+            if ok && digits_ok && oh <= 23 && om <= 59 && (sign == 0x2B || sign == 0x2D) {
+                let off = (oh * 60 + om) as i64 * 60;
+                return Some((day + sod - if sign == 0x2B { off } else { -off }) * 1000);
+            }
+        }
+    }
+    parse_ts_fast(s)
+}
+
+/// `ingest_ts` (a valid YYYY-MM-DDTHH:MM:SSZ by the rules) -> (seconds,
+/// milliseconds); anything else takes the full parser.
+#[inline(always)]
+fn parse_ingest_dc(dc: &mut DateCache, s: &[u8]) -> Option<(i64, i64)> {
+    if s.len() == 20 {
+        if let Some(day) = dc.secs(s.as_ptr()) {
+            let secs = day + clock(unsafe { s.as_ptr().add(11) }).0;
+            return Some((secs, secs * 1000));
+        }
+    }
+    parse_ts_fast(s).map(|ms| (ms.div_euclid(1000), ms))
 }
 
 #[inline(always)]
@@ -1685,7 +2003,7 @@ struct P1Out {
 fn parse_links(buf: &[u8], begin: usize, limit: usize) -> Vec<(Key, Key)> {
     // a link line is rarely shorter than 16 bytes
     let mut out = Vec::with_capacity(limit.min(buf.len()).saturating_sub(begin) / 16 + 16);
-    scan_fast::<2, _>(buf, begin, limit, |f| {
+    scan_lean::<2, 1, _>(buf, begin, limit, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
@@ -1762,12 +2080,13 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
     // two batches: `bs[cur]` fills while `bs[cur ^ 1]` waits for its slots
     let mut bs = [empty, empty];
     let mut cur = 0usize;
-    scan_fast::<7, _>(buf, begin, limit, |f| {
+    let mut dc = DateCache::new();
+    scan_lean::<7, 3, _>(buf, begin, limit, |f| {
         if f[0].is_empty() {
             return;
         }
         let (fp, fp2) = eid_fp(&key_of(f[0]));
-        let (ingest_s, ingest_ms) = parse_ingest_s(f[3]).unwrap_or((i64::MAX / 2000, i64::MAX / 2));
+        let (ingest_s, ingest_ms) = parse_ingest_dc(&mut dc, f[3]).unwrap_or((i64::MAX / 2000, i64::MAX / 2));
         let ingest = (ingest_s - ctx.ingest_base_s).clamp(0, 0xFF_FFFF) as u64;
         let d = RecD { fp, b: ((fp2 as u64) << 56) | (ingest << 32) };
         let part = (fp >> (64 - pa_bits())) as usize;
@@ -1775,7 +2094,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
             }
-            let ts = match parse_ts_fast(f[2]) {
+            let ts = match parse_ts_dc(&mut dc, f[2]) {
                 Some(t) if t >= ws && t < we => t,
                 _ => break 'v,
             };
@@ -1865,11 +2184,12 @@ fn parse_clicks(
         }
         b.n = 0;
     };
-    scan_fast::<4, _>(buf, begin, limit, |f| {
+    let mut dc = DateCache::new();
+    scan_lean::<4, 2, _>(buf, begin, limit, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
-        let ts = match parse_ts_fast(f[3]) {
+        let ts = match parse_ts_dc(&mut dc, f[3]) {
             Some(t) if t >= lo && t < ctx.we => t,
             _ => return,
         };
