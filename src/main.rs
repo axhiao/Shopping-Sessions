@@ -133,6 +133,7 @@ impl<T: Copy> PVec<T> {
     fn release(&self) {
         release(self.ptr as *const u8, self.cap * std::mem::size_of::<T>());
     }
+
     #[inline(always)]
     fn extend_from_slice(&mut self, s: &[T]) {
         while self.len + s.len() > self.cap {
@@ -416,7 +417,9 @@ impl LinkMap {
     }
     #[inline(always)]
     fn prefetch(&self, h: u64) {
-        prefetch(unsafe { self.slots.add(self.slot_of(h)) });
+        let i = self.slot_of(h);
+        prefetch(unsafe { self.slots.add(i) });
+        prefetch(unsafe { self.slots.add((i + 2) & self.mask) });
     }
     /// The person for user `k` (hash `h`).
     #[inline(always)]
@@ -905,17 +908,32 @@ fn event_type(s: &[u8]) -> u32 {
 
 const VALID: u32 = 1 << 31;
 const T_PURCHASE: u32 = 2;
-const HAS_PAY: u64 = 1 << 63;
-
-/// Dedup record, partitioned by event id. `loc` points at the payload of a
-/// valid copy (HAS_PAY): worker << 48 | partition << 32 | index.
+/// Dedup record (16 bytes), partitioned by event id: `fp` is a 64-bit event-id
+/// fingerprint; `b` = 8 more fingerprint bits << 56 | ingest seconds (24
+/// bits, relative to window start - 2^23 s) << 32 | loc. loc points at the
+/// payload of a valid copy in the same worker: HAS_PAY | partition << 21 |
+/// index.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct RecD {
     fp: u64,
-    fp2: u32,
-    ingest: u32,
-    loc: u64,
+    b: u64,
+}
+
+const HAS_PAY: u64 = 1 << 31;
+const IDX_BITS: u32 = 21;
+const _: () = assert!(PC_BITS + IDX_BITS <= 31);
+static IDX_OVERFLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+impl RecD {
+    #[inline(always)]
+    fn ingest(&self) -> u64 {
+        (self.b >> 32) & 0xFF_FFFF
+    }
+    #[inline(always)]
+    fn same_event(&self, o: &RecD) -> bool {
+        self.fp == o.fp && (self.b >> 56) == (o.b >> 56)
+    }
 }
 
 /// Payload of a valid event copy, partitioned by person. `x` is 0 for a view
@@ -1112,7 +1130,7 @@ static LINKS: Mutex<Vec<Vec<(Key, Key)>>> = Mutex::new(Vec::new());
 static LINKMAP: OnceLock<LinkMap> = OnceLock::new();
 
 struct P1Work {
-    dd: Parts<RecD, 8>,          // by event-id partition
+    dd: Parts<RecD, 4>,          // by event-id partition
     pay: Parts<RecP, 8>,         // by person partition
     pur: Vec<PVec<(u32, u32)>>,  // per person partition: (price, category) of purchases
     clq: Parts<RecC, 8>,         // by person partition
@@ -1151,10 +1169,12 @@ struct EvBatch {
 }
 
 #[inline(always)]
-fn flush_batch(b: &mut EvBatch, lm: &LinkMap, w: usize, o: &mut P1Work) {
+fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
     for j in 0..b.n {
         let mut p = b.pay[j];
-        p.person = lm.person(&p.person, b.h[j]);
+        if !exp(64) {
+            p.person = lm.person(&p.person, b.h[j]);
+        }
         let q = (hk(&p.person) >> (64 - PC_BITS)) as usize;
         if p.x != 0 {
             let side = unsafe { o.pur.get_unchecked_mut(q) };
@@ -1162,21 +1182,33 @@ fn flush_batch(b: &mut EvBatch, lm: &LinkMap, w: usize, o: &mut P1Work) {
             side.push(b.pc[j]);
         }
         let mut d = b.dd[j];
-        d.loc = HAS_PAY | ((w as u64) << 48) | ((q as u64) << 32) | o.pay.next_index(q) as u64;
-        o.pay.push(q, p);
-        o.dd.push((d.fp >> (64 - PA_BITS)) as usize, d);
+        let idx = o.pay.next_index(q) as u64;
+        if idx >= 1 << IDX_BITS {
+            IDX_OVERFLOW.store(true, Ordering::Relaxed);
+        }
+        d.b |= HAS_PAY | ((q as u64) << IDX_BITS) | (idx & ((1 << IDX_BITS) - 1));
+        if !exp(256) {
+            o.pay.push(q, p);
+        } else {
+            std::hint::black_box(&p);
+        }
+        if !exp(128) {
+            o.dd.push((d.fp >> (64 - PA_BITS)) as usize, d);
+        } else {
+            std::hint::black_box(&d);
+        }
     }
     b.n = 0;
 }
 
-fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, w: usize, lm: &LinkMap, o: &mut P1Work) {
+fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, o: &mut P1Work) {
     let (ws, we) = (ctx.ws, ctx.we);
     let mut b = EvBatch {
         n: 0,
         pay: [RecP { person: ZERO, ts: 0, x: 0 }; EB],
         pc: [(0, 0); EB],
         h: [0; EB],
-        dd: [RecD { fp: 0, fp2: 0, ingest: 0, loc: 0 }; EB],
+        dd: [RecD { fp: 0, b: 0 }; EB],
     };
     let stop_scan = exp(16);
     let stop_push = exp(32);
@@ -1190,8 +1222,8 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, w: usize, lm:
         }
         let (fp, fp2) = eid_fp(&key_of(f[0]));
         let ingest_ms = parse_ts(f[3]).unwrap_or(i64::MAX / 2);
-        let ingest = (ingest_ms.div_euclid(1000) - ctx.ingest_base_s).clamp(0, u32::MAX as i64) as u32;
-        let d = RecD { fp, fp2, ingest, loc: 0 };
+        let ingest = (ingest_ms.div_euclid(1000) - ctx.ingest_base_s).clamp(0, 0xFF_FFFF) as u64;
+        let d = RecD { fp, b: ((fp2 as u64) << 56) | (ingest << 32) };
         let part = (fp >> (64 - PA_BITS)) as usize;
         'v: {
             if f[1].is_empty() || f[5].is_empty() {
@@ -1228,13 +1260,13 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, w: usize, lm:
             b.dd[b.n] = d;
             b.n += 1;
             if b.n == EB {
-                flush_batch(&mut b, lm, w, o);
+                flush_batch(&mut b, lm, o);
             }
             return;
         }
         o.dd.push(part, d);
     });
-    flush_batch(&mut b, lm, w, o);
+    flush_batch(&mut b, lm, o);
 }
 
 fn parse_clicks(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, clq: &mut Parts<RecC, 8>) {
@@ -1581,7 +1613,7 @@ fn main() {
     let ctx = Ctx {
         ws,
         we,
-        ingest_base_s: ws.div_euclid(1000) - 400 * 86_400,
+        ingest_base_s: ws.div_euclid(1000) - (1 << 23),
         products,
         unknown_cat,
         cat_names,
@@ -1643,6 +1675,9 @@ fn main() {
             LINKS.lock().unwrap().push(pairs);
         }
         barrier.wait();
+        if w == 0 && verbose {
+            eprintln!("{:>8.1} ms  links parsed", t0.elapsed().as_secs_f64() * 1e3);
+        }
         let lm = LINKMAP.get_or_init(|| LinkMap::with_pairs(total_pairs.load(Ordering::Relaxed)));
         let pairs = all_pairs.get_or_init(|| std::mem::take(&mut *LINKS.lock().unwrap()));
         // L1: insert keys and union, in slices
@@ -1659,6 +1694,9 @@ fn main() {
             lm.add_pairs(&v[a..(a + PS).min(v.len())]);
         }
         barrier.wait();
+        if w == 0 && verbose {
+            eprintln!("{:>8.1} ms  links inserted", t0.elapsed().as_secs_f64() * 1e3);
+        }
         // L2: smallest key per person; L3: store names
         const SS: usize = 1 << 16;
         let nslices = lm.size().div_ceil(SS);
@@ -1686,6 +1724,7 @@ fn main() {
             pur: (0..PC).map(|_| PVec::with_capacity(res_pay / 24 + 16)).collect(),
             clq: Parts::new(PC, res_cl),
         };
+
         loop {
             let i = counters[4].fetch_add(1, Ordering::Relaxed);
             if i >= data_chunks.len() {
@@ -1694,7 +1733,7 @@ fn main() {
             let c = &chunks[data_chunks[i]];
             let (bytes, b, l) = chunk_bytes(&files[c.file], c, &mut buf);
             match c.kind {
-                Kind::Event => parse_events(&ctx, bytes, b, l, w, lm, &mut o),
+                Kind::Event => parse_events(&ctx, bytes, b, l, lm, &mut o),
                 Kind::Click => parse_clicks(&ctx, bytes, b, l, lm, &mut o.clq),
                 Kind::Link => unreachable!(),
             }
@@ -1707,16 +1746,16 @@ fn main() {
     });
     lap("phase 1 parse");
     let linkmap = LINKMAP.get().unwrap();
+    assert!(!IDX_OVERFLOW.load(Ordering::Relaxed), "a person partition outgrew the dedup index");
 
     // --- phase 2a: dedup by event id; losing copies are marked dead in place
     let next = AtomicUsize::new(0);
-    let kill = |loc: u64| {
-        if loc & HAS_PAY == 0 {
+    let kill = |w: usize, b: u64| {
+        if b & HAS_PAY == 0 {
             return;
         }
-        let w = ((loc >> 48) & 0x3FFF) as usize;
-        let q = ((loc >> 32) & 0xFFFF) as usize;
-        let i = (loc & 0xFFFF_FFFF) as usize;
+        let q = ((b >> IDX_BITS) as usize) & (PC - 1);
+        let i = (b as usize) & ((1 << IDX_BITS) - 1);
         unsafe { (*p1[w].pay[q].ptr.add(i)).ts = DEAD };
     };
     let lm_slices = linkmap.size().div_ceil(1 << 16);
@@ -1742,27 +1781,31 @@ fn main() {
             let mask = size - 1;
             table.clear();
             table.resize(size, 0);
+            // entry: tag (24 bits of fp) << 40 | worker << 32 | index, never 0
             for (w, o) in p1.iter().enumerate() {
                 for (j, r) in o.dd[i].as_slice().iter().enumerate() {
-                    let entry = ((w as u64) << 32) | j as u64 | (1 << 63);
-                    let mut sl = (r.fp >> 20) as usize & mask;
+                    let tag = (r.fp & 0xFF_FFFF) | 0x80_0000;
+                    let entry = (tag << 40) | ((w as u64) << 32) | j as u64;
+                    let mut sl = (r.fp >> 24) as usize & mask;
                     loop {
                         let e = unsafe { *table.get_unchecked(sl) };
                         if e == 0 {
                             unsafe { *table.get_unchecked_mut(sl) = entry };
                             break;
                         }
-                        let ow = ((e >> 32) & 0xFF) as usize;
-                        let oj = (e & 0xFFFF_FFFF) as usize;
-                        let other = unsafe { p1.get_unchecked(ow).dd.get_unchecked(i).as_slice().get_unchecked(oj) };
-                        if other.fp == r.fp && other.fp2 == r.fp2 {
-                            if r.ingest < other.ingest {
-                                kill(other.loc);
-                                unsafe { *table.get_unchecked_mut(sl) = entry };
-                            } else {
-                                kill(r.loc);
+                        if e >> 40 == tag {
+                            let ow = ((e >> 32) & 0xFF) as usize;
+                            let oj = (e & 0xFFFF_FFFF) as usize;
+                            let other = unsafe { p1.get_unchecked(ow).dd.get_unchecked(i).as_slice().get_unchecked(oj) };
+                            if other.same_event(r) {
+                                if r.ingest() < other.ingest() {
+                                    kill(ow, other.b);
+                                    unsafe { *table.get_unchecked_mut(sl) = entry };
+                                } else {
+                                    kill(w, r.b);
+                                }
+                                break;
                             }
-                            break;
                         }
                         sl = (sl + 1) & mask;
                     }
