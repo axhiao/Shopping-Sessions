@@ -366,10 +366,10 @@ fn synthesize(src: &Path, dst: &Path, copies: usize, nt: usize) -> u64 {
         }
         let text = fs::read(&jobs[i].0).unwrap_or_default();
         let head = text.iter().position(|&b| b == b'\n').map(|p| p + 1).unwrap_or(text.len());
-        let mut out = Vec::with_capacity(text.len() + text.len() / 16 + 64);
+        let mut out = Vec::with_capacity((text.len() + text.len() / 16 + 64) * copies);
+        // all copies go into one file, so the file count stays that of the source
+        out.extend_from_slice(&text[..head]);
         for c in 0..copies {
-            out.clear();
-            out.extend_from_slice(&text[..head]);
             if c == 0 {
                 out.extend_from_slice(&text[head..]);
             } else {
@@ -401,10 +401,10 @@ fn synthesize(src: &Path, dst: &Path, copies: usize, nt: usize) -> u64 {
                     out.extend_from_slice(&line[at..]);
                 }
             }
-            let p = jobs[i].1.with_file_name(format!("{}-{c:02}.csv", jobs[i].1.file_name().unwrap().to_string_lossy()));
-            fs::write(&p, &out).unwrap();
-            total.fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
+        let p = jobs[i].1.with_file_name(format!("{}.csv", jobs[i].1.file_name().unwrap().to_string_lossy()));
+        fs::write(&p, &out).unwrap();
+        total.fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
     });
     total.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -442,7 +442,19 @@ fn child(data: &Path, out: &Path, envs: &[(&str, &str)], show: bool) -> f64 {
                         }
                     }
                 }
-                eprintln!("[diag]     {} status={:?} | {}", envs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "), o.status.code(), line);
+                use std::os::unix::process::ExitStatusExt;
+                eprintln!(
+                    "[diag]     {} status={:?} signal={:?} | {}",
+                    envs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "),
+                    o.status.code(),
+                    o.status.signal(),
+                    line
+                );
+                if !o.status.success() {
+                    for l in text.lines().rev().take(6) {
+                        eprintln!("[diag]       child: {l}");
+                    }
+                }
             }
         }
         Err(e) => eprintln!("[diag]     child failed: {e}"),
