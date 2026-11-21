@@ -272,14 +272,54 @@ impl<T: Copy, const K: usize> Parts<T, K> {
     fn push(&mut self, q: usize, v: T) {
         unsafe {
             let k = *self.n.get_unchecked(q) as usize;
-            *self.buf.get_unchecked_mut(q).get_unchecked_mut(k) = v;
             if k + 1 == K {
+                #[cfg(target_feature = "avx2")]
+                if std::mem::size_of::<T>() == 16 || std::mem::size_of::<T>() == 32 {
+                    self.flush_with(q, v);
+                    *self.n.get_unchecked_mut(q) = 0;
+                    return;
+                }
+                *self.buf.get_unchecked_mut(q).get_unchecked_mut(k) = v;
                 self.flush(q);
                 *self.n.get_unchecked_mut(q) = 0;
             } else {
+                *self.buf.get_unchecked_mut(q).get_unchecked_mut(k) = v;
                 *self.n.get_unchecked_mut(q) = (k + 1) as u32;
             }
         }
+    }
+    /// Writes out partition q's staged K - 1 records followed by `v`. The last
+    /// record goes from registers straight into the output vector: storing it
+    /// in the staging buffer and loading the whole line back would make the
+    /// load wait for the store to leave the store buffer (a wide load cannot
+    /// be forwarded from narrower stores), behind every older pending store.
+    #[cfg(target_feature = "avx2")]
+    #[inline(always)]
+    unsafe fn flush_with(&mut self, q: usize, v: T) {
+        use std::arch::x86_64::*;
+        let o = self.out.get_unchecked_mut(q);
+        if o.len + K > o.cap {
+            o.grow();
+        }
+        let dst = o.ptr.add(o.len) as *mut u8;
+        let src = self.buf.get_unchecked(q).as_ptr() as *const u8;
+        let bytes = K * std::mem::size_of::<T>();
+        let mut i = 0;
+        while i + 32 < bytes {
+            let x = _mm256_loadu_si256(src.add(i) as *const __m256i);
+            _mm256_stream_si256(dst.add(i) as *mut __m256i, x);
+            i += 32;
+        }
+        let last = if std::mem::size_of::<T>() == 16 {
+            let w = std::mem::transmute_copy::<T, [u64; 2]>(&v);
+            let lo = _mm_loadu_si128(src.add(i) as *const __m128i);
+            _mm256_inserti128_si256(_mm256_castsi128_si256(lo), _mm_set_epi64x(w[1] as i64, w[0] as i64), 1)
+        } else {
+            let w = std::mem::transmute_copy::<T, [u64; 4]>(&v);
+            _mm256_set_epi64x(w[3] as i64, w[2] as i64, w[1] as i64, w[0] as i64)
+        };
+        _mm256_stream_si256(dst.add(i) as *mut __m256i, last);
+        o.len += K;
     }
     #[inline(always)]
     fn flush(&mut self, q: usize) {
