@@ -659,28 +659,64 @@ impl LinkMap {
                     prefetch_w(unsafe { self.parent.as_ptr().add(i) });
                 }
             }
+            // claim the slots, then bring in the roots' keys (the union compares
+            // them) before linking
+            let mut xs = [0u32; B];
+            let mut ys = [0u32; B];
             for (j, (a, b)) in chunk.iter().enumerate() {
-                let x = self.insert(a, ha[j]);
-                let y = self.insert(b, hb[j]);
-                self.union(x, y);
+                let x = self.find(self.insert(a, ha[j]));
+                let y = self.find(self.insert(b, hb[j]));
+                prefetch(unsafe { self.slots.add(x as usize) });
+                prefetch(unsafe { self.slots.add(y as usize) });
+                xs[j] = x;
+                ys[j] = y;
+            }
+            for j in 0..chunk.len() {
+                self.union(xs[j], ys[j]);
             }
         }
     }
 
     /// For the slots in [from, to): store the person name as the value.
     fn finish(&self, from: usize, to: usize) {
+        // in batches: find the roots (parent array only) and prefetch their
+        // slots and the filter words, then copy the names
+        const B: usize = 32;
+        let mut idx = [0usize; B];
+        let mut root = [0usize; B];
+        let mut fbit = [0u64; B];
+        let mut n = 0usize;
+        let write = |idx: &[usize], root: &[usize], fbit: &[u64]| {
+            for j in 0..idx.len() {
+                let (i, b) = (idx[j], root[j]);
+                let name = self.slot(b).k;
+                unsafe { (*self.slots.add(i)).v = name };
+                if b != i {
+                    let fb = fbit[j];
+                    self.filter[(fb >> 6) as usize].fetch_or(1 << (fb & 63), Ordering::Relaxed);
+                }
+            }
+        };
         for i in from..to {
             if self.parent[i].load(Ordering::Relaxed) == 0 {
                 continue;
             }
             let b = self.find(i as u32) as usize;
-            let name = self.slot(b).k;
-            unsafe { (*self.slots.add(i)).v = name };
+            idx[n] = i;
+            root[n] = b;
             if b != i {
+                prefetch(unsafe { self.slots.add(b) });
                 let fb = hk(&self.slot(i).k) >> (64 - FILTER_BITS);
-                self.filter[(fb >> 6) as usize].fetch_or(1 << (fb & 63), Ordering::Relaxed);
+                prefetch_w(unsafe { self.filter.as_ptr().add((fb >> 6) as usize) });
+                fbit[n] = fb;
+            }
+            n += 1;
+            if n == B {
+                write(&idx, &root, &fbit);
+                n = 0;
             }
         }
+        write(&idx[..n], &root[..n], &fbit[..n]);
     }
 }
 
@@ -1645,7 +1681,8 @@ struct P1Out {
 }
 
 fn parse_links(buf: &[u8], begin: usize, limit: usize) -> Vec<(Key, Key)> {
-    let mut out = Vec::new();
+    // a link line is rarely shorter than 16 bytes
+    let mut out = Vec::with_capacity(limit.min(buf.len()).saturating_sub(begin) / 16 + 16);
     scan_fast::<2, _>(buf, begin, limit, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
@@ -1790,15 +1827,33 @@ fn parse_clicks(
 ) {
     let lo = ctx.ws - WEEK;
     const B: usize = 16;
-    let mut batch = [RecC { user: ZERO, cid: ZERO, ts: 0, camp: 0 }; B];
-    let mut hs = [0u64; B];
-    let mut n = 0usize;
-    let flush = |batch: &[RecC], hs: &[u64], clq: &mut Parts<RecCc, 2>, cesc: &mut [PVec<Key>]| {
-        for (r, &h) in batch.iter().zip(hs) {
-            let mut r = *r;
-            let mut ph = h;
-            if lm.maybe_linked(h) {
-                r.user = lm.person(&r.user, h);
+    // Two batches, as for events: the filter word is prefetched while parsing,
+    // the slot when the batch is full, and the batch is resolved one batch later.
+    #[derive(Clone, Copy)]
+    struct Batch {
+        n: usize,
+        r: [RecC; B],
+        h: [u64; B],
+        linked: [bool; B],
+    }
+    let empty = Batch { n: 0, r: [RecC { user: ZERO, cid: ZERO, ts: 0, camp: 0 }; B], h: [0; B], linked: [false; B] };
+    let mut bs = [empty, empty];
+    let mut cur = 0usize;
+    let stage2 = |b: &mut Batch| {
+        for j in 0..b.n {
+            let linked = lm.maybe_linked(b.h[j]);
+            if linked {
+                lm.prefetch(b.h[j]);
+            }
+            b.linked[j] = linked;
+        }
+    };
+    let flush = |b: &mut Batch, clq: &mut Parts<RecCc, 2>, cesc: &mut [PVec<Key>]| {
+        for j in 0..b.n {
+            let mut r = b.r[j];
+            let mut ph = b.h[j];
+            if b.linked[j] {
+                r.user = lm.person(&r.user, ph);
                 ph = hk(&r.user);
             }
             let q = (ph >> (64 - pc_bits())) as usize;
@@ -1806,6 +1861,7 @@ fn parse_clicks(
             let rec = RecCc { p: compact(&r.user, esc), c: compact(&r.cid, esc), ts: r.ts, camp: r.camp };
             clq.push(q, rec);
         }
+        b.n = 0;
     };
     scan_fast::<4, _>(buf, begin, limit, |f| {
         if f[0].is_empty() || f[1].is_empty() {
@@ -1821,18 +1877,22 @@ fn parse_clicks(
         };
         let user = key_of(f[1]);
         let h = hk(&user);
-        if lm.maybe_linked(h) {
-            lm.prefetch(h);
-        }
-        batch[n] = RecC { user, cid: key_of(f[0]), ts: (ts - lo) as u32, camp };
-        hs[n] = h;
-        n += 1;
-        if n == B {
-            flush(&batch, &hs, clq, cesc);
-            n = 0;
+        lm.prefetch_filter(h);
+        let b = &mut bs[cur];
+        b.r[b.n] = RecC { user, cid: key_of(f[0]), ts: (ts - lo) as u32, camp };
+        b.h[b.n] = h;
+        b.n += 1;
+        if b.n == B {
+            stage2(b);
+            let [b0, b1] = &mut bs;
+            let prev = if cur == 0 { b1 } else { b0 };
+            flush(prev, clq, cesc);
+            cur ^= 1;
         }
     });
-    flush(&batch[..n], &hs[..n], clq, cesc);
+    stage2(&mut bs[cur]);
+    flush(&mut bs[cur ^ 1], clq, cesc);
+    flush(&mut bs[cur], clq, cesc);
 }
 
 // ---------------------------------------------------------------------------
@@ -2148,7 +2208,6 @@ fn main() {
     // event times are stored as 31-bit offsets from the window start
     assert!(we - ws < TS_DEAD as i64, "window longer than 24 days");
 
-    // products and campaigns are parsed by one worker while the others parse links
     let build_ctx = || {
         let pbuf = pad_buffer(fs::read(data.join("products.csv")).unwrap_or_default());
         let mut prod_raw: Vec<(Key, u32)> = Vec::new();
@@ -2233,7 +2292,9 @@ fn main() {
     for (fi, f) in files.iter().enumerate() {
         let mut s = 0;
         while s < f.len {
-            let e = (s + chunk_size()).min(f.len);
+            // link files are few and small: small chunks keep every thread busy
+            let step = if f.kind == Kind::Link { 256 << 10 } else { chunk_size() };
+            let e = (s + step).min(f.len);
             chunks.push(Chunk { kind: f.kind, file: fi, start: s, end: e });
             s = e;
         }
@@ -2264,10 +2325,13 @@ fn main() {
     let total_pairs = AtomicUsize::new(0);
     let all_pairs: OnceLock<Vec<Vec<(Key, Key)>>> = OnceLock::new();
     let counters: [AtomicUsize; 6] = Default::default();
-    let p1: Vec<P1Out> = run_workers(nthreads, |w| {
-        if w + 1 == nthreads {
-            ctx_cell.get_or_init(build_ctx);
-        }
+    // products and campaigns are read by a thread of their own, so the link
+    // phases never wait for them; the workers need them only after the link map
+    let p1: Vec<P1Out> = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            ctx_cell.get_or_init(&build_ctx);
+        });
+        run_workers(nthreads, |w| {
         let mut buf = Vec::new();
         // L0: parse link files
         loop {
@@ -2343,7 +2407,7 @@ fn main() {
         if w == 0 && verbose {
             eprintln!("{:>8.1} ms  link map built ({} pairs)", t0.elapsed().as_secs_f64() * 1e3, total_pairs.load(Ordering::Relaxed));
         }
-        let ctx = ctx_cell.get().expect("ctx built before the link barriers");
+        let ctx = ctx_cell.get_or_init(&build_ctx);
         let mut o = P1Work {
             dd: Parts::new(pa, res_dd),
             pay: Parts::new(pc, res_pay),
@@ -2390,6 +2454,7 @@ fn main() {
             eprintln!("  p1 w{w} done at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
         }
         r
+        })
     });
     lap("phase 1 parse");
     let ctx = ctx_cell.get().unwrap();
