@@ -636,7 +636,7 @@ pub fn run(data: &Path, out: &Path, nt: usize) {
     ] {
         cat(f, 3);
     }
-    grep("/proc/self/mountinfo", &[" /data ", " /output ", " /scratch ", " /tmp ", " / "], 8);
+    grep("/proc/self/mountinfo", &[" /data ", " /output ", " /scratch ", " /tmp "], 8);
     for k in ["NCPU", "MEM_GB", "DATA_DIR", "OUTPUT_DIR", "SCRATCH_DIR", "HOME"] {
         dl!("[diag] env {k}={:?}", std::env::var(k).ok());
     }
