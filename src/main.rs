@@ -81,8 +81,18 @@ fn arena_alloc(bytes: usize) -> *mut u8 {
     (a.base + off) as *mut u8
 }
 
+/// Drops the pages fully inside [p, p + len) (MADV_DONTNEED, which only takes
+/// the mmap lock for reading, so threads can do it in parallel).
+fn release(p: *const u8, len: usize) {
+    let a = (p as usize + 4095) & !4095;
+    let b = (p as usize + len) & !4095;
+    if b > a && !exp(512) {
+        unsafe { madvise(a as *mut _, b - a, 4 /* MADV_DONTNEED */) };
+    }
+}
+
 /// Growable buffer of Copy records in the arena.
-struct PVec<T: Copy> {
+pub struct PVec<T: Copy> {
     ptr: *mut T,
     len: usize,
     cap: usize,
@@ -119,6 +129,17 @@ impl<T: Copy> PVec<T> {
     }
     fn len(&self) -> usize {
         self.len
+    }
+    fn release(&self) {
+        release(self.ptr as *const u8, self.cap * std::mem::size_of::<T>());
+    }
+    #[inline(always)]
+    fn extend_from_slice(&mut self, s: &[T]) {
+        while self.len + s.len() > self.cap {
+            self.grow();
+        }
+        unsafe { std::ptr::copy_nonoverlapping(s.as_ptr(), self.ptr.add(self.len), s.len()) };
+        self.len += s.len();
     }
 }
 
@@ -1257,7 +1278,7 @@ struct URow {
 }
 
 struct P3 {
-    rows: Vec<URow>,
+    rows: PVec<URow>,
     agg: Vec<[u64; 4]>, // (camp * ndays + day) -> sessions, purchasing, revenue, assisted
     cnt: Vec<u32>,
     pos: Vec<u32>,
@@ -1656,6 +1677,10 @@ fn main() {
                 Kind::Click => parse_clicks(&ctx, bytes, b, l, lm, &mut o.clq),
                 Kind::Link => unreachable!(),
             }
+            let inf = &files[c.file];
+            if !inf.map.is_null() {
+                release(unsafe { inf.map.add(c.start as usize) }, (c.end - c.start) as usize);
+            }
         }
         P1Out { dd: o.dd.finish(), pay: o.pay.finish(), clq: o.clq.finish() }
     });
@@ -1673,11 +1698,19 @@ fn main() {
         let i = (loc & 0xFFFF_FFFF) as usize;
         unsafe { (*p1[w].pay[q].ptr.add(i)).meta = 0 };
     };
+    let lm_slices = linkmap.size().div_ceil(1 << 16);
+    let next_lm = AtomicUsize::new(0);
     run_workers(nthreads, |_| {
         let mut table: Vec<u64> = Vec::new();
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= PA {
+                let j = next_lm.fetch_add(1, Ordering::Relaxed);
+                if j < lm_slices {
+                    let n = (1usize << 16).min(linkmap.size() - (j << 16));
+                    release(unsafe { linkmap.slots.add(j << 16) } as *const u8, n * std::mem::size_of::<Slot>());
+                    continue;
+                }
                 break;
             }
             let total: usize = p1.iter().map(|o| o.dd[i].len()).sum();
@@ -1714,6 +1747,9 @@ fn main() {
                     }
                 }
             }
+            for o in p1.iter() {
+                o.dd[i].release();
+            }
         }
     });
     lap("phase 2a dedup");
@@ -1731,10 +1767,14 @@ fn main() {
         .map(|q| (p1.iter().map(|o| o.pay[q].len()).sum::<usize>(), q))
         .collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
+    let total_pay: usize = order.iter().map(|o| o.0).sum();
+    let est_rows = total_pay / 7 / nthreads + 1024;
+    let max_part = order[0].0;
+    let max_clicks = (0..PC).map(|q| p1.iter().map(|o| o.clq[q].len()).sum::<usize>()).max().unwrap_or(0);
     let next = AtomicUsize::new(0);
     let aggs: Vec<Vec<[u64; 4]>> = run_workers(nthreads, |w| {
         let mut st = P3 {
-            rows: Vec::new(),
+            rows: PVec::with_capacity(est_rows),
             agg: vec![[0u64; 4]; (ncamp + 1) * ndays],
             cnt: vec![0; ncamp + 1],
             pos: vec![0; ncamp + 1],
@@ -1743,14 +1783,26 @@ fn main() {
             touched: Vec::new(),
         };
         let mut lid = LocalIds::new();
-        let mut evs: Vec<RecP> = Vec::new();
-        let mut sorted: Vec<RecP> = Vec::new();
-        let mut cls: Vec<RecC> = Vec::new();
-        let mut csorted: Vec<RecC> = Vec::new();
-        let mut cpid: Vec<u32> = Vec::new();
+        lid.reset(max_part);
+        let mut evs: Vec<RecP> = Vec::with_capacity(max_part);
+        let mut sorted: Vec<RecP> = Vec::with_capacity(max_part);
+        let mut cls: Vec<RecC> = Vec::with_capacity(max_clicks);
+        let mut csorted: Vec<RecC> = Vec::with_capacity(max_clicks);
+        let mut cpid: Vec<u32> = Vec::with_capacity(max_clicks);
         let mut start: Vec<u32> = Vec::new();
         let mut cstart: Vec<u32> = Vec::new();
         let mut fill: Vec<u32> = Vec::new();
+        let mut tm = [0f64; 6];
+        let mut tt = Instant::now();
+        macro_rules! tick {
+            ($i:expr) => {
+                if verbose {
+                    let n = Instant::now();
+                    tm[$i] += (n - tt).as_secs_f64();
+                    tt = n;
+                }
+            };
+        }
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= PC {
@@ -1767,6 +1819,7 @@ fn main() {
             if evs.is_empty() {
                 continue;
             }
+            tick!(0);
             // local person ids, in first-seen order
             lid.reset(evs.len());
             for e in evs.iter_mut() {
@@ -1792,6 +1845,7 @@ fn main() {
                 sorted[*f as usize] = *e;
                 *f += 1;
             }
+            tick!(1);
             // clicks of persons that have events here
             cls.clear();
             cpid.clear();
@@ -1821,6 +1875,7 @@ fn main() {
                 csorted[*f as usize] = *c;
                 *f += 1;
             }
+            tick!(2);
             for p in 0..np {
                 let ev = &mut sorted[start[p] as usize..start[p + 1] as usize];
                 if ev.len() > 1 {
@@ -1832,24 +1887,31 @@ fn main() {
                 }
                 process_person(&geo, &mut st, lid.persons[p], ev, cl);
             }
+            tick!(3);
+            for o in p1.iter() {
+                o.pay[q].release();
+                o.clq[q].release();
+            }
+            tick!(4);
         }
+        tick!(5);
         // write this worker's user_daily part
         let n = st.rows.len();
         if n > 0 || w == 0 {
             let mut c_user = pq::Column::new("user_id", pq::Kind::Str, false, n);
             let mut c_day = pq::Column::new("day", pq::Kind::Date, false, n);
-            let mut c_ses = pq::Column::new("sessions", pq::Kind::I64, false, n);
-            let mut c_ev = pq::Column::new("events", pq::Kind::I64, false, n);
+            let mut c_ses = pq::Column::new("sessions", pq::Kind::I32, false, n);
+            let mut c_ev = pq::Column::new("events", pq::Kind::I32, false, n);
             let mut c_rev = pq::Column::new("revenue_cents", pq::Kind::I64, false, n);
             let mut c_top = pq::Column::new("top_category", pq::Kind::Str, true, n);
             let mut tmp = Vec::new();
-            for r in &st.rows {
+            for r in st.rows.as_slice() {
                 tmp.clear();
                 key_bytes(&r.person, &mut tmp);
                 c_user.push_str(&tmp);
                 c_day.push_i32(r.day);
-                c_ses.push_i64(r.sessions as i64);
-                c_ev.push_i64(r.events as i64);
+                c_ses.push_i32(r.sessions as i32);
+                c_ev.push_i32(r.events as i32);
                 c_rev.push_i64(r.revenue as i64);
                 if r.top >= 0 {
                     c_top.push_str(&ctx.cat_names[r.top as usize]);
@@ -1857,12 +1919,23 @@ fn main() {
                     c_top.push_null();
                 }
             }
-            pq::write_file(
+            let tw = Instant::now();
+            let r = pq::write_file(
                 &out.join("user_daily").join(format!("part-{w:03}.parquet")),
                 &[c_user, c_day, c_ses, c_ev, c_rev, c_top],
                 n,
-            )
-            .expect("write user_daily");
+            );
+            r.expect("write user_daily");
+            if verbose {
+                eprintln!("  w{w} write_file {:.1} ms ({n} rows)", tw.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        if verbose {
+            let e = tt.elapsed().as_secs_f64();
+            eprintln!(
+                "  p3 w{w}: gather {:.0} sortp {:.0} clicks {:.0} sess {:.0} release {:.0} idle {:.0} write {:.0} ms",
+                tm[0] * 1e3, tm[1] * 1e3, tm[2] * 1e3, tm[3] * 1e3, tm[4] * 1e3, tm[5] * 1e3, e * 1e3
+            );
         }
         st.agg
     });

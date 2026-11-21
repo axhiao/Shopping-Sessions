@@ -1,15 +1,16 @@
 //! Minimal Parquet writer: one row group, one PLAIN data page per column,
-//! uncompressed. Enough for the two output tables (INT32 DATE, INT64, UTF8
-//! strings, one nullable string column).
+//! uncompressed. Enough for the two output tables (INT32 DATE, INT32/INT64,
+//! UTF8 strings, one nullable string column). Buffers live in the arena so
+//! writing never calls mmap/munmap (which would contend with page faults).
 
-pub const T_INT32: i32 = 1;
-pub const T_INT64: i32 = 2;
-pub const T_BYTE_ARRAY: i32 = 6;
+use crate::PVec;
+use std::io::Write;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Kind {
     Str,
     Date,
+    I32,
     I64,
 }
 
@@ -18,45 +19,60 @@ pub struct Column {
     pub kind: Kind,
     pub optional: bool,
     /// PLAIN-encoded non-null values.
-    pub values: Vec<u8>,
-    /// One entry per row (true = present). Only used when `optional`.
-    pub defs: Vec<bool>,
+    values: PVec<u8>,
+    /// Definition levels, one bit per row, LSB first (only when optional).
+    defs: PVec<u8>,
+    rows: usize,
 }
 
 impl Column {
     pub fn new(name: &'static str, kind: Kind, optional: bool, rows: usize) -> Column {
         let per = match kind {
-            Kind::Str => 16,
-            Kind::Date => 4,
+            Kind::Str => 20,
+            Kind::Date | Kind::I32 => 4,
             Kind::I64 => 8,
         };
         Column {
             name,
             kind,
             optional,
-            values: Vec::with_capacity(rows * per),
-            defs: if optional { Vec::with_capacity(rows) } else { Vec::new() },
+            values: PVec::with_capacity(rows * per + 64),
+            defs: PVec::with_capacity(if optional { rows / 8 + 16 } else { 16 }),
+            rows: 0,
         }
+    }
+    #[inline]
+    fn def(&mut self, present: bool) {
+        if self.optional {
+            if self.rows % 8 == 0 {
+                self.defs.push(0);
+            }
+            if present {
+                let last = self.defs.len() - 1;
+                unsafe { *self.defs.ptr.add(last) |= 1 << (self.rows % 8) };
+            }
+        }
+        self.rows += 1;
     }
     #[inline]
     pub fn push_str(&mut self, s: &[u8]) {
         self.values.extend_from_slice(&(s.len() as u32).to_le_bytes());
         self.values.extend_from_slice(s);
-        if self.optional {
-            self.defs.push(true);
-        }
+        self.def(true);
     }
     #[inline]
     pub fn push_null(&mut self) {
-        self.defs.push(false);
+        self.def(false);
     }
     #[inline]
     pub fn push_i32(&mut self, v: i32) {
         self.values.extend_from_slice(&v.to_le_bytes());
+        self.rows += 1;
     }
     #[inline]
     pub fn push_i64(&mut self, v: i64) {
         self.values.extend_from_slice(&v.to_le_bytes());
+        self.rows += 1;
     }
 }
 
@@ -135,48 +151,38 @@ impl Thrift {
 
 fn ptype(k: Kind) -> i32 {
     match k {
-        Kind::Str => T_BYTE_ARRAY,
-        Kind::Date => T_INT32,
-        Kind::I64 => T_INT64,
+        Kind::Str => 6,              // BYTE_ARRAY
+        Kind::Date | Kind::I32 => 1, // INT32
+        Kind::I64 => 2,              // INT64
     }
 }
 
-/// RLE/bit-packed hybrid encoding of 1-bit definition levels, as bit-packed runs.
-fn encode_defs(defs: &[bool], out: &mut Vec<u8>) {
-    let mut body = Vec::with_capacity(defs.len() / 8 + 16);
-    let groups = defs.len().div_ceil(8);
-    let mut g = 0;
-    while g < groups {
-        let run = (groups - g).min(63);
-        body.push(((run << 1) | 1) as u8);
-        for k in 0..run {
-            let base = (g + k) * 8;
-            let mut byte = 0u8;
-            for b in 0..8 {
-                if base + b < defs.len() && defs[base + b] {
-                    byte |= 1 << b;
-                }
-            }
-            body.push(byte);
-        }
-        g += run;
+/// RLE/bit-packed hybrid encoding of 1-bit definition levels: bit-packed runs
+/// of up to 63 groups of 8, straight from the packed bits.
+fn encode_defs(bits: &[u8], out: &mut Vec<u8>) {
+    let mut body = Vec::with_capacity(bits.len() + bits.len() / 63 + 8);
+    for run in bits.chunks(63) {
+        body.push(((run.len() << 1) | 1) as u8);
+        body.extend_from_slice(run);
     }
     out.extend_from_slice(&(body.len() as u32).to_le_bytes());
     out.extend_from_slice(&body);
 }
 
 pub fn write_file(path: &std::path::Path, cols: &[Column], nrows: usize) -> std::io::Result<()> {
-    let mut out: Vec<u8> = Vec::with_capacity(cols.iter().map(|c| c.values.len() + c.defs.len() / 8 + 64).sum::<usize>() + 1024);
-    out.extend_from_slice(b"PAR1");
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(b"PAR1")?;
+    let mut pos: i64 = 4;
     // (data_page_offset, total_size)
     let mut metas: Vec<(i64, i64)> = Vec::new();
     if nrows > 0 {
         for c in cols {
-            let mut body = Vec::new();
+            assert_eq!(c.rows, nrows);
+            let mut pre = Vec::new();
             if c.optional {
-                encode_defs(&c.defs, &mut body);
+                encode_defs(c.defs.as_slice(), &mut pre);
             }
-            let body_len = body.len() + c.values.len();
+            let body_len = pre.len() + c.values.len();
             let mut h = Thrift::new();
             h.i32(1, 0); // DATA_PAGE
             h.i32(2, body_len as i32);
@@ -188,11 +194,12 @@ pub fn write_file(path: &std::path::Path, cols: &[Column], nrows: usize) -> std:
             h.i32(4, 3); // RLE
             h.end_struct();
             h.buf.push(0);
-            let off = out.len() as i64;
-            out.extend_from_slice(&h.buf);
-            out.extend_from_slice(&body);
-            out.extend_from_slice(&c.values);
-            metas.push((off, (h.buf.len() + body_len) as i64));
+            f.write_all(&h.buf)?;
+            f.write_all(&pre)?;
+            f.write_all(c.values.as_slice())?;
+            let size = (h.buf.len() + body_len) as i64;
+            metas.push((pos, size));
+            pos += size;
         }
     }
     let mut t = Thrift::new();
@@ -211,7 +218,7 @@ pub fn write_file(path: &std::path::Path, cols: &[Column], nrows: usize) -> std:
         match c.kind {
             Kind::Str => t.i32(6, 0),  // UTF8
             Kind::Date => t.i32(6, 6), // DATE
-            Kind::I64 => {}
+            _ => {}
         }
         match c.kind {
             Kind::Str => {
@@ -226,7 +233,7 @@ pub fn write_file(path: &std::path::Path, cols: &[Column], nrows: usize) -> std:
                 t.end_struct();
                 t.end_struct();
             }
-            Kind::I64 => {}
+            _ => {}
         }
         t.end_struct();
     }
@@ -263,8 +270,9 @@ pub fn write_file(path: &std::path::Path, cols: &[Column], nrows: usize) -> std:
     }
     t.bin(6, b"shopping-sessions");
     t.buf.push(0);
-    out.extend_from_slice(&t.buf);
-    out.extend_from_slice(&(t.buf.len() as u32).to_le_bytes());
-    out.extend_from_slice(b"PAR1");
-    std::fs::write(path, &out)
+    let n = t.buf.len() as u32;
+    t.buf.extend_from_slice(&n.to_le_bytes());
+    t.buf.extend_from_slice(b"PAR1");
+    f.write_all(&t.buf)?;
+    Ok(())
 }
