@@ -1,414 +1,543 @@
-//! Scorer diagnostics (feature "diag"): prints what the machine looks like and a
-//! few micro-benchmarks to stderr. Never part of a scored build.
+//! Scorer diagnostics (feature "diag"): runs the pipeline as child processes
+//! on a 20x copy of the dev set, with the sampling profiler on, and returns
+//! where the samples fall (by source line) inside one extra output row. Never
+//! part of a scored build.
 
+use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::time::Instant;
 
-extern "C" {
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn munmap(addr: *mut u8, len: usize) -> i32;
-    fn mincore(addr: *mut u8, len: usize, vec: *mut u8) -> i32;
-    fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
+/// The text of the extra output row.
+static ROW: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+macro_rules! dl {
+    ($($a:tt)*) => {{
+        eprintln!($($a)*);
+    }};
 }
 
-fn cpu() -> (f64, f64) {
-    let mut ru = [0i64; 18];
-    unsafe { getrusage(0, &mut ru) };
-    (ru[0] as f64 + ru[1] as f64 * 1e-6, ru[2] as f64 + ru[3] as f64 * 1e-6)
+pub fn rows() -> Vec<String> {
+    vec![ROW.lock().unwrap().chars().take(1750).collect()]
 }
 
-fn cat(path: &str, max_lines: usize) {
-    match fs::read_to_string(path) {
-        Ok(s) => {
-            for l in s.lines().take(max_lines) {
-                eprintln!("[diag] {path}: {l}");
-            }
-        }
-        Err(e) => eprintln!("[diag] {path}: <{e}>"),
-    }
-}
-
-fn grep(path: &str, keys: &[&str], max: usize) {
-    if let Ok(s) = fs::read_to_string(path) {
-        let mut n = 0;
-        for l in s.lines() {
-            if keys.iter().any(|k| l.contains(k)) {
-                eprintln!("[diag] {path}: {l}");
-                n += 1;
-                if n >= max {
-                    break;
-                }
-            }
-        }
-    } else {
-        eprintln!("[diag] {path}: <unreadable>");
-    }
-}
-
-/// Runs `f(thread)` on `nt` threads; returns (wall s, user s, sys s).
-fn timed<F: Fn(usize) + Sync>(nt: usize, f: F) -> (f64, f64, f64) {
-    let c0 = cpu();
+/// Runs `f(thread)` on `nt` threads; returns the wall time in seconds.
+fn timed<F: Fn(usize) + Sync>(nt: usize, f: F) -> f64 {
     let t = Instant::now();
     std::thread::scope(|s| {
-        for w in 0..nt {
+        for i in 0..nt {
             let f = &f;
-            s.spawn(move || f(w));
+            s.spawn(move || f(i));
         }
     });
-    let e = t.elapsed().as_secs_f64();
-    let c1 = cpu();
-    (e, c1.0 - c0.0, c1.1 - c0.1)
+    t.elapsed().as_secs_f64()
 }
 
-fn anon(len: usize, thp: bool) -> *mut u8 {
-    unsafe {
-        let p = mmap(std::ptr::null_mut(), len + (2 << 20), 3, 0x22 | 0x4000, -1, 0);
-        let a = ((p as usize + (2 << 20) - 1) & !((2 << 20) - 1)) as *mut u8;
-        madvise(a, len, if thp { 14 } else { 15 });
-        a
-    }
-}
+const B36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
-fn mem_tests(nt: usize) {
-    const SZ: usize = 256 << 20;
-    for thp in [false, true] {
-        // first-touch cost
-        let ptrs: Vec<usize> = (0..nt).map(|_| anon(SZ, thp) as usize).collect();
-        let (w, u, s) = timed(nt, |i| unsafe {
-            let p = ptrs[i] as *mut u8;
-            let mut o = 0;
-            while o < SZ {
-                p.add(o).write_volatile(1);
-                o += 4096;
-            }
-        });
-        let huge = fs::read_to_string("/proc/self/smaps_rollup")
-            .ok()
-            .and_then(|s| s.lines().find(|l| l.starts_with("AnonHugePages")).map(|l| l.to_string()))
-            .unwrap_or_default();
-        eprintln!(
-            "[diag] fault thp={thp} threads={nt}: {:.0} ms wall, user {:.2} sys {:.2}, {:.2} GB/s, {:.2} us/4K-page cpu  [{huge}]",
-            w * 1e3,
-            u,
-            s,
-            (nt * SZ) as f64 / w / 1e9,
-            (u + s) * 1e6 / (nt * SZ / 4096) as f64
-        );
-        if !thp {
-            // bandwidth on the faulted 4K memory
-            for (name, mode) in [("read", 0), ("write", 1), ("write-nt", 2), ("rep-stosb", 3)] {
-                let (w, _, _) = timed(nt, |i| unsafe {
-                    use std::arch::x86_64::*;
-                    let p = ptrs[i] as *mut u64;
-                    let n = SZ / 8;
-                    match mode {
-                        0 => {
-                            let mut a = _mm256_setzero_si256();
-                            let mut i = 0;
-                            while i < n {
-                                a = _mm256_add_epi64(a, _mm256_load_si256(p.add(i) as *const __m256i));
-                                i += 4;
-                            }
-                            std::hint::black_box(a);
-                        }
-                        1 => {
-                            let v = _mm256_set1_epi64x(3);
-                            let mut i = 0;
-                            while i < n {
-                                _mm256_store_si256(p.add(i) as *mut __m256i, v);
-                                i += 4;
-                            }
-                        }
-                        2 => {
-                            let v = _mm256_set1_epi64x(5);
-                            let mut i = 0;
-                            while i < n {
-                                _mm256_stream_si256(p.add(i) as *mut __m256i, v);
-                                i += 4;
-                            }
-                            _mm_sfence();
-                        }
-                        _ => {
-                            std::arch::asm!("rep stosb", inout("rcx") SZ => _, inout("rdi") p => _, in("al") 0u8);
-                        }
-                    }
-                });
-                eprintln!("[diag] bandwidth {name} threads={nt}: {:.1} GB/s", (nt * SZ) as f64 / w / 1e9);
-            }
-            // random 64-byte reads in the 256 MB block, 8 independent chains
-            let (w, _, _) = timed(nt, |i| unsafe {
-                let p = ptrs[i] as *const u64;
-                let mut x = [1u64 + i as u64, 2, 3, 4, 5, 6, 7, 8];
-                let mut acc = 0u64;
-                for _ in 0..500_000 {
-                    for k in 0..8 {
-                        x[k] = x[k].wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407 + k as u64);
-                        acc = acc.wrapping_add(*p.add(((x[k] >> 20) as usize % (SZ / 64)) * 8));
-                    }
-                }
-                std::hint::black_box(acc);
-            });
-            eprintln!("[diag] random read (8 chains) threads={nt}: {:.1} ns/read", w * 1e9 / 4e6);
-        } else {
-            let (w, _, _) = timed(nt, |i| unsafe {
-                let p = ptrs[i] as *const u64;
-                let mut x = [1u64 + i as u64, 2, 3, 4, 5, 6, 7, 8];
-                let mut acc = 0u64;
-                for _ in 0..500_000 {
-                    for k in 0..8 {
-                        x[k] = x[k].wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407 + k as u64);
-                        acc = acc.wrapping_add(*p.add(((x[k] >> 20) as usize % (SZ / 64)) * 8));
-                    }
-                }
-                std::hint::black_box(acc);
-            });
-            eprintln!("[diag] random read thp (8 chains) threads={nt}: {:.1} ns/read", w * 1e9 / 4e6);
-        }
-        let (w, u, s) = timed(nt, |i| unsafe {
-            madvise(ptrs[i] as *mut u8, SZ, 4);
-        });
-        eprintln!("[diag] dontneed thp={thp} threads={nt}: {:.0} ms wall, cpu {:.2}", w * 1e3, u + s);
-        for p in ptrs {
-            unsafe { munmap(p as *mut u8, SZ) };
-        }
-    }
-}
-
-fn io_tests(data: &Path, out: &Path, scratch: &Path, nt: usize) {
-    use std::os::unix::io::AsRawFd;
-    let mut files: Vec<(std::path::PathBuf, u64)> = Vec::new();
-    for dir in ["events", "clicks", "links"] {
-        let mut n = 0u64;
-        let mut bytes = 0u64;
-        if let Ok(rd) = fs::read_dir(data.join(dir)) {
-            for e in rd.flatten() {
-                if let Ok(m) = e.metadata() {
-                    if m.is_file() {
-                        n += 1;
-                        bytes += m.len();
-                        files.push((e.path(), m.len()));
-                    }
-                }
-            }
-        }
-        eprintln!("[diag] {dir}: {n} files, {bytes} bytes");
-    }
-    files.sort();
-    let total: u64 = files.iter().map(|f| f.1).sum();
-    // how much of the input is already in the page cache?
-    let mut resident = 0u64;
-    let mut pages = 0u64;
-    let t = Instant::now();
-    for (p, len) in &files {
-        if *len == 0 {
-            continue;
-        }
-        let f = fs::File::open(p).unwrap();
-        unsafe {
-            let m = mmap(std::ptr::null_mut(), *len as usize, 1, 0x02, f.as_raw_fd(), 0);
-            if m as isize == -1 {
-                continue;
-            }
-            let np = (*len as usize).div_ceil(4096);
-            let mut v = vec![0u8; np];
-            if mincore(m, *len as usize, v.as_mut_ptr()) == 0 {
-                resident += v.iter().filter(|&&b| b & 1 != 0).count() as u64;
-                pages += np as u64;
-            }
-            munmap(m, *len as usize);
-        }
-    }
-    eprintln!("[diag] page cache before reading: {resident} of {pages} pages resident ({:.1} ms to check)", t.elapsed().as_secs_f64() * 1e3);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    for pass in 0..2 {
-        next.store(0, std::sync::atomic::Ordering::Relaxed);
-        let (w, u, s) = timed(nt, |_| {
-            let mut buf = vec![0u8; 1 << 20];
-            loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if i >= files.len() {
-                    break;
-                }
-                let f = fs::File::open(&files[i].0).unwrap();
-                let mut off = 0u64;
-                loop {
-                    let n = f.read_at(&mut buf, off).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    off += n as u64;
-                }
-            }
-        });
-        eprintln!("[diag] pread pass {pass} threads={nt}: {:.1} ms, {:.2} GB/s, user {:.2} sys {:.2}", w * 1e3, total as f64 / w / 1e9, u, s);
-    }
-    next.store(0, std::sync::atomic::Ordering::Relaxed);
-    let (w, u, s) = timed(nt, |_| loop {
-        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if i >= files.len() {
+/// `v` in base 36 without leading zeros (the way the generator prints an ID's number).
+fn b36_var(mut v: u64, out: &mut Vec<u8>) {
+    let mut buf = [0u8; 13];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = B36[(v % 36) as usize];
+        v /= 36;
+        if v == 0 {
             break;
         }
-        let len = files[i].1 as usize;
-        if len == 0 {
-            continue;
-        }
-        let f = fs::File::open(&files[i].0).unwrap();
-        unsafe {
-            let m = mmap(std::ptr::null_mut(), len, 1, 0x02, f.as_raw_fd(), 0);
-            madvise(m, len, 22);
-            let mut acc = 0u64;
-            let mut o = 0;
-            while o < len {
-                acc += *m.add(o) as u64;
-                o += 64;
-            }
-            std::hint::black_box(acc);
-            madvise(m, len, 4);
-            munmap(m, len);
-        }
-    });
-    eprintln!("[diag] mmap+populate+touch+release threads={nt}: {:.1} ms, {:.2} GB/s, user {:.2} sys {:.2}", w * 1e3, total as f64 / w / 1e9, u, s);
-    for (name, dir) in [("output", out), ("scratch", scratch)] {
-        let _ = fs::create_dir_all(dir);
-        let (w, u, s) = timed(nt, |i| {
-            let p = dir.join(format!("_diag{i}.tmp"));
-            let buf = vec![7u8; 4 << 20];
-            if let Ok(f) = fs::File::create(&p) {
-                for k in 0..8u64 {
-                    let _ = f.write_all_at(&buf, k * (4 << 20));
-                }
-            }
-        });
-        let ok = dir.join("_diag0.tmp").exists();
-        let t = Instant::now();
-        for i in 0..nt {
-            let _ = fs::remove_file(dir.join(format!("_diag{i}.tmp")));
-        }
-        eprintln!(
-            "[diag] write {name} ({}x32 MB, ok={ok}): {:.1} ms, {:.2} GB/s, user {:.2} sys {:.2}; unlink {:.1} ms",
-            nt,
-            w * 1e3,
-            (nt * (32 << 20)) as f64 / w / 1e9,
-            u,
-            s,
-            t.elapsed().as_secs_f64() * 1e3
-        );
     }
-    // scanner micro-benchmark on the first megabyte of the biggest events file
-    let big = files.iter().filter(|f| f.0.to_string_lossy().contains("/events/")).max_by_key(|f| f.1);
-    if let Some((p, _)) = big {
-        let mut text = fs::read(p).unwrap_or_default();
-        text.truncate(text.len().min(1 << 20));
-        while !text.is_empty() && text.last() != Some(&b'\n') {
-            text.pop();
+    out.extend_from_slice(&buf[i..]);
+}
+
+/// The content `ct` of an ID field as copy `c` (from 1) writes it. Copies keep
+/// the shape of generated IDs: an event id with a sequence number gets the
+/// number moved up by `c * stride` (so the copies together are one dense
+/// range, like one big data set); any other letter-and-digits ID gets its
+/// first character after the letter rotated by `c`; the rest gets a tag in front.
+fn retag(ct: &[u8], c: usize, seq: Option<(u64, u64)>, out: &mut Vec<u8>) {
+    if ct.is_empty() {
+        return;
+    }
+    if let Some((key, stride)) = seq {
+        // (`ct` lies in a buffer with 32 spare bytes at its end)
+        if let Some(v) = crate::id_number(b'e', ct) {
+            let n = (crate::seq_of(v, key) + c as u64 * stride) & crate::M40;
+            out.push(b'e');
+            b36_var(crate::scramble(n, key), out);
+            return;
         }
-        if text.len() > 1000 {
-            let buf = crate::pad_buffer(text);
-            let begin = crate::find_byte(&buf, 0, b'\n') + 1;
-            for threads in [1, nt] {
-                for fast in [false, true] {
-                    let lines = std::sync::atomic::AtomicU64::new(0);
-                    let (w, _, _) = timed(threads, |_| {
-                        let (mut n, mut acc) = (0u64, 0u64);
-                        for _ in 0..60 {
-                            let mut f = |fs: &[&[u8]; 7]| {
-                                n += 1;
-                                acc = acc.wrapping_add(fs[0].len() as u64 + fs[3].as_ptr() as u64 + fs[6].len() as u64);
-                            };
-                            if fast {
-                                crate::scan_fast::<7, _>(&buf, begin, buf.len(), &mut f);
-                            } else {
-                                crate::scan_lines::<7, _>(&buf, begin, buf.len(), &mut f);
-                            }
-                        }
-                        std::hint::black_box(acc);
-                        lines.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-                    });
-                    let n = lines.load(std::sync::atomic::Ordering::Relaxed);
-                    eprintln!("[diag] scan fast={fast} threads={threads}: {:.2} ns/line/thread", w * 1e9 * threads as f64 / n as f64);
-                }
-            }
+    }
+    let digit = |b: u8| B36.iter().position(|&x| x == b);
+    match (ct[0], ct.get(1).and_then(|&b| digit(b))) {
+        (b'e' | b'u' | b'k', Some(d)) => {
+            out.push(ct[0]);
+            out.push(B36[(d + c) % 36]);
+            out.extend_from_slice(&ct[2..]);
+        }
+        _ => {
+            out.push(B36[c % 36]);
+            out.extend_from_slice(ct);
         }
     }
 }
 
-pub fn run(data: &Path, out: &Path, nt: usize) {
-    let t0 = Instant::now();
-    eprintln!("[diag] ---- machine");
-    grep("/proc/cpuinfo", &["model name", "cpu MHz", "cache size", "siblings", "cpu cores"], 6);
-    if let Ok(s) = fs::read_to_string("/proc/cpuinfo") {
-        eprintln!("[diag] processors listed: {}", s.lines().filter(|l| l.starts_with("processor")).count());
-        if let Some(l) = s.lines().find(|l| l.starts_with("flags")) {
-            let want = [
-                "avx2", "bmi2", "avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512_vbmi", "avx512_vbmi2", "avx512_bitalg",
-                "avx512_vpopcntdq", "vpclmulqdq", "gfni", "vaes", "erms", "fsrm", "hypervisor", "pdpe1gb", "movdir64b",
-            ];
-            let have: Vec<&str> = l.split_whitespace().filter(|f| want.contains(f)).collect();
-            eprintln!("[diag] flags of interest: {}", have.join(" "));
-        }
+/// Writes `copies` copies of every CSV in `src/{events,clicks,links}` to `dst`
+/// with the IDs in the first two fields of each line made distinct per copy
+/// (see `retag`): a data set `copies` times the size, same shape. Returns the
+/// bytes written and whether the event ids kept their sequence numbers.
+fn synthesize(src: &Path, dst: &Path, copies: usize, nt: usize) -> (u64, bool) {
+    let _ = fs::remove_dir_all(dst);
+    for d in ["events", "clicks", "links"] {
+        fs::create_dir_all(dst.join(d)).unwrap();
     }
-    grep("/proc/self/status", &["Cpus_allowed_list", "Mems_allowed_list", "Threads"], 4);
-    if let Ok(s) = fs::read_to_string("/proc/self/status") {
-        if let Some(l) = s.lines().find(|l| l.starts_with("Cpus_allowed_list")) {
-            let list = l.split(':').nth(1).unwrap_or("").trim();
-            for part in list.split(',') {
-                let mut it = part.split('-');
-                let a: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-                let b: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(a);
-                for c in a..=b.min(a + 15) {
-                    let r = |f: &str| fs::read_to_string(format!("/sys/devices/system/cpu/cpu{c}/{f}")).unwrap_or_default().trim().to_string();
-                    eprintln!(
-                        "[diag] cpu{c}: siblings {} core {} pkg {} maxfreq {} cur {}",
-                        r("topology/thread_siblings_list"),
-                        r("topology/core_id"),
-                        r("topology/physical_package_id"),
-                        r("cpufreq/cpuinfo_max_freq"),
-                        r("cpufreq/scaling_cur_freq")
-                    );
+    for f in ["manifest.json", "products.csv", "campaigns.csv"] {
+        let _ = fs::copy(src.join(f), dst.join(f));
+    }
+    let mut jobs: Vec<(std::path::PathBuf, std::path::PathBuf, bool)> = Vec::new();
+    for d in ["events", "clicks", "links"] {
+        if let Ok(rd) = fs::read_dir(src.join(d)) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.ends_with(".csv") {
+                    jobs.push((e.path(), dst.join(d).join(name), d == "events"));
                 }
             }
         }
     }
-    for i in 0..4 {
-        let r = |f: &str| fs::read_to_string(format!("/sys/devices/system/cpu/cpu0/cache/index{i}/{f}")).unwrap_or_default().trim().to_string();
-        eprintln!("[diag] cache index{i}: level {} type {} size {} shared {}", r("level"), r("type"), r("size"), r("shared_cpu_list"));
+    // the key of the event ids (from the biggest events file) and the number of event lines
+    let mut lines = 0u64;
+    let mut biggest: Vec<u8> = Vec::new();
+    for j in jobs.iter().filter(|j| j.2) {
+        let text = fs::read(&j.0).unwrap_or_default();
+        lines += text.iter().filter(|&&b| b == b'\n').count() as u64;
+        if text.len() > biggest.len() {
+            biggest = text;
+        }
     }
-    cat("/proc/version", 1);
-    grep("/proc/meminfo", &["MemTotal", "MemFree", "MemAvailable", "Cached", "Dirty", "AnonHugePages", "HugePages_Total", "Hugepagesize"], 10);
-    for f in [
-        "/sys/kernel/mm/transparent_hugepage/enabled",
-        "/sys/kernel/mm/transparent_hugepage/defrag",
-        "/sys/kernel/mm/transparent_hugepage/shmem_enabled",
-        "/proc/sys/vm/overcommit_memory",
-        "/proc/sys/vm/dirty_ratio",
-        "/proc/sys/vm/dirty_background_ratio",
-        "/proc/sys/vm/max_map_count",
-        "/proc/sys/kernel/perf_event_paranoid",
-        "/proc/self/cgroup",
-        "/sys/fs/cgroup/cpu.max",
-        "/sys/fs/cgroup/cpuset.cpus.effective",
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory.high",
-        "/sys/fs/cgroup/cpu.weight",
-        "/sys/devices/system/cpu/vulnerabilities/spectre_v2",
-        "/sys/devices/system/cpu/vulnerabilities/mds",
-        "/sys/devices/system/cpu/vulnerabilities/meltdown",
-        "/proc/loadavg",
-    ] {
-        cat(f, 3);
+    biggest.extend_from_slice(&[0u8; 32]);
+    let mut sample: Vec<u64> = Vec::new();
+    for line in biggest[..biggest.len() - 32].split(|&b| b == b'\n').skip(1) {
+        if sample.len() == 48 {
+            break;
+        }
+        let end = line.iter().position(|&b| b == b',').unwrap_or(line.len());
+        if let Some(v) = crate::id_number(b'e', &line[..end]) {
+            sample.push(v);
+        }
     }
-    grep("/proc/self/mountinfo", &[" /data ", " /output ", " /scratch ", " /tmp ", " / "], 8);
-    for k in ["NCPU", "MEM_GB", "DATA_DIR", "OUTPUT_DIR", "SCRATCH_DIR", "HOME"] {
-        eprintln!("[diag] env {k}={:?}", std::env::var(k).ok());
+    let seq = crate::find_seq_key(&sample, (lines * 2).max(1 << 12), nt).map(|key| (key, lines));
+    dl!("[diag] event ids: {} lines, key {:?}", lines, seq.map(|s| format!("{:x}", s.0)));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let total = std::sync::atomic::AtomicU64::new(0);
+    timed(nt, |_| loop {
+        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if i >= jobs.len() {
+            break;
+        }
+        let mut text = fs::read(&jobs[i].0).unwrap_or_default();
+        let len = text.len();
+        text.extend_from_slice(&[0u8; 32]);
+        let head = text[..len].iter().position(|&b| b == b'\n').map(|p| p + 1).unwrap_or(len);
+        let mut out = Vec::with_capacity((len + len / 16 + 64) * copies);
+        // all copies go into one file, so the file count stays that of the source
+        out.extend_from_slice(&text[..head]);
+        for c in 0..copies {
+            if c == 0 {
+                out.extend_from_slice(&text[head..len]);
+                continue;
+            }
+            for line in text[head..len].split_inclusive(|&b| b == b'\n') {
+                let mut at = 0;
+                for field in 0..2 {
+                    let end = line[at..].iter().position(|&b| b == b',' || b == b'\n').map(|p| at + p).unwrap_or(line.len());
+                    let f = &line[at..end];
+                    let quoted = f.len() >= 2 && f[0] == b'"' && f[f.len() - 1] == b'"';
+                    let ct = if quoted { &f[1..f.len() - 1] } else { f };
+                    if quoted {
+                        out.push(b'"');
+                    }
+                    retag(ct, c, if field == 0 && jobs[i].2 { seq } else { None }, &mut out);
+                    if quoted {
+                        out.push(b'"');
+                    }
+                    if end < line.len() && line[end] == b',' {
+                        out.push(b',');
+                        at = end + 1;
+                    } else {
+                        at = end;
+                        break;
+                    }
+                }
+                out.extend_from_slice(&line[at..]);
+            }
+        }
+        fs::write(&jobs[i].1, &out).unwrap();
+        total.fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    });
+    (total.load(std::sync::atomic::Ordering::Relaxed), seq.is_some())
+}
+
+/// Runs this binary as a child on `data` with extra environment. Returns the
+/// wall time in ms and [link map, phase 1 end, dedup end, phase 3 end, user s, sys s]
+/// from its phase lines (zeros if it failed).
+fn child(data: &Path, out: &Path, envs: &[(&str, &str)]) -> (f64, [f64; 8]) {
+    let _ = fs::remove_dir_all(out);
+    let _ = fs::create_dir_all(out);
+    let exe = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
+    let mut cmd = std::process::Command::new(exe);
+    cmd.env("SS_CHILD", "1").env("SS_VERBOSE", "1").env("DATA_DIR", data).env("OUTPUT_DIR", out);
+    for (k, v) in envs {
+        cmd.env(k, v);
     }
-    eprintln!("[diag] ---- io ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+    let t = Instant::now();
+    let r = cmd.output();
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    // [link map, phase 1 end, dedup end, phase 3 end, user s, sys s, sequence phase end, sequence path on]
+    let mut laps = [0f64; 8];
+    match r {
+        Ok(o) => {
+            let text = String::from_utf8_lossy(&o.stderr);
+            for l in text.lines() {
+                let at: f64 = l.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                let k = if l.contains("link map built") {
+                    0
+                } else if l.contains("phase 1 parse") {
+                    1
+                } else if l.contains("phase 2a dedup") {
+                    2
+                } else if l.contains("phase 3 sessions") {
+                    3
+                } else if l.contains("phase 2b sequence") {
+                    6
+                } else {
+                    if l.contains("sequence numbers: on=true") {
+                        laps[7] = 1.0;
+                    }
+                    if l.contains("ms  done") {
+                        let num = |key: &str| -> f64 {
+                            l.find(key).and_then(|p| l[p + key.len()..].split('s').next().and_then(|v| v.trim().parse().ok())).unwrap_or(0.0)
+                        };
+                        laps[4] = num("(user ");
+                        laps[5] = num(" sys ");
+                    }
+                    continue;
+                };
+                laps[k] = at;
+            }
+            if laps[6] == 0.0 {
+                laps[6] = laps[2];
+            }
+            if !o.status.success() {
+                use std::os::unix::process::ExitStatusExt;
+                dl!("[diag]     child failed: status={:?} signal={:?}", o.status.code(), o.status.signal());
+                for l in text.lines().rev().take(4) {
+                    dl!("[diag]       child: {l}");
+                }
+                laps = [0.0; 8];
+            }
+        }
+        Err(e) => dl!("[diag]     child failed: {e}"),
+    }
+    (ms, laps)
+}
+
+fn b36(mut v: u64, width: usize) -> String {
+    let mut s = vec![b'0'; width];
+    v = v.min(36u64.pow(width as u32) - 1);
+    for i in (0..width).rev() {
+        s[i] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(v % 36) as usize];
+        v /= 36;
+    }
+    String::from_utf8(s).unwrap()
+}
+
+/// Scatter micro-benchmark: every thread spreads 4M 16-byte records over 1024
+/// partitions through 64-byte staging buffers. ns per record and thread for:
+/// c = registers + streaming stores on untouched memory (page faults included),
+/// then on the same (now faulted) memory: a = store + reload + streaming (the
+/// old writer), b = registers + streaming, p = registers + plain stores,
+/// e = direct 16-byte writes without staging; then a and b again.
+#[allow(dead_code)]
+fn scatter(nt: usize) -> String {
+    use std::arch::x86_64::*;
+    const P: usize = 1024;
+    const N: usize = 4 << 20;
+    const CAP: usize = 5120;
+    let bytes = P * CAP * 16;
+    let regions: Vec<usize> = (0..nt).map(|_| crate::zeroed_slice::<u8>(bytes).as_mut_ptr() as usize).collect();
+    let mut s = String::from("S:");
+    for mode in [1usize, 0, 1, 2, 3, 0, 1] {
+        let w = timed(nt, |t| unsafe {
+            let base = regions[t] as *mut u8;
+            let mut buf = vec![[0u64; 8]; P];
+            let mut cnt = vec![0u32; P];
+            let mut len = vec![0u32; P];
+            let (bufp, cntp, lenp) = (buf.as_mut_ptr() as *mut u64, cnt.as_mut_ptr(), len.as_mut_ptr());
+            let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ ((t as u64 + 1) << 32);
+            for _ in 0..N {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let q = (x >> 20) as usize & (P - 1);
+                let (a, b) = (x, x.rotate_left(17));
+                let l = *lenp.add(q) as usize;
+                if l + 4 > CAP {
+                    continue;
+                }
+                let d = base.add((q * CAP + l) * 16);
+                if mode == 3 {
+                    (d as *mut u64).write(a);
+                    (d as *mut u64).add(1).write(b);
+                    *lenp.add(q) = l as u32 + 1;
+                    continue;
+                }
+                let k = *cntp.add(q) as usize;
+                let bp = bufp.add(q * 8);
+                if k < 3 {
+                    *bp.add(2 * k) = a;
+                    *bp.add(2 * k + 1) = b;
+                    *cntp.add(q) = k as u32 + 1;
+                    continue;
+                }
+                *cntp.add(q) = 0;
+                *lenp.add(q) = l as u32 + 4;
+                if mode == 0 {
+                    *bp.add(6) = a;
+                    *bp.add(7) = b;
+                    let v0 = _mm256_loadu_si256(bp as *const __m256i);
+                    let v1 = _mm256_loadu_si256(bp.add(4) as *const __m256i);
+                    _mm256_stream_si256(d as *mut __m256i, v0);
+                    _mm256_stream_si256(d.add(32) as *mut __m256i, v1);
+                } else {
+                    let v0 = _mm256_loadu_si256(bp as *const __m256i);
+                    let lo = _mm_loadu_si128(bp.add(4) as *const __m128i);
+                    let v1 = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), _mm_set_epi64x(b as i64, a as i64), 1);
+                    if mode == 1 {
+                        _mm256_stream_si256(d as *mut __m256i, v0);
+                        _mm256_stream_si256(d.add(32) as *mut __m256i, v1);
+                    } else {
+                        _mm256_storeu_si256(d as *mut __m256i, v0);
+                        _mm256_storeu_si256(d.add(32) as *mut __m256i, v1);
+                    }
+                }
+            }
+            std::hint::black_box((&buf, &len));
+        });
+        let per = w * 1e9 / N as f64;
+        dl!("[diag] scatter mode {mode}: {per:.1} ns/record");
+        s.push_str(&format!("{per:.1},"));
+    }
+    for r in &regions {
+        crate::release(*r as *const u8, bytes);
+    }
+    s.pop();
+    s.push(';');
+    s
+}
+
+/// Hash-table micro-benchmark: every thread inserts 2M random 64-bit keys
+/// into one shared 512 MB open-addressing table (16-byte slots, prefetched 16
+/// operations ahead) and raises the slot's second word. ns per operation and
+/// thread: on untouched memory, then twice more with the same keys.
+#[allow(dead_code)]
+fn table(nt: usize) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const BITS: u32 = 25;
+    const OPS: usize = 2 << 20;
+    const D: usize = 16;
+    let n = 1usize << BITS;
+    let tab = crate::zeroed_slice::<[AtomicU64; 2]>(n);
+    let tab: &[[AtomicU64; 2]] = tab;
+    let slot = |fp: u64| (fp.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - BITS)) as usize;
+    let mut s = String::from("T:");
+    for pass in 0..3u64 {
+        let w = timed(nt, |t| {
+            let mut x = 0xD6E8_FEB8_6659_FD93u64 ^ ((t as u64 + 1) << 40);
+            let mut ring = [1u64; D];
+            for i in 0..OPS + D {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let fp = x | 1;
+                crate::prefetch_w(unsafe { tab.as_ptr().add(slot(fp)) });
+                let old = std::mem::replace(&mut ring[i % D], fp);
+                if i >= D {
+                    let mut j = slot(old);
+                    loop {
+                        let e = unsafe { tab.get_unchecked(j) };
+                        let c = e[0].load(Ordering::Relaxed);
+                        if c == old {
+                            break;
+                        }
+                        if c == 0 {
+                            match e[0].compare_exchange(0, old, Ordering::Relaxed, Ordering::Relaxed) {
+                                Ok(_) => break,
+                                Err(c2) if c2 == old => break,
+                                _ => {}
+                            }
+                        }
+                        j = (j + 1) & (n - 1);
+                    }
+                    let e = unsafe { tab.get_unchecked(j) };
+                    e[1].fetch_max((old >> 8) + pass, Ordering::Relaxed);
+                }
+            }
+        });
+        let per = w * 1e9 / OPS as f64;
+        dl!("[diag] table pass {pass}: {per:.1} ns/op");
+        s.push_str(&format!("{per:.1},"));
+    }
+    crate::release(tab.as_ptr() as *const u8, n * 16);
+    s.pop();
+    s.push(';');
+    s
+}
+
+/// address -> "line code" (main.rs line, 10000 + pq.rs line, ...) or a
+/// function name, from the table the Docker build wrote next to the binary.
+fn load_table() -> HashMap<u64, String> {
+    let path = std::env::var("SS_LINES").unwrap_or_else(|_| "/lines.tbl".into());
+    let mut m = HashMap::new();
+    if let Ok(text) = fs::read_to_string(&path) {
+        for l in text.lines() {
+            let mut it = l.split_whitespace();
+            if let (Some(a), Some(k)) = (it.next(), it.next()) {
+                if let Ok(a) = u64::from_str_radix(a, 16) {
+                    m.insert(a, k.to_string());
+                }
+            }
+        }
+    }
+    dl!("[diag] line table {path}: {} addresses", m.len());
+    m
+}
+
+pub fn run(data: &Path, _out: &Path, nt: usize) {
+    let _ = data;
+    let t0 = Instant::now();
     let scratch = std::path::PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into()));
-    io_tests(data, out, &scratch, nt);
-    eprintln!("[diag] ---- memory ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
-    mem_tests(1);
-    mem_tests(nt);
-    eprintln!("[diag] ---- done ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
+    let mut row = String::from("v7;");
+    // fingerprint of this binary (FNV-1a), to match it with a local build
+    let exe = fs::read(std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into())).unwrap_or_default();
+    let fnv = exe.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    row.push_str(&format!("X{};", b36(fnv % 36u64.pow(8), 8)));
+    let syn = scratch.join("syn");
+    let (bytes, seq) = synthesize(data, &syn, 20, nt);
+    dl!("[diag] synthetic x20 data: {} MB in {:.0} ms, sequence numbers kept: {seq}", bytes >> 20, t0.elapsed().as_secs_f64() * 1e3);
+    row.push_str(&format!("q{};", seq as u32));
+    let out = scratch.join("synout");
+
+    // pipeline variants: code:wall,link map,phase 1,dedup,sequence phase,phase 3,user,sys,sequence path on (best of 3)
+    let sets: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        ("d", vec![]),
+        ("ns", vec![("SS_NO_SEQ", "1")]),
+        ("x12", vec![("SS_IXSHIFT", "12")]),
+        ("x13", vec![("SS_IXSHIFT", "13")]),
+        ("x15", vec![("SS_IXSHIFT", "15")]),
+        ("x16", vec![("SS_IXSHIFT", "16")]),
+        ("r1", vec![("SS_REL", "1")]),
+        ("np", vec![("SS_POP", "0")]),
+        ("p2", vec![("SS_PF2", "1")]),
+        ("nr1", vec![("SS_NO_SEQ", "1"), ("SS_REL", "1")]),
+        ("ns2", vec![("SS_NO_SEQ", "1")]),
+        ("d2", vec![]),
+    ];
+    for (name, envs) in &sets {
+        let mut best = (f64::MAX, [0f64; 8]);
+        for _ in 0..3 {
+            let r = child(&syn, &out, envs);
+            if r.0 < best.0 && r.1[3] > 0.0 {
+                best = r;
+            }
+        }
+        if best.0 == f64::MAX {
+            best.0 = 0.0;
+        }
+        let l = best.1;
+        let rec = format!(
+            "{name}:{:.0},{:.0},{:.0},{:.0},{:.0},{:.0},{:.1},{:.1},{:.0};",
+            best.0,
+            l[0],
+            l[1] - l[0],
+            l[2] - l[1],
+            l[6] - l[2],
+            l[3] - l[6],
+            l[4],
+            l[5],
+            l[7]
+        );
+        dl!("[diag] variant {rec}");
+        row.push_str(&rec);
+    }
+    row.push(';');
+    row.push(';');
+
+    // profile of the default pipeline: several runs, samples summed by table key
+    let table = load_table();
+    let prof = scratch.join("prof.txt");
+    let prof_s = prof.to_string_lossy().to_string();
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    let mut addrs: HashMap<u64, u64> = HashMap::new();
+    let (mut total, mut unknown, mut runs) = (0u64, 0u64, 0);
+    while runs < 8 && t0.elapsed().as_secs_f64() < 90.0 {
+        let _ = fs::remove_file(&prof);
+        child(&syn, &out, &[("SS_PROF", &prof_s)]);
+        runs += 1;
+        if let Ok(text) = fs::read_to_string(&prof) {
+            for l in text.lines() {
+                let mut it = l.split_whitespace();
+                let (Some(a), Some(c)) = (it.next(), it.next()) else { continue };
+                let (Ok(a), Ok(c)) = (u64::from_str_radix(a, 16), c.parse::<u64>()) else { continue };
+                total += c;
+                *addrs.entry(a).or_insert(0) += c;
+                match table.get(&a) {
+                    Some(k) => *counts.entry(k.clone()).or_insert(0) += c,
+                    None => unknown += c,
+                }
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&out);
+    let _ = fs::remove_dir_all(&syn);
+    let _ = fs::remove_file(&prof);
+    let mut v: Vec<(String, u64)> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    // P<samples>,<not in the table>,<runs>; then functions without a source
+    // line (name=count), then lines: 3 base-36 digits of the line code and 3
+    // of the count, most samples first
+    row.push_str(&format!("P{total},{unknown},{runs};"));
+    let names: Vec<String> = v.iter().filter(|(k, _)| k.parse::<u64>().is_err()).take(6).map(|(k, c)| format!("{k}={c}")).collect();
+    row.push_str(&names.join(","));
+    row.push(';');
+    let mut lines = 0;
+    for (k, c) in v.iter() {
+        if let Ok(code) = k.parse::<u64>() {
+            if lines == 80 {
+                break;
+            }
+            lines += 1;
+            row.push_str(&b36(code, 3));
+            row.push_str(&b36(*c, 3));
+        }
+    }
+    // then instruction addresses (offsets in the binary): 4 base-36 digits and
+    // 3 of the count, most samples first
+    row.push(';');
+    let mut av: Vec<(u64, u64)> = addrs.into_iter().collect();
+    av.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (a, c) in av.iter() {
+        if *a >= 36u64.pow(4) {
+            continue;
+        }
+        if row.len() + 7 > 1750 {
+            break;
+        }
+        row.push_str(&b36(*a, 4));
+        row.push_str(&b36(*c, 3));
+    }
+    dl!("[diag] done in {:.0} ms: {} samples in {runs} runs, {} keys, row {} chars", t0.elapsed().as_secs_f64() * 1e3, total, v.len(), row.len());
+    dl!("[diag] {row}");
+    *ROW.lock().unwrap() = row;
 }

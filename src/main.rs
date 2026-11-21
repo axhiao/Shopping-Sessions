@@ -40,6 +40,19 @@ const PAD: usize = 128;
 /// How far ahead of the line being scanned the input is prefetched (bytes).
 const INPUT_AHEAD: usize = 512;
 
+/// Experiment switches of the diagnostic build: 0 = SS_PF (input prefetch
+/// distance), 1 = SS_PF2 (also prefetch the following cache line), 2 = SS_REL
+/// (input release: 0 per chunk, 1 per file at the end of phase 1, 2 never),
+/// 3 = SS_RES (partition reserve in percent of a sampled estimate, 0 = the
+/// fixed estimate), 4 = SS_POP (populate the input page tables per chunk).
+fn knob(i: usize) -> i64 {
+    static V: OnceLock<[i64; 5]> = OnceLock::new();
+    V.get_or_init(|| {
+        let g = |k: &str, d: i64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        [g("SS_PF", INPUT_AHEAD as i64), g("SS_PF2", 0), g("SS_REL", 0), g("SS_RES", 0), g("SS_POP", 1)]
+    })[i]
+}
+
 // ---------------------------------------------------------------------------
 // Memory helpers
 
@@ -1242,12 +1255,16 @@ fn scan_lean<'a, const N: usize, const K: usize, F: FnMut(&[&'a [u8]; N])>(buf: 
     debug_assert!(K >= 1 && K < N);
     let ptr = buf.as_ptr();
     let mut ls = begin;
+    let (pf, pf2) = (knob(0) as usize, knob(1) != 0);
     while ls < limit && ls < n {
         let p = unsafe { ptr.add(ls) };
         // The input is read once, front to back, from 4 KB pages: the hardware
         // prefetcher restarts at every page, and on the scorer the loads below
         // waited for memory (phase 1 is 9% faster with this one hint per line).
-        prefetch(p.wrapping_add(INPUT_AHEAD));
+        prefetch(p.wrapping_add(pf));
+        if pf2 {
+            prefetch(p.wrapping_add(pf + 64));
+        }
         match unsafe { line_cursors::<N, K>(p) } {
             Line::Slow => {
                 let (end, res) = slow_line::<N>(buf, ls);
@@ -2031,7 +2048,7 @@ const SCR_C1I: u64 = inv64(SCR_C1);
 const SCR_C2I: u64 = inv64(SCR_C2);
 
 /// The generator's bijection on 0..2^40.
-#[cfg(test)]
+#[cfg(any(test, feature = "diag"))]
 fn scramble(n: u64, key: u64) -> u64 {
     let mut m = ((n & M40).wrapping_mul(SCR_C1) ^ key) & M40;
     m ^= m >> 17;
@@ -2407,7 +2424,9 @@ fn chunk_bytes<'a>(inf: &'a InFile, c: &Chunk, buf: &'a mut Vec<u8>) -> (&'a [u8
         // populate the page tables for this range in one go
         let s = (c.start as usize) & !4095;
         let e = ((c.end as usize + 65536).min(inf.len as usize) + 4095) & !4095;
-        unsafe { madvise(inf.map.add(s) as *mut _, e - s, 22 /* MADV_POPULATE_READ */) };
+        if knob(4) != 0 {
+            unsafe { madvise(inf.map.add(s) as *mut _, e - s, 22 /* MADV_POPULATE_READ */) };
+        }
         let begin = if c.start == 0 {
             find_byte(all, 0, b'\n') + 1
         } else {
@@ -2774,10 +2793,14 @@ fn parse_events(ctx: &Ctx, ix: &IxCfg, buf: &[u8], begin: usize, limit: usize, l
     let mut dc = DateCache::new();
     let ptr = buf.as_ptr();
     let mut ls = begin;
+    let (pf, pf2) = (knob(0) as usize, knob(1) != 0);
     while ls < limit && ls < n {
         let p = unsafe { ptr.add(ls) };
         // (see scan_lean)
-        prefetch(p.wrapping_add(INPUT_AHEAD));
+        prefetch(p.wrapping_add(pf));
+        if pf2 {
+            prefetch(p.wrapping_add(pf + 64));
+        }
         match unsafe { line_cursors::<7, 3>(p) } {
             Line::Slow => ls = event_slow(ctx, ix, buf, ls, &mut dc, lm, &mut q, o),
             Line::Bad(e) => ls += e + 1,
@@ -3363,7 +3386,9 @@ fn main() {
     SUBS.store(nthreads + 1, Ordering::Relaxed);
     let verbose = cfg!(feature = "diag") || std::env::var("SS_VERBOSE").is_ok();
     #[cfg(feature = "diag")]
-    diag::run(&data, &out, nthreads);
+    if std::env::var_os("SS_CHILD").is_none() {
+        diag::run(&data, &out, nthreads);
+    }
     #[cfg(feature = "diag")]
     let t0 = Instant::now();
     let lap = |what: &str| {
@@ -3484,9 +3509,35 @@ fn main() {
     }
     // estimate line counts to pre-size the partition buffers
     let bytes_of = |k: Kind| files.iter().filter(|f| f.kind == k).map(|f| f.len).sum::<u64>();
-    let est_events = (bytes_of(Kind::Event) / 70) as usize;
-    let est_clicks = (bytes_of(Kind::Click) / 40) as usize;
-    let per = |n: usize, parts: usize| n / parts / nthreads + n / parts / nthreads / 3 + 64;
+    let mut est_events = (bytes_of(Kind::Event) / 70) as usize;
+    let mut est_clicks = (bytes_of(Kind::Click) / 40) as usize;
+    let res = knob(3) as usize;
+    if res != 0 {
+        // bytes per line from the first 256 KB of the biggest file of a kind
+        let sample = |k: Kind| -> Option<f64> {
+            let f = files.iter().filter(|f| f.kind == k && !f.map.is_null()).max_by_key(|f| f.len)?;
+            let n = (f.len as usize).min(256 << 10);
+            let s = unsafe { std::slice::from_raw_parts(f.map, n) };
+            let lines = s.iter().filter(|&&b| b == b'\n').count();
+            if lines < 16 {
+                return None;
+            }
+            Some(n as f64 / lines as f64)
+        };
+        if let Some(a) = sample(Kind::Event) {
+            est_events = (bytes_of(Kind::Event) as f64 / a) as usize;
+        }
+        if let Some(a) = sample(Kind::Click) {
+            est_clicks = (bytes_of(Kind::Click) as f64 / a) as usize;
+        }
+    }
+    let per = |n: usize, parts: usize| {
+        if res != 0 {
+            n / parts / nthreads * res / 100 + 64
+        } else {
+            n / parts / nthreads + n / parts / nthreads / 3 + 64
+        }
+    };
     // about 40k events per partition, between 256 and 1024 partitions
     let bits = ((est_events / 40_000).max(1) as f64).log2().round().clamp(8.0, MAX_PC_BITS as f64) as u32;
     let abits = std::env::var("SS_ABITS").ok().and_then(|v| v.parse().ok()).unwrap_or(bits);
@@ -3523,6 +3574,10 @@ fn main() {
                     while (bound >> shift) > 2560 && shift < 16 {
                         shift += 1;
                     }
+                    #[cfg(feature = "diag")]
+                    if let Some(v) = std::env::var("SS_IXSHIFT").ok().and_then(|v| v.parse::<u32>().ok()) {
+                        shift = v.clamp(12, 18);
+                    }
                     let parts = (((bound >> shift) + 1) as usize).min(8192);
                     cfg = IxCfg { on: true, key, shift, mask: (1 << shift) - 1, parts, imax: (parts as u64) << shift };
                 }
@@ -3545,6 +3600,7 @@ fn main() {
     let link_chunks: Vec<usize> = (0..chunks.len()).filter(|&i| chunks[i].kind == Kind::Link).collect();
     let data_chunks: Vec<usize> = (0..chunks.len()).filter(|&i| chunks[i].kind != Kind::Link).collect();
     let barrier = std::sync::Barrier::new(nthreads);
+    let p1_barrier = std::sync::Barrier::new(nthreads);
     let total_pairs = AtomicUsize::new(0);
     let all_pairs: OnceLock<Vec<Vec<(Key, Key)>>> = OnceLock::new();
     let counters: [AtomicUsize; 6] = Default::default();
@@ -3668,8 +3724,17 @@ fn main() {
                 Kind::Link => unreachable!(),
             }
             let inf = &files[c.file];
-            if !inf.map.is_null() {
+            if !inf.map.is_null() && knob(2) == 0 {
                 release(unsafe { inf.map.add(c.start as usize) }, (c.end - c.start) as usize);
+            }
+        }
+        if knob(2) == 1 {
+            // everyone is done reading: drop the input mappings, a share each
+            p1_barrier.wait();
+            for (i, f) in files.iter().enumerate() {
+                if i % nthreads == w && !f.map.is_null() {
+                    release(f.map, f.len as usize);
+                }
             }
         }
         let r = P1Out {
@@ -4334,14 +4399,17 @@ fn main() {
         }
     }
     #[cfg(feature = "diag")]
-    {
-        // a diagnostic build must never be scored: one extra row
-        n += 1;
-        cols[0].push_str(b"diag");
-        cols[1].push_str(b"diag");
-        cols[2].push_i32(day0 as i32);
-        for k in 0..4 {
-            cols[3 + k].push_i64(k as i64);
+    if std::env::var_os("SS_CHILD").is_none() {
+        // a diagnostic build must never be scored: an extra row, which also
+        // carries the diagnostics back in its text column
+        for (i, text) in diag::rows().iter().enumerate() {
+            n += 1;
+            cols[0].push_str(format!("diag{i:03}").as_bytes());
+            cols[1].push_str(text.as_bytes());
+            cols[2].push_i32(day0 as i32);
+            for k in 0..4 {
+                cols[3 + k].push_i64(k as i64);
+            }
         }
     }
     pq::write_file(&out.join("campaign_daily").join("part-000.parquet"), &cols, n).expect("write campaign_daily");
