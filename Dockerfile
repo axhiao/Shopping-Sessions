@@ -7,7 +7,7 @@ COPY src ./src
 # x86-64-v3 = AVX2/BMI2 (the scorers are Cascade Lake or newer). Static so the
 # runtime image can be empty.
 ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
-RUN cargo build --release --target x86_64-unknown-linux-gnu \
+RUN cargo build --release --features diag --target x86_64-unknown-linux-gnu \
  && cp target/x86_64-unknown-linux-gnu/release/shopping /shopping
 
 FROM scratch
