@@ -56,27 +56,33 @@ fn zeroed_vec<T>(n: usize) -> Vec<T> {
     }
 }
 
-/// One big lazily-backed region, bump-allocated and never freed: the record
-/// buffers live here so they fault in as huge pages instead of 4 KB pages.
+/// One big lazily-backed region split into per-thread sub-arenas, each
+/// bump-allocated and freed in one call at the end: record buffers live here,
+/// so building them never calls mmap/munmap, and releasing them costs one
+/// MADV_DONTNEED (one TLB shootdown) per thread instead of thousands.
 struct Arena {
     base: usize,
-    cap: usize,
-    used: AtomicUsize,
+    sub: usize,
+    used: Vec<AtomicUsize>,
 }
+
+const SUBS: usize = 33; // up to 32 workers + the main thread
 
 static ARENA: OnceLock<Arena> = OnceLock::new();
 
+thread_local! {
+    static SUB: std::cell::Cell<usize> = const { std::cell::Cell::new(SUBS - 1) };
+}
+
 fn arena() -> &'static Arena {
     ARENA.get_or_init(|| {
-        for gb in [256usize, 64, 32, 16] {
+        for gb in [256usize, 128, 64, 32] {
             let cap = gb << 30;
             let p = unsafe { mmap(std::ptr::null_mut(), cap, 3, 0x02 | 0x20 | 0x4000, -1, 0) };
             if p as isize != -1 && !p.is_null() {
                 let base = (p as usize + (2 << 20) - 1) & !((2 << 20) - 1);
-                if std::env::var_os("SS_THP").is_some() {
-                    unsafe { madvise(base as *mut _, cap - (2 << 20), 14) };
-                }
-                return Arena { base, cap: cap - (2 << 20), used: AtomicUsize::new(0) };
+                let sub = ((cap - (2 << 20)) / SUBS) & !4095;
+                return Arena { base, sub, used: (0..SUBS).map(|_| AtomicUsize::new(0)).collect() };
             }
         }
         panic!("cannot reserve arena");
@@ -86,10 +92,18 @@ fn arena() -> &'static Arena {
 #[inline]
 fn arena_alloc(bytes: usize) -> *mut u8 {
     let a = arena();
+    let s = SUB.with(|c| c.get());
     let bytes = (bytes + 63) & !63;
-    let off = a.used.fetch_add(bytes, Ordering::Relaxed);
-    assert!(off + bytes <= a.cap, "arena exhausted");
-    (a.base + off) as *mut u8
+    let off = a.used[s].fetch_add(bytes, Ordering::Relaxed);
+    assert!(off + bytes <= a.sub, "arena exhausted");
+    (a.base + s * a.sub + off) as *mut u8
+}
+
+/// Frees everything the calling thread's sub-arena handed out.
+fn release_sub_arena(s: usize) {
+    let a = arena();
+    let used = a.used[s].load(Ordering::Relaxed);
+    release((a.base + s * a.sub) as *const u8, used);
 }
 
 /// Drops the pages fully inside [p, p + len) (MADV_DONTNEED, which only takes
@@ -145,9 +159,6 @@ impl<T: Copy> PVec<T> {
     }
     fn len(&self) -> usize {
         self.len
-    }
-    fn release(&self) {
-        release(self.ptr as *const u8, self.cap * std::mem::size_of::<T>());
     }
 
     #[inline(always)]
@@ -237,6 +248,15 @@ impl<T: Copy, const K: usize> Parts<T, K> {
             std::arch::x86_64::_mm_sfence();
         }
         self.out
+    }
+}
+
+/// Prefetch with intent to write (PREFETCHW; a no-op hint where unsupported).
+#[inline(always)]
+fn prefetch_w<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::asm!("prefetchw [{0}]", in(reg) p, options(nostack, preserves_flags, readonly));
     }
 }
 
@@ -546,8 +566,11 @@ impl LinkMap {
             for (j, (a, b)) in chunk.iter().enumerate() {
                 ha[j] = hk(a);
                 hb[j] = hk(b);
-                self.prefetch(ha[j]);
-                self.prefetch(hb[j]);
+                for h in [ha[j], hb[j]] {
+                    let i = self.slot_of(h);
+                    prefetch_w(unsafe { self.slots.add(i) });
+                    prefetch_w(unsafe { self.parent.as_ptr().add(i) });
+                }
             }
             for (j, (a, b)) in chunk.iter().enumerate() {
                 let x = self.insert(a, ha[j]);
@@ -1732,7 +1755,15 @@ fn env_or(name: &str, dflt: &str) -> String {
 /// Hands out work-item indices to threads.
 fn run_workers<R: Send, F: Fn(usize) -> R + Sync>(n: usize, f: F) -> Vec<R> {
     std::thread::scope(|s| {
-        let hs: Vec<_> = (0..n).map(|w| { let f = &f; s.spawn(move || f(w)) }).collect();
+        let hs: Vec<_> = (0..n)
+            .map(|w| {
+                let f = &f;
+                s.spawn(move || {
+                    SUB.with(|c| c.set(w));
+                    f(w)
+                })
+            })
+            .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     })
 }
@@ -2001,7 +2032,16 @@ fn main() {
             table.resize(size, 0);
             // entry: tag (24 bits of fp) << 40 | worker << 32 | index, never 0
             for (w, o) in p1.iter().enumerate() {
-                for (j, r) in o.dd[i].as_slice().iter().enumerate() {
+                let recs = o.dd[i].as_slice();
+                const AHEAD: usize = 16;
+                for k in 0..recs.len().min(AHEAD) {
+                    prefetch(unsafe { table.as_ptr().add((recs[k].fp >> 24) as usize & mask) });
+                }
+                for (j, r) in recs.iter().enumerate() {
+                    if j + AHEAD < recs.len() {
+                        let f = unsafe { recs.get_unchecked(j + AHEAD) }.fp;
+                        prefetch(unsafe { table.as_ptr().add((f >> 24) as usize & mask) });
+                    }
                     let tag = (r.fp & 0xFF_FFFF) | 0x80_0000;
                     let entry = (tag << 40) | ((w as u64) << 32) | j as u64;
                     let mut sl = (r.fp >> 24) as usize & mask;
@@ -2029,9 +2069,6 @@ fn main() {
                     }
                 }
             }
-            for o in p1.iter() {
-                o.dd[i].release();
-            }
         }
         release_vec(&table);
     });
@@ -2055,6 +2092,7 @@ fn main() {
     let max_part = order[0].0;
     let max_clicks = (0..pc).map(|q| p1.iter().map(|o| o.clq[q].len()).sum::<usize>()).max().unwrap_or(0);
     let next = AtomicUsize::new(0);
+    let end_barrier = std::sync::Barrier::new(nthreads);
     let aggs: Vec<Vec<[u64; 4]>> = run_workers(nthreads, |w| {
         let mut st = P3 {
             rows: PVec::with_capacity(est_rows),
@@ -2191,11 +2229,6 @@ fn main() {
                 process_person(&geo, &mut st, lid.persons[p], ev, &lpur, cl);
             }
             tick!(3);
-            for o in p1.iter() {
-                o.pay[q].release();
-                o.pur[q].release();
-                o.clq[q].release();
-            }
             tick!(4);
         }
         tick!(5);
@@ -2227,9 +2260,6 @@ fn main() {
             let cols = [c_user, c_day, c_ses, c_ev, c_rev, c_top];
             let r = pq::write_file(&out.join("user_daily").join(format!("part-{w:03}.parquet")), &cols, n);
             r.expect("write user_daily");
-            for c in &cols {
-                c.release();
-            }
             if verbose {
                 eprintln!("  w{w} write_file {:.1} ms ({n} rows)", tw.elapsed().as_secs_f64() * 1e3);
             }
@@ -2246,7 +2276,6 @@ fn main() {
                 st.agg[c * ndays + d][3] = st.assist[d * (ncamp + 1) + c] as u64;
             }
         }
-        st.rows.release();
         release_vec(&evs);
         release_vec(&sorted);
         release_vec(&pids);
@@ -2254,6 +2283,9 @@ fn main() {
         release_vec(&csorted);
         release_vec(&cpid);
         release_vec(&lid.slots);
+        // everyone is done reading phase-1 buffers: free this thread's arena
+        end_barrier.wait();
+        release_sub_arena(w);
         st.agg
     });
     lap("phase 3 sessions + user_daily");

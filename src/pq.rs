@@ -69,10 +69,6 @@ impl Column {
         self.values.extend_from_slice(&v.to_le_bytes());
         self.rows += 1;
     }
-    pub fn release(&self) {
-        self.values.release();
-        self.defs.release();
-    }
     #[inline]
     pub fn push_i64(&mut self, v: i64) {
         self.values.extend_from_slice(&v.to_le_bytes());
