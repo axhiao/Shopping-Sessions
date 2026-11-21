@@ -1,6 +1,7 @@
 //! Shopping Sessions pipeline. See README.md for the design.
 
 mod pq;
+mod prof;
 #[cfg(test)]
 mod tests;
 
@@ -1030,9 +1031,17 @@ fn parse_iso_fast(s: &[u8]) -> Option<i64> {
 /// `ingest_ts`, which the rules guarantee is a valid F1 timestamp: no
 /// validation, just the arithmetic. Falls back to the full parser otherwise.
 #[inline(always)]
+#[allow(dead_code)]
 fn parse_ingest(s: &[u8]) -> Option<i64> {
+    parse_ingest_s(s).map(|(_, ms)| ms)
+}
+
+/// As `parse_ingest`, returning (floor seconds, milliseconds).
+#[inline(always)]
+fn parse_ingest_s(s: &[u8]) -> Option<(i64, i64)> {
+    let slow = |s: &[u8]| parse_ts_fast(s).map(|ms| (ms.div_euclid(1000), ms));
     if s.len() != 20 {
-        return parse_ts_fast(s);
+        return slow(s);
     }
     // digit lanes only (separators zeroed so the multiply cannot carry)
     let a = (load8(s, 0) ^ 0x3030_3030_3030_3030) & 0x00FF_FF00_FFFF_FFFF;
@@ -1045,10 +1054,11 @@ fn parse_ingest(s: &[u8]) -> Option<i64> {
     let y = ln(pa, 0) * 100 + ln(pa, 2);
     let (mo, d, h, mi, se) = (ln(pa, 5), ln(pb, 0), ln(pb, 3), ln(pb, 6), ln(pc, 1));
     if mo.wrapping_sub(1) > 11 || d.wrapping_sub(1) > 30 {
-        return parse_ts_fast(s);
+        return slow(s);
     }
     let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    Some((days_fast(y, mo, d, leap) * 86_400 + (h * 3600 + mi * 60 + se) as i64) * 1000)
+    let secs = days_fast(y, mo, d, leap) * 86_400 + (h * 3600 + mi * 60 + se) as i64;
+    Some((secs, secs * 1000))
 }
 
 /// Same contract as `parse_ts`.
@@ -1440,8 +1450,8 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
             return;
         }
         let (fp, fp2) = eid_fp(&key_of(f[0]));
-        let ingest_ms = parse_ingest(f[3]).unwrap_or(i64::MAX / 2);
-        let ingest = (ingest_ms.div_euclid(1000) - ctx.ingest_base_s).clamp(0, 0xFF_FFFF) as u64;
+        let (ingest_s, ingest_ms) = parse_ingest_s(f[3]).unwrap_or((i64::MAX / 2000, i64::MAX / 2));
+        let ingest = (ingest_s - ctx.ingest_base_s).clamp(0, 0xFF_FFFF) as u64;
         let d = RecD { fp, b: ((fp2 as u64) << 56) | (ingest << 32) };
         let part = (fp >> (64 - pa_bits())) as usize;
         'v: {
@@ -1815,73 +1825,80 @@ fn main() {
         }
     };
 
+    let prof_path = std::env::var("SS_PROF").ok();
+    if prof_path.is_some() {
+        prof::start(200);
+    }
     // --- small inputs
     let manifest = fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let ws = manifest_value(&manifest, "window_start");
     let we = manifest_value(&manifest, "window_end");
 
-    let pbuf = pad_buffer(fs::read(data.join("products.csv")).unwrap_or_default());
-    let mut prod_raw: Vec<(Key, u32)> = Vec::new();
-    let mut cat_ids: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
-    let mut cat_list: Vec<Vec<u8>> = Vec::new();
-    {
-        let begin = find_byte(&pbuf, 0, b'\n') + 1;
-        scan_lines::<2, _>(&pbuf, begin, pbuf.len(), |f| {
-            if f[0].is_empty() {
-                return;
-            }
-            let c = match cat_ids.get(f[1]) {
-                Some(&c) => c,
-                None => {
-                    let c = cat_list.len() as u32;
-                    cat_ids.insert(f[1].to_vec(), c);
-                    cat_list.push(f[1].to_vec());
-                    c
+    // products and campaigns are parsed by one worker while the others parse links
+    let build_ctx = || {
+        let pbuf = pad_buffer(fs::read(data.join("products.csv")).unwrap_or_default());
+        let mut prod_raw: Vec<(Key, u32)> = Vec::new();
+        let mut cat_ids: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
+        let mut cat_list: Vec<Vec<u8>> = Vec::new();
+        {
+            let begin = find_byte(&pbuf, 0, b'\n') + 1;
+            scan_lines::<2, _>(&pbuf, begin, pbuf.len(), |f| {
+                if f[0].is_empty() {
+                    return;
                 }
-            };
-            prod_raw.push((key_of(f[0]), c));
-        });
-    }
-    let mut cat_names: Vec<Vec<u8>> = cat_list.clone();
-    cat_names.push(b"unknown".to_vec());
-    cat_names.sort();
-    cat_names.dedup();
-    let remap: Vec<u32> = cat_list.iter().map(|c| cat_names.binary_search(c).unwrap() as u32).collect();
-    let unknown_cat = cat_names.binary_search(&b"unknown".to_vec()).unwrap() as u32;
-    let mut products: KeyMap<u32> = KeyMap::new(prod_raw.len() + 16);
-    for (k, c) in &prod_raw {
-        products.get_or_insert(k, remap[*c as usize]);
-    }
+                let c = match cat_ids.get(f[1]) {
+                    Some(&c) => c,
+                    None => {
+                        let c = cat_list.len() as u32;
+                        cat_ids.insert(f[1].to_vec(), c);
+                        cat_list.push(f[1].to_vec());
+                        c
+                    }
+                };
+                prod_raw.push((key_of(f[0]), c));
+            });
+        }
+        let mut cat_names: Vec<Vec<u8>> = cat_list.clone();
+        cat_names.push(b"unknown".to_vec());
+        cat_names.sort();
+        cat_names.dedup();
+        let remap: Vec<u32> = cat_list.iter().map(|c| cat_names.binary_search(c).unwrap() as u32).collect();
+        let unknown_cat = cat_names.binary_search(&b"unknown".to_vec()).unwrap() as u32;
+        let mut products: KeyMap<u32> = KeyMap::new(prod_raw.len() + 16);
+        for (k, c) in &prod_raw {
+            products.get_or_insert(k, remap[*c as usize]);
+        }
 
-    let cbuf = pad_buffer(fs::read(data.join("campaigns.csv")).unwrap_or_default());
-    let mut camp_ids = Vec::new();
-    let mut camp_channels = Vec::new();
-    let mut campaigns: KeyMap<u32> = KeyMap::new(cbuf.len() / 8 + 16);
-    {
-        let begin = find_byte(&cbuf, 0, b'\n') + 1;
-        scan_lines::<2, _>(&cbuf, begin, cbuf.len(), |f| {
-            if f[0].is_empty() {
-                return;
-            }
-            let (_, ins) = campaigns.get_or_insert(&key_of(f[0]), camp_ids.len() as u32);
-            if ins {
-                camp_ids.push(f[0].to_vec());
-                camp_channels.push(f[1].to_vec());
-            }
-        });
-    }
-    let ncamp = camp_ids.len();
-    let ctx = Ctx {
-        ws,
-        we,
-        ingest_base_s: ws.div_euclid(1000) - (1 << 23),
-        products,
-        unknown_cat,
-        cat_names,
-        campaigns,
-        camp_ids,
-        camp_channels,
+        let cbuf = pad_buffer(fs::read(data.join("campaigns.csv")).unwrap_or_default());
+        let mut camp_ids = Vec::new();
+        let mut camp_channels = Vec::new();
+        let mut campaigns: KeyMap<u32> = KeyMap::new(cbuf.len() / 8 + 16);
+        {
+            let begin = find_byte(&cbuf, 0, b'\n') + 1;
+            scan_lines::<2, _>(&cbuf, begin, cbuf.len(), |f| {
+                if f[0].is_empty() {
+                    return;
+                }
+                let (_, ins) = campaigns.get_or_insert(&key_of(f[0]), camp_ids.len() as u32);
+                if ins {
+                    camp_ids.push(f[0].to_vec());
+                    camp_channels.push(f[1].to_vec());
+                }
+            });
+        }
+        Ctx {
+            ws,
+            we,
+            ingest_base_s: ws.div_euclid(1000) - (1 << 23),
+            products,
+            unknown_cat,
+            cat_names,
+            campaigns,
+            camp_ids,
+            camp_channels,
+        }
     };
+    let ctx_cell: OnceLock<Ctx> = OnceLock::new();
     lap("small inputs");
 
     // --- files and chunks: links first, then clicks (they do not need the
@@ -1930,6 +1947,9 @@ fn main() {
     let all_pairs: OnceLock<Vec<Vec<(Key, Key)>>> = OnceLock::new();
     let counters: [AtomicUsize; 6] = Default::default();
     let p1: Vec<P1Out> = run_workers(nthreads, |w| {
+        if w + 1 == nthreads {
+            ctx_cell.get_or_init(build_ctx);
+        }
         let mut buf = Vec::new();
         // L0: parse link files
         loop {
@@ -2013,6 +2033,7 @@ fn main() {
         if w == 0 && verbose {
             eprintln!("{:>8.1} ms  link map built ({} pairs)", t0.elapsed().as_secs_f64() * 1e3, total_pairs.load(Ordering::Relaxed));
         }
+        let ctx = ctx_cell.get().expect("ctx built before the link barriers");
         let mut o = P1Work {
             dd: Parts::new(pa, res_dd),
             pay: Parts::new(pc, res_pay),
@@ -2028,8 +2049,8 @@ fn main() {
             let c = &chunks[data_chunks[i]];
             let (bytes, b, l) = chunk_bytes(&files[c.file], c, &mut buf);
             match c.kind {
-                Kind::Event => parse_events(&ctx, bytes, b, l, lm, &mut o),
-                Kind::Click => parse_clicks(&ctx, bytes, b, l, lm, &mut o.clq),
+                Kind::Event => parse_events(ctx, bytes, b, l, lm, &mut o),
+                Kind::Click => parse_clicks(ctx, bytes, b, l, lm, &mut o.clq),
                 Kind::Link => unreachable!(),
             }
             let inf = &files[c.file];
@@ -2044,6 +2065,8 @@ fn main() {
         r
     });
     lap("phase 1 parse");
+    let ctx = ctx_cell.get().unwrap();
+    let ncamp = ctx.camp_ids.len();
     let linkmap = LINKMAP.get().unwrap();
     assert!(!IDX_OVERFLOW.load(Ordering::Relaxed), "a person partition outgrew the dedup index");
 
@@ -2270,6 +2293,9 @@ fn main() {
                 if ev.len() > 1 {
                     ev.sort_unstable();
                 }
+            }
+            tick!(5);
+            for p in 0..np {
                 let cl = &mut csorted[cstart[p] as usize..cstart[p + 1] as usize];
                 if cl.len() > 1 {
                     cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| cmp_key(&b.cid, &a.cid)));
@@ -2284,7 +2310,6 @@ fn main() {
             tick!(3);
             tick!(4);
         }
-        tick!(5);
         // write this worker's user_daily part
         let n = st.rows.len();
         if n > 0 || w == 0 {
@@ -2320,7 +2345,7 @@ fn main() {
         if verbose {
             let e = tt.elapsed().as_secs_f64();
             eprintln!(
-                "  p3 w{w}: gather {:.0} sortp {:.0} clicks {:.0} sort {:.0} sess {:.0} release {:.0} idle {:.0} write {:.0} ms",
+                "  p3 w{w}: gather {:.0} sortp {:.0} clicks {:.0} csort {:.0} sess {:.0} release {:.0} esort {:.0} write {:.0} ms",
                 tm[0] * 1e3, tm[1] * 1e3, tm[2] * 1e3, tm[6] * 1e3, tm[3] * 1e3, tm[4] * 1e3, tm[5] * 1e3, e * 1e3
             );
         }
@@ -2387,6 +2412,9 @@ fn main() {
     }
     pq::write_file(&out.join("campaign_daily").join("part-000.parquet"), &cols, n).expect("write campaign_daily");
     lap("done");
+    if let Some(p) = &prof_path {
+        prof::dump(p);
+    }
     if verbose {
         let st = fs::read_to_string("/proc/self/status").unwrap_or_default();
         for l in st.lines().filter(|l| l.starts_with("VmRSS") || l.starts_with("RssAnon") || l.starts_with("RssFile") || l.starts_with("VmPTE")) {
