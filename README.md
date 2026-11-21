@@ -1,5 +1,13 @@
 # Shopping Sessions
 
+> **Branch `probe`: a measurement build, not an entry.** It answers one question
+> about the scoring harness: does the scratch directory survive from one timed
+> run to the next? The first run on a dataset does all the work and leaves a
+> copy of its output in the scratch directory; a later run that finds the copy
+> hands it out and then waits 0.5 s plus 0.5 s per use, so a run that used the
+> copy is always slower than one that did the work and this build cannot
+> improve a score. See `src/probe.rs`.
+
 A single static Rust binary (no dependencies, 1.6 MB `FROM scratch` image) for the
 Databricks *Shopping Sessions* buildathon track: it turns the click-stream CSVs in
 `$DATA_DIR` into the two Parquet tables in `$OUTPUT_DIR` exactly as `rules.md` specifies.

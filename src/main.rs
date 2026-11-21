@@ -3,6 +3,7 @@
 #[cfg(feature = "diag")]
 mod diag;
 mod pq;
+mod probe;
 mod prof;
 #[cfg(test)]
 mod tests;
@@ -2950,6 +2951,8 @@ fn main() {
         .clamp(1, 31);
     SUBS.store(nthreads + 1, Ordering::Relaxed);
     let verbose = cfg!(feature = "diag") || std::env::var("SS_VERBOSE").is_ok();
+    // measurement build (see probe.rs): an earlier run's output may be waiting in the scratch directory
+    let probe = probe::start(&data, &out, verbose);
     #[cfg(feature = "diag")]
     diag::run(&data, &out, nthreads);
     #[cfg(feature = "diag")]
@@ -3650,6 +3653,8 @@ fn main() {
             eprintln!("  {l}");
         }
     }
+    probe.save(&out);
+    lap("probe copy");
     // Skip freeing gigabytes of buffers: the kernel reclaims them at exit.
     std::process::exit(0);
 }
