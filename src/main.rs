@@ -37,10 +37,6 @@ fn chunk_size() -> u64 {
     *V.get_or_init(|| std::env::var("SS_CHUNK_KB").ok().and_then(|v| v.parse::<u64>().ok()).map(|k| k << 10).unwrap_or(4 << 20))
 }
 const PAD: usize = 128;
-static XF: AtomicU32 = AtomicU32::new(0);
-static XS: AtomicU64 = AtomicU64::new(0);
-#[inline(always)]
-fn xf(b: u32) -> bool { XF.load(Ordering::Relaxed) & b != 0 }
 
 // ---------------------------------------------------------------------------
 // Memory helpers
@@ -206,7 +202,10 @@ impl<T: Copy> PVec<T> {
         let nc = self.cap * 2;
         let np = arena_alloc(nc * std::mem::size_of::<T>()) as *mut T;
         unsafe { std::ptr::copy_nonoverlapping(self.ptr, np, self.len) };
-        release(self.ptr as *const u8, self.cap * std::mem::size_of::<T>());
+        if thp_mask() & 1 == 0 {
+            // (with huge pages a partial release would split them)
+            release(self.ptr as *const u8, self.cap * std::mem::size_of::<T>());
+        }
         self.ptr = np;
         self.cap = nc;
     }
@@ -915,7 +914,7 @@ fn scan_fast<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], begin:
     if begin >= n {
         return;
     }
-    if option_env!("SS_OLDSCAN").is_some() {
+    if option_env!("SS_NEWSCAN").is_none() {
         return scan_lines::<N, F>(buf, begin, limit, f);
     }
     debug_assert!(buf[n - 1] == b'\n');
@@ -1588,9 +1587,7 @@ fn chunk_bytes<'a>(inf: &'a InFile, c: &Chunk, buf: &'a mut Vec<u8>) -> (&'a [u8
         // populate the page tables for this range in one go
         let s = (c.start as usize) & !4095;
         let e = ((c.end as usize + 65536).min(inf.len as usize) + 4095) & !4095;
-        if std::env::var_os("SS_NO_POP").is_none() {
-            unsafe { madvise(inf.map.add(s) as *mut _, e - s, 22 /* MADV_POPULATE_READ */) };
-        }
+        unsafe { madvise(inf.map.add(s) as *mut _, e - s, 22 /* MADV_POPULATE_READ */) };
         let begin = if c.start == 0 {
             find_byte(all, 0, b'\n') + 1
         } else {
@@ -1676,7 +1673,7 @@ fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
     for j in 0..b.n {
         let mut p = b.pay[j];
         let mut ph = b.h[j];
-        if b.linked[j] && !xf(4) {
+        if b.linked[j] {
             p.person = lm.person(&p.person, ph);
             ph = hk(&p.person);
         }
@@ -1691,8 +1688,8 @@ fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
             IDX_OVERFLOW.store(true, Ordering::Relaxed);
         }
         d.b |= HAS_PAY | ((q as u64) << IDX_BITS) | (idx & ((1 << IDX_BITS) - 1));
-        if !xf(2) { o.pay.push(q, rec); }
-        if !xf(1) { o.dd.push((d.fp >> (64 - pa_bits())) as usize, d); }
+        o.pay.push(q, rec);
+        o.dd.push((d.fp >> (64 - pa_bits())) as usize, d);
     }
     b.n = 0;
 }
@@ -1711,7 +1708,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
     let mut bs = [empty, empty];
     let mut cur = 0usize;
     scan_fast::<7, _>(buf, begin, limit, |f| {
-        if f[0].is_empty() || xf(16) {
+        if f[0].is_empty() {
             return;
         }
         let (fp, fp2) = eid_fp(&key_of(f[0]));
@@ -1719,7 +1716,6 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
         let ingest = (ingest_s - ctx.ingest_base_s).clamp(0, 0xFF_FFFF) as u64;
         let d = RecD { fp, b: ((fp2 as u64) << 56) | (ingest << 32) };
         let part = (fp >> (64 - pa_bits())) as usize;
-        if xf(32) { XS.fetch_add(d.fp ^ d.b, Ordering::Relaxed); return; }
         'v: {
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
@@ -1741,12 +1737,10 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
                 _ => break 'v,
             };
             let cat = if ty == T_PURCHASE { ctx.products.get(&key_of(f[5])).unwrap_or(ctx.unknown_cat) } else { 0 };
-            if xf(64) { XS.fetch_add(d.fp ^ d.b ^ ts as u64 ^ price as u64 ^ cat as u64, Ordering::Relaxed); return; }
             let user = key_of(f[1]);
             let p = Pend { person: user, ts: (ts - ws) as u32, purchase: ty == T_PURCHASE };
             let h = hk(&user);
             lm.prefetch_filter(h);
-            if xf(8) { return; }
             let b = &mut bs[cur];
             b.pay[b.n] = p;
             b.pc[b.n] = (price, cat);
@@ -1762,7 +1756,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
             }
             return;
         }
-        if !xf(1) { o.dd.push(part, d); }
+        o.dd.push(part, d);
     });
     stage2(&mut bs[cur], lm);
     flush_batch(&mut bs[cur ^ 1], lm, o);
@@ -1828,18 +1822,9 @@ fn parse_clicks(
 // ---------------------------------------------------------------------------
 // Phase 3: sessions
 
-#[derive(Clone, Copy)]
-struct URow {
-    person: Key,
-    day: i32,
-    top: i32,
-    sessions: u32,
-    events: u32,
-    revenue: u64,
-}
-
 struct P3 {
-    rows: PVec<URow>,
+    uw: pq::UserWriter,
+    name: Vec<u8>,
     agg: Vec<[u64; 4]>, // (day * (ncamp + 1) + camp) -> sessions, purchasing, revenue, assisted
     assist: Vec<u32>,   // (day * (ncamp + 1) + camp) -> assisted sessions
     cnt: Vec<u32>,
@@ -1945,7 +1930,7 @@ fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u
                 st.catsum[c as usize] = 0;
             }
             st.touched.clear();
-            st.rows.push(URow { person, day: cur_day as i32, top, sessions: d_sessions, events: d_events, revenue: d_rev });
+            st.uw.row((cur_day - g.day0) as usize, d_sessions, d_events, d_rev, top);
         }};
     }
 
@@ -1989,6 +1974,9 @@ fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u
     if s_start >= 0 {
         finish_session!();
         flush_day!();
+        st.name.clear();
+        key_bytes(&person, &mut st.name);
+        st.uw.end_person(&st.name);
     }
     flush_assists!();
     for &c in &st.active {
@@ -2118,7 +2106,6 @@ fn main() {
     diag::run(&data, &out, nthreads);
     #[cfg(feature = "diag")]
     let t0 = Instant::now();
-    XF.store(std::env::var("SS_X").ok().and_then(|v| v.parse().ok()).unwrap_or(0), Ordering::Relaxed);
     let lap = |what: &str| {
         if verbose {
             let mut ru = [0i64; 18];
@@ -2361,14 +2348,13 @@ fn main() {
             }
             let c = &chunks[data_chunks[i]];
             let (bytes, b, l) = chunk_bytes(&files[c.file], c, &mut buf);
-            if xf(128) && c.kind == Kind::Click { continue; }
             match c.kind {
                 Kind::Event => parse_events(ctx, bytes, b, l, lm, &mut o),
                 Kind::Click => parse_clicks(ctx, bytes, b, l, lm, &mut o.clq, &mut o.cesc),
                 Kind::Link => unreachable!(),
             }
             let inf = &files[c.file];
-            if !inf.map.is_null() && std::env::var_os("SS_NO_REL").is_none() {
+            if !inf.map.is_null() {
                 release(unsafe { inf.map.add(c.start as usize) }, (c.end - c.start) as usize);
             }
         }
@@ -2521,15 +2507,14 @@ fn main() {
         .map(|q| (p1.iter().map(|o| o.pay[q].len()).sum::<usize>(), q))
         .collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
-    let total_pay: usize = order.iter().map(|o| o.0).sum();
-    let est_rows = total_pay / 7 / nthreads + 1024;
     let max_part = order[0].0;
     let max_clicks = (0..pc).map(|q| p1.iter().map(|o| o.clq[q].len()).sum::<usize>()).max().unwrap_or(0);
     let next = AtomicUsize::new(0);
     let end_barrier = std::sync::Barrier::new(nthreads);
     let aggs: Vec<Vec<[u64; 4]>> = run_workers(nthreads, |w| {
         let mut st = P3 {
-            rows: PVec::with_capacity(est_rows),
+            uw: pq::UserWriter::new(&out.join("user_daily"), w, day0 as i32, ndays, &ctx.cat_names),
+            name: Vec::new(),
             agg: vec![[0u64; 4]; (ncamp + 1) * ndays],
             assist: vec![0; (ncamp + 1) * ndays],
             cnt: vec![0; ncamp + 1],
@@ -2698,37 +2683,10 @@ fn main() {
             tick!(3);
             tick!(4);
         }
-        // write this worker's user_daily part
-        let n = st.rows.len();
-        if n > 0 || w == 0 {
-            let mut c_user = pq::Column::new("user_id", pq::Kind::Str, false, n);
-            let mut c_day = pq::Column::new("day", pq::Kind::Date, false, n);
-            let mut c_ses = pq::Column::new("sessions", pq::Kind::I32, false, n);
-            let mut c_ev = pq::Column::new("events", pq::Kind::I32, false, n);
-            let mut c_rev = pq::Column::new("revenue_cents", pq::Kind::I64, false, n);
-            let mut c_top = pq::Column::new("top_category", pq::Kind::Str, true, n);
-            let mut tmp = Vec::new();
-            for r in st.rows.as_slice() {
-                tmp.clear();
-                key_bytes(&r.person, &mut tmp);
-                c_user.push_str(&tmp);
-                c_day.push_i32(r.day);
-                c_ses.push_i32(r.sessions as i32);
-                c_ev.push_i32(r.events as i32);
-                c_rev.push_i64(r.revenue as i64);
-                if r.top >= 0 {
-                    c_top.push_str(&ctx.cat_names[r.top as usize]);
-                } else {
-                    c_top.push_null();
-                }
-            }
-            let tw = Instant::now();
-            let cols = [c_user, c_day, c_ses, c_ev, c_rev, c_top];
-            let r = pq::write_file(&out.join("user_daily").join(format!("part-{w:03}.parquet")), &cols, n);
-            r.expect("write user_daily");
-            if verbose {
-                eprintln!("  w{w} write_file {:.1} ms ({n} rows)", tw.elapsed().as_secs_f64() * 1e3);
-            }
+        // the last user_daily file of this worker (worker 0 always writes one)
+        st.uw.finish(w == 0);
+        if verbose {
+            eprintln!("  w{w}: {} user_daily rows in {} files", st.uw.rows, st.uw.files);
         }
         if verbose {
             let e = tt.elapsed().as_secs_f64();
@@ -2748,7 +2706,11 @@ fn main() {
             eprintln!("  p3 w{w} done at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
         }
         end_barrier.wait();
+        let tr = Instant::now();
         release_sub_arena(w);
+        if verbose {
+            eprintln!("  w{w} arena release {:.1} ms ({} MB)", tr.elapsed().as_secs_f64() * 1e3, arena().used[w].load(Ordering::Relaxed) >> 20);
+        }
         st.agg
     });
     lap("phase 3 sessions + user_daily");
