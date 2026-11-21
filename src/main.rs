@@ -1,6 +1,8 @@
 //! Shopping Sessions pipeline. See README.md for the design.
 
 mod pq;
+#[cfg(test)]
+mod tests;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -860,6 +862,162 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
     Some(v as i64)
 }
 
+// --- SWAR timestamp parsing ------------------------------------------------
+// The slices passed here always have at least 24 readable bytes from their
+// start (buffers carry PAD bytes of slack).
+
+#[inline(always)]
+fn load8(s: &[u8], at: usize) -> u64 {
+    unsafe { (s.as_ptr().add(at) as *const u64).read_unaligned() }
+}
+
+/// For each byte lane selected by `lanes` (0xFF per lane), true if it holds an
+/// ASCII digit.
+#[inline(always)]
+fn all_digits(v: u64, lanes: u64) -> bool {
+    let t = v ^ 0x3030_3030_3030_3030;
+    (((t.wrapping_add(0x7676_7676_7676_7676)) | t) & lanes & 0x8080_8080_8080_8080) == 0
+}
+
+/// Eight ASCII digits (first digit in the lowest byte) to their value.
+#[inline(always)]
+fn eight_digits(v: u64) -> u64 {
+    let v = v.wrapping_sub(0x3030_3030_3030_3030);
+    let v = (v.wrapping_mul(10) + (v >> 8)) & 0x00FF_00FF_00FF_00FF;
+    let v = (v.wrapping_mul(100) + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
+    v.wrapping_mul(10000).wrapping_add(v >> 32) & 0xFFFF_FFFF
+}
+
+#[inline(always)]
+fn lane(v: u64, i: u32) -> i64 {
+    ((v >> (8 * i)) & 0xFF) as i64 - b'0' as i64
+}
+
+/// Days since 1970-01-01 for a valid proleptic Gregorian date, y in 0..=9999.
+#[inline(always)]
+fn days_fast(y: u32, m: u32, d: u32, leap: bool) -> i64 {
+    const CUM: [u32; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let before = 365 * y + (y + 3) / 4 - (y + 99) / 100 + (y + 399) / 400;
+    let doy = CUM[m as usize] + (leap && m > 2) as u32 + d - 1;
+    (before + doy) as i64 - 719_528
+}
+
+/// F1 (len 20) or F2 (len 25), SWAR-validated. Caller checked the length.
+#[inline(always)]
+fn parse_iso_fast(s: &[u8]) -> Option<i64> {
+    let a = load8(s, 0); // YYYY-MM-
+    let b = load8(s, 8); // DDTHH:MM
+    let c = load8(s, 16); // :SSZ.... or :SS+HH:M
+    const A_SEP: u64 = 0xFF00_00FF_0000_0000; // lanes 4, 7
+    const A_VAL: u64 = (b'-' as u64) << 32 | (b'-' as u64) << 56;
+    const B_SEP: u64 = 0x0000_FF00_00FF_0000; // lanes 2, 5
+    const B_VAL: u64 = (b'T' as u64) << 16 | (b':' as u64) << 40;
+    if a & A_SEP != A_VAL || b & B_SEP != B_VAL || c & 0xFF != b':' as u64 {
+        return None;
+    }
+    if !all_digits(a, !A_SEP) || !all_digits(b, !B_SEP) || !all_digits(c, 0x00FF_FF00) {
+        return None;
+    }
+    // digit values, separators zeroed; then lane i = 10 * digit i + digit i+1
+    let pair = |v: u64, lanes: u64| {
+        let t = (v ^ 0x3030_3030_3030_3030) & lanes;
+        t.wrapping_mul(10).wrapping_add(t >> 8)
+    };
+    let pa = pair(a, !A_SEP);
+    let pb = pair(b, !B_SEP);
+    let pc = pair(c, 0x0000_FFFF_00FF_FF00); // SS, and HH of an offset
+    let ln = |v: u64, i: u32| ((v >> (8 * i)) & 0xFF) as u32;
+    let y = ln(pa, 0) * 100 + ln(pa, 2);
+    let mo = ln(pa, 5);
+    let d = ln(pb, 0);
+    let h = ln(pb, 3);
+    let mi = ln(pb, 6);
+    let se = ln(pc, 1);
+    let off: i64 = if s.len() == 20 {
+        if (c >> 24) & 0xFF != b'Z' as u64 {
+            return None;
+        }
+        0
+    } else {
+        // c lanes 3..7 = "+HH:M", s[24] = M
+        let sign = match (c >> 24) & 0xFF {
+            0x2B => 1,
+            0x2D => -1,
+            _ => return None,
+        };
+        let m2 = s[24].wrapping_sub(b'0');
+        if (c >> 48) & 0xFF != b':' as u64 || !all_digits(c, 0xFF00_FFFF_0000_0000 & !0x00FF_0000_0000_0000) || m2 > 9 {
+            return None;
+        }
+        let oh = ln(pc, 4);
+        let om = ln(c ^ 0x3030_3030_3030_3030, 7) * 10 + m2 as u32;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        sign * (oh * 60 + om) as i64
+    };
+    if mo.wrapping_sub(1) > 11 || h > 23 || mi > 59 || se > 59 || d < 1 {
+        return None;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    const DIM: [u32; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if d > DIM[mo as usize] + (leap && mo == 2) as u32 {
+        return None;
+    }
+    let days = days_fast(y, mo, d, leap);
+    Some(((days * 86_400 + (h * 3600 + mi * 60 + se) as i64) - off * 60) * 1000)
+}
+
+/// `ingest_ts`, which the rules guarantee is a valid F1 timestamp: no
+/// validation, just the arithmetic. Falls back to the full parser otherwise.
+#[inline(always)]
+fn parse_ingest(s: &[u8]) -> Option<i64> {
+    if s.len() != 20 {
+        return parse_ts_fast(s);
+    }
+    // digit lanes only (separators zeroed so the multiply cannot carry)
+    let a = (load8(s, 0) ^ 0x3030_3030_3030_3030) & 0x00FF_FF00_FFFF_FFFF;
+    let b = (load8(s, 8) ^ 0x3030_3030_3030_3030) & 0xFFFF_00FF_FF00_FFFF;
+    let c = (load8(s, 16) ^ 0x3030_3030_3030_3030) & 0x0000_0000_00FF_FF00;
+    let pa = a.wrapping_mul(10).wrapping_add(a >> 8);
+    let pb = b.wrapping_mul(10).wrapping_add(b >> 8);
+    let pc = c.wrapping_mul(10).wrapping_add(c >> 8);
+    let ln = |v: u64, i: u32| ((v >> (8 * i)) & 0xFF) as u32;
+    let y = ln(pa, 0) * 100 + ln(pa, 2);
+    let (mo, d, h, mi, se) = (ln(pa, 5), ln(pb, 0), ln(pb, 3), ln(pb, 6), ln(pc, 1));
+    if mo.wrapping_sub(1) > 11 || d.wrapping_sub(1) > 30 {
+        return parse_ts_fast(s);
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    Some((days_fast(y, mo, d, leap) * 86_400 + (h * 3600 + mi * 60 + se) as i64) * 1000)
+}
+
+/// Same contract as `parse_ts`.
+#[inline(always)]
+fn parse_ts_fast(s: &[u8]) -> Option<i64> {
+    let n = s.len();
+    if n == 0 {
+        return None;
+    }
+    if (n == 20 || n == 25) && s[4] == b'-' {
+        return parse_iso_fast(s);
+    }
+    if n <= 16 {
+        // digits only: up to two 8-byte words, left-padded with '0'
+        let (hi, lo) = if n > 8 {
+            let k = n - 8;
+            (load8(s, 0) << (8 * (8 - k)) | (0x3030_3030_3030_3030u64 >> (8 * k)), load8(s, k))
+        } else {
+            (0x3030_3030_3030_3030, load8(s, 0) << (8 * (8 - n)) | (0x3030_3030_3030_3030u64 >> (8 * n)))
+        };
+        if !all_digits(hi, !0) || !all_digits(lo, !0) {
+            return None;
+        }
+        return Some((eight_digits(hi) * 100_000_000 + eight_digits(lo)) as i64);
+    }
+    parse_ts(s)
+}
+
 #[inline(always)]
 fn parse_price(s: &[u8]) -> Option<u32> {
     if s.is_empty() {
@@ -906,7 +1064,6 @@ fn event_type(s: &[u8]) -> u32 {
 // ---------------------------------------------------------------------------
 // Records
 
-const VALID: u32 = 1 << 31;
 const T_PURCHASE: u32 = 2;
 /// Dedup record (16 bytes), partitioned by event id: `fp` is a 64-bit event-id
 /// fingerprint; `b` = 8 more fingerprint bits << 56 | ingest seconds (24
@@ -1212,6 +1369,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
     };
     let stop_scan = exp(16);
     let stop_push = exp(32);
+    let (x_nofp, x_noing, x_nots) = (exp(1 << 15), exp(1 << 16), exp(1 << 17));
     scan_lines::<7, _>(buf, begin, limit, |f| {
         if stop_scan {
             std::hint::black_box(f);
@@ -1220,8 +1378,8 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
         if f[0].is_empty() {
             return;
         }
-        let (fp, fp2) = eid_fp(&key_of(f[0]));
-        let ingest_ms = parse_ts(f[3]).unwrap_or(i64::MAX / 2);
+        let (fp, fp2) = if x_nofp { (f[0].len() as u64 * 0x9E37_79B9_7F4A_7C15, 1) } else { eid_fp(&key_of(f[0])) };
+        let ingest_ms = if x_noing { 1_800_000_000_000 } else { parse_ingest(f[3]).unwrap_or(i64::MAX / 2) };
         let ingest = (ingest_ms.div_euclid(1000) - ctx.ingest_base_s).clamp(0, 0xFF_FFFF) as u64;
         let d = RecD { fp, b: ((fp2 as u64) << 56) | (ingest << 32) };
         let part = (fp >> (64 - PA_BITS)) as usize;
@@ -1229,7 +1387,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
             }
-            let ts = match parse_ts(f[2]) {
+            let ts = match if x_nots { Some(ws + f[2].len() as i64) } else { parse_ts_fast(f[2]) } {
                 Some(t) if t >= ws && t < we => t,
                 _ => break 'v,
             };
@@ -1287,7 +1445,7 @@ fn parse_clicks(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
-        let ts = match parse_ts(f[3]) {
+        let ts = match parse_ts_fast(f[3]) {
             Some(t) if t >= lo && t < ctx.we => t,
             _ => return,
         };
@@ -1732,6 +1890,19 @@ fn main() {
             }
             let c = &chunks[data_chunks[i]];
             let (bytes, b, l) = chunk_bytes(&files[c.file], c, &mut buf);
+            if exp(4096) || (exp(8192) && c.kind == Kind::Click) {
+                std::hint::black_box(bytes);
+                continue;
+            }
+            if exp(16384) {
+                // just stream through the bytes
+                let mut acc = 0u64;
+                for ch in bytes[b..l.min(bytes.len())].chunks(64) {
+                    acc = acc.wrapping_add(ch[0] as u64);
+                }
+                std::hint::black_box(acc);
+                continue;
+            }
             match c.kind {
                 Kind::Event => parse_events(&ctx, bytes, b, l, lm, &mut o),
                 Kind::Click => parse_clicks(&ctx, bytes, b, l, lm, &mut o.clq),
