@@ -1659,6 +1659,8 @@ struct P3 {
     cnt: Vec<u32>,
     pos: Vec<u32>,
     active: Vec<u32>,
+    pend: Vec<u32>,
+    pend_days: Vec<u32>,
     catsum: Vec<u64>,
     touched: Vec<u32>,
 }
@@ -1671,7 +1673,9 @@ struct Geo {
 
 /// `evs`: the person's events as ts << 32 | x, sorted; `pur`: (price, cat)
 /// for the purchase indices in x.
-fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u32)], cls: &[RecC]) {
+/// `cls`: the person's clicks as ts << 32 | index into `camps`, sorted by ts,
+/// ties by click id descending (so the last of equal ts has the smallest id).
+fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u32)], cls: &[u64], camps: &[u32]) {
     let mut lo = 0usize;
     let mut hi = 0usize;
     // day accumulators
@@ -1686,22 +1690,40 @@ fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u
     let mut s_purch = false;
     let mut prev_t: i64 = 0;
 
+    let stride = g.organic as usize + 1;
+    // Sessions not yet credited to the assisting campaigns, per day: they are
+    // added to every active campaign when the active set changes.
+    macro_rules! flush_assists {
+        () => {{
+            for &d in &st.pend_days {
+                let n = st.pend[d as usize];
+                st.pend[d as usize] = 0;
+                let row = d as usize * stride;
+                for &c in &st.active {
+                    unsafe { *st.assist.get_unchecked_mut(row + c as usize) += n };
+                }
+            }
+            st.pend_days.clear();
+        }};
+    }
     macro_rules! finish_session {
         () => {{
             let sc = s_start + WEEK;
-            while hi < cls.len() && (cls[hi].ts as i64) <= sc {
-                let c = cls[hi].camp as usize;
+            while hi < cls.len() && ((cls[hi] >> 32) as i64) <= sc {
+                let c = unsafe { *camps.get_unchecked(cls[hi] as u32 as usize) } as usize;
                 if st.cnt[c] == 0 {
+                    flush_assists!();
                     st.pos[c] = st.active.len() as u32;
                     st.active.push(c as u32);
                 }
                 st.cnt[c] += 1;
                 hi += 1;
             }
-            while lo < hi && (cls[lo].ts as i64) < sc - WEEK {
-                let c = cls[lo].camp as usize;
+            while lo < hi && ((cls[lo] >> 32) as i64) < sc - WEEK {
+                let c = unsafe { *camps.get_unchecked(cls[lo] as u32 as usize) } as usize;
                 st.cnt[c] -= 1;
                 if st.cnt[c] == 0 {
+                    flush_assists!();
                     let p = st.pos[c] as usize;
                     let last = st.active.pop().unwrap();
                     if p < st.active.len() {
@@ -1711,14 +1733,16 @@ fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u
                 }
                 lo += 1;
             }
-            let credit = if lo < hi { cls[hi - 1].camp } else { g.organic } as usize;
+            let credit = if lo < hi { unsafe { *camps.get_unchecked(cls[hi - 1] as u32 as usize) } } else { g.organic } as usize;
             let a = unsafe { st.agg.get_unchecked_mut(s_didx * (g.organic as usize + 1) + credit) };
             a[0] += 1;
             a[1] += s_purch as u64;
             a[2] += s_rev;
-            let row = s_didx * (g.organic as usize + 1);
-            for &c in &st.active {
-                unsafe { *st.assist.get_unchecked_mut(row + c as usize) += 1 };
+            if !st.active.is_empty() {
+                if st.pend[s_didx] == 0 {
+                    st.pend_days.push(s_didx as u32);
+                }
+                st.pend[s_didx] += 1;
             }
         }};
     }
@@ -1780,6 +1804,7 @@ fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u
         finish_session!();
         flush_day!();
     }
+    flush_assists!();
     for &c in &st.active {
         st.cnt[c as usize] = 0;
     }
@@ -2316,6 +2341,8 @@ fn main() {
             cnt: vec![0; ncamp + 1],
             pos: vec![0; ncamp + 1],
             active: Vec::new(),
+            pend: vec![0; ndays],
+            pend_days: Vec::new(),
             catsum: vec![0; ncat],
             touched: Vec::new(),
         };
@@ -2327,8 +2354,10 @@ fn main() {
         let mut sorted = arena_vec::<u64>(max_part);
         let mut pids = arena_vec::<u32>(max_part);
         let mut lpur = arena_vec::<(u32, u32)>(max_part);
-        let mut cls = arena_vec::<RecC>(max_clicks);
-        let mut csorted = arena_vec::<RecC>(max_clicks);
+        let mut cls = arena_vec::<u64>(max_clicks);
+        let mut csorted = arena_vec::<u64>(max_clicks);
+        let mut ccamp = arena_vec::<u32>(max_clicks);
+        let mut ccid = arena_vec::<Key>(max_clicks);
         let mut cpid = arena_vec::<u32>(max_clicks);
         let mut start: Vec<u32> = Vec::new();
         let mut cstart: Vec<u32> = Vec::new();
@@ -2408,12 +2437,16 @@ fn main() {
             // clicks of persons that have events here
             cls.clear();
             cpid.clear();
+            ccamp.clear();
+            ccid.clear();
             for o in p1.iter() {
                 let esc = o.cesc[q].as_slice();
                 for c in o.clq[q].as_slice() {
                     let user = expand(&c.p, esc);
                     if let Some(id) = lid.get(&user) {
-                        cls.push(RecC { user, cid: expand(&c.c, esc), ts: c.ts, camp: c.camp });
+                        cls.push(((c.ts as u64) << 32) | ccamp.len() as u64);
+                        ccamp.push(c.camp);
+                        ccid.push(expand(&c.c, esc));
                         cpid.push(id);
                     }
                 }
@@ -2447,14 +2480,26 @@ fn main() {
             for p in 0..np {
                 let cl = &mut csorted[cstart[p] as usize..cstart[p + 1] as usize];
                 if cl.len() > 1 {
-                    cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| cmp_key(&b.cid, &a.cid)));
+                    cl.sort_unstable();
+                    // equal timestamps: order by click id, descending
+                    let mut a = 0;
+                    while a < cl.len() {
+                        let mut b = a + 1;
+                        while b < cl.len() && cl[b] >> 32 == cl[a] >> 32 {
+                            b += 1;
+                        }
+                        if b - a > 1 {
+                            cl[a..b].sort_unstable_by(|x, y| cmp_key(&ccid[*y as u32 as usize], &ccid[*x as u32 as usize]));
+                        }
+                        a = b;
+                    }
                 }
             }
             tick!(6);
             for p in 0..np {
                 let ev = &sorted[start[p] as usize..start[p + 1] as usize];
                 let cl = &csorted[cstart[p] as usize..cstart[p + 1] as usize];
-                process_person(&geo, &mut st, lid.persons[p], ev, &lpur, cl);
+                process_person(&geo, &mut st, lid.persons[p], ev, &lpur, cl, &ccamp);
             }
             tick!(3);
             tick!(4);
