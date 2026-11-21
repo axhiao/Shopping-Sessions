@@ -28,6 +28,7 @@ fn pc_bits() -> u32 {
     PC_BITS_V.load(Ordering::Relaxed)
 }
 const MAX_PC_BITS: u32 = 10;
+const NT_STORES: bool = true;
 const CHUNK: u64 = 4 << 20;
 const PAD: usize = 128;
 
@@ -41,18 +42,16 @@ extern "C" {
 }
 
 /// A zero-filled Vec whose pages are not touched yet, advised to use huge pages.
-fn zeroed_vec<T>(n: usize) -> Vec<T> {
+fn zeroed_slice<T>(n: usize) -> &'static mut [T] {
+    // A fresh anonymous mapping: zero pages, faulted in lazily (in parallel by
+    // whoever touches them). The system allocator would memset large
+    // over-aligned blocks on one thread.
     let n = n.max(1);
-    let layout = std::alloc::Layout::array::<T>(n).unwrap();
+    let bytes = (std::mem::size_of::<T>() * n + 4095) & !4095;
     unsafe {
-        let p = std::alloc::alloc_zeroed(layout) as *mut T;
-        assert!(!p.is_null());
-        let start = (p as usize + (2 << 20) - 1) & !((2 << 20) - 1);
-        let end = (p as usize + layout.size()) & !((2 << 20) - 1);
-        if end > start {
-            madvise(start as *mut _, end - start, 14 /* MADV_HUGEPAGE */);
-        }
-        Vec::from_raw_parts(p, n, n)
+        let p = mmap(std::ptr::null_mut(), bytes, 3, 0x02 | 0x20 | 0x4000, -1, 0);
+        assert!(p as isize != -1 && !p.is_null(), "mmap failed");
+        std::slice::from_raw_parts_mut(p as *mut T, n)
     }
 }
 
@@ -230,7 +229,11 @@ impl<T: Copy, const K: usize> Parts<T, K> {
                 let mut i = 0;
                 while i < bytes {
                     let v = _mm256_loadu_si256(src.add(i) as *const __m256i);
-                    _mm256_stream_si256(dst.add(i) as *mut __m256i, v);
+                    if NT_STORES {
+                        _mm256_stream_si256(dst.add(i) as *mut __m256i, v);
+                    } else {
+                        _mm256_storeu_si256(dst.add(i) as *mut __m256i, v);
+                    }
                     i += 32;
                 }
             }
@@ -436,11 +439,11 @@ struct LinkMap {
     slots: *mut Slot,
     mask: usize,
     /// Build-time state: parent (slot + 1, 0 = unclaimed) and best (slot + 1).
-    parent: Vec<AtomicU32>,
-    best: Vec<AtomicU32>,
+    parent: &'static [AtomicU32],
+    best: &'static [AtomicU32],
     /// One bit per hash (top 24 bits) of every ID whose person is not itself:
     /// a clear bit means "the person is the ID", with no table probe.
-    filter: Vec<AtomicU64>,
+    filter: &'static [AtomicU64],
 }
 
 const FILTER_BITS: u32 = 24;
@@ -452,14 +455,13 @@ impl LinkMap {
     fn with_pairs(pairs: usize) -> LinkMap {
         let occ = pairs * 2;
         let size = (occ + 1).next_power_of_two().max(16);
-        let slots: Vec<Slot> = zeroed_vec(size);
-        let slots = Vec::leak(slots).as_mut_ptr();
+        let slots = zeroed_slice::<Slot>(size).as_mut_ptr();
         LinkMap {
             slots,
             mask: size - 1,
-            parent: zeroed_vec(size),
-            best: zeroed_vec(size),
-            filter: zeroed_vec(1 << (FILTER_BITS - 6)),
+            parent: zeroed_slice(size),
+            best: zeroed_slice(size),
+            filter: zeroed_slice(1 << (FILTER_BITS - 6)),
         }
     }
     fn size(&self) -> usize {
@@ -1926,7 +1928,7 @@ fn main() {
     let barrier = std::sync::Barrier::new(nthreads);
     let total_pairs = AtomicUsize::new(0);
     let all_pairs: OnceLock<Vec<Vec<(Key, Key)>>> = OnceLock::new();
-    let counters: [AtomicUsize; 5] = Default::default();
+    let counters: [AtomicUsize; 6] = Default::default();
     let p1: Vec<P1Out> = run_workers(nthreads, |w| {
         let mut buf = Vec::new();
         // L0: parse link files
@@ -1947,6 +1949,32 @@ fn main() {
         }
         let lm = LINKMAP.get_or_init(|| LinkMap::with_pairs(total_pairs.load(Ordering::Relaxed)));
         let pairs = all_pairs.get_or_init(|| std::mem::take(&mut *LINKS.lock().unwrap()));
+        // Fault the link arrays in, in parallel and in order.
+        {
+            const PS2: usize = 1 << 16;
+            let n = lm.size().div_ceil(PS2);
+            let touch = |p: *const u8, len: usize| {
+                let mut o = 0;
+                while o < len {
+                    unsafe { std::ptr::write_volatile(p.add(o) as *mut u8, 0) };
+                    o += 4096;
+                }
+            };
+            loop {
+                let i = counters[5].fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let (a, b) = (i * PS2, ((i + 1) * PS2).min(lm.size()));
+                touch(unsafe { lm.slots.add(a) } as *const u8, (b - a) * std::mem::size_of::<Slot>());
+                touch(lm.parent[a..b].as_ptr() as *const u8, (b - a) * 4);
+                touch(lm.best[a..b].as_ptr() as *const u8, (b - a) * 4);
+            }
+            barrier.wait();
+            if w == 0 && verbose {
+                eprintln!("{:>8.1} ms  link arrays touched", t0.elapsed().as_secs_f64() * 1e3);
+            }
+        }
         // L1: insert keys and union, in slices
         const PS: usize = 8192;
         let items: Vec<(usize, usize)> =
@@ -2009,7 +2037,11 @@ fn main() {
                 release(unsafe { inf.map.add(c.start as usize) }, (c.end - c.start) as usize);
             }
         }
-        P1Out { dd: o.dd.finish(), pay: o.pay.finish(), pur: o.pur, clq: o.clq.finish() }
+        let r = P1Out { dd: o.dd.finish(), pay: o.pay.finish(), pur: o.pur, clq: o.clq.finish() };
+        if verbose {
+            eprintln!("  p1 w{w} done at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+        r
     });
     lap("phase 1 parse");
     let linkmap = LINKMAP.get().unwrap();
@@ -2305,6 +2337,9 @@ fn main() {
         release_vec(&cpid);
         release_vec(&lid.slots);
         // everyone is done reading phase-1 buffers: free this thread's arena
+        if verbose {
+            eprintln!("  p3 w{w} done at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
         end_barrier.wait();
         release_sub_arena(w);
         st.agg
