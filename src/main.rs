@@ -1902,12 +1902,23 @@ const ESCAPE: u32 = 0xFE;
 
 #[inline(always)]
 fn compact(k: &Key, esc: &mut PVec<Key>) -> Ck {
-    if (k[1] >> 8) & 0xFFFF_FFFF == 0 {
-        [(k[0] >> 32) as u32, k[0] as u32, (((k[1] >> 32) as u32) & 0xFFFF_FF00) | (k[1] as u32 & 0xFF)]
+    if let Some(c) = compact_plain(k) {
+        c
     } else {
         let i = esc.len() as u32;
         esc.push(*k);
         [i, 0, ESCAPE]
+    }
+}
+
+/// The compact form of a key that has one (the same key always gives the same
+/// form, and different keys different forms).
+#[inline(always)]
+fn compact_plain(k: &Key) -> Option<Ck> {
+    if (k[1] >> 8) & 0xFFFF_FFFF == 0 {
+        Some([(k[0] >> 32) as u32, k[0] as u32, (((k[1] >> 32) as u32) & 0xFFFF_FF00) | (k[1] as u32 & 0xFF)])
+    } else {
+        None
     }
 }
 
@@ -2681,83 +2692,124 @@ fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u
 }
 
 /// Per-partition local person table (generation-stamped, never cleared).
+/// Persons of one partition, numbered in order of first appearance. Looked
+/// up by the 12-byte compact key as it sits in the records (no expansion, one
+/// multiplication); the few keys that do not fit the compact form go through
+/// a map of full keys.
 struct LocalIds {
     slots: Vec<LSlot>,
-    gen: u32,
     mask: usize,
     persons: Vec<Key>,
+    long: std::collections::HashMap<Key, u32>,
 }
 
+/// `a`, `b`: the compact key; `idp`: person id + 1 (0 = empty).
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct LSlot {
-    k: Key,
-    id: u32,
-    stamp: u32,
+    a: u64,
+    b: u32,
+    idp: u32,
+}
+
+const LEMPTY: LSlot = LSlot { a: 0, b: 0, idp: 0 };
+
+/// The two words of a compact key that is not an escape.
+#[inline(always)]
+fn ck_words(c: &Ck) -> (u64, u32) {
+    (c[0] as u64 | (c[1] as u64) << 32, c[2])
 }
 
 impl LocalIds {
     fn new() -> LocalIds {
-        LocalIds { slots: Vec::new(), gen: 0, mask: 0, persons: Vec::new() }
+        LocalIds { slots: Vec::new(), mask: 0, persons: Vec::new(), long: std::collections::HashMap::new() }
     }
     /// Starts a new partition expecting about `n` persons.
     fn reset(&mut self, n: usize) {
         let size = (n * 2).next_power_of_two().max(256);
         if size > self.slots.len() {
-            self.slots = vec![LSlot { k: ZERO, id: 0, stamp: 0 }; size];
-            self.gen = 0;
+            self.slots = vec![LEMPTY; size];
+        } else {
+            self.slots[..size].fill(LEMPTY);
         }
         self.mask = size - 1;
-        self.gen += 1;
         self.persons.clear();
+        self.long.clear();
+    }
+    #[inline(always)]
+    fn home(&self, a: u64, b: u32) -> usize {
+        (fm(a ^ 0x9E37_79B9_7F4A_7C15, b as u64 ^ 0xD6E8_FEB8_6659_FD93) >> 20) as usize & self.mask
     }
     #[cold]
     fn grow(&mut self) {
         let size = (self.mask + 1) * 2;
         if size > self.slots.len() {
-            self.slots = vec![LSlot { k: ZERO, id: 0, stamp: 0 }; size];
-            self.gen = 0;
+            self.slots = vec![LEMPTY; size];
+        } else {
+            self.slots[..size].fill(LEMPTY);
         }
         self.mask = size - 1;
-        self.gen += 1;
         for (id, k) in self.persons.iter().enumerate() {
-            let mut i = (hk(k) >> 20) as usize & self.mask;
-            while self.slots[i].stamp == self.gen {
-                i = (i + 1) & self.mask;
+            if let Some(c) = compact_plain(k) {
+                let (a, b) = ck_words(&c);
+                let mut i = self.home(a, b);
+                while self.slots[i].idp != 0 {
+                    i = (i + 1) & self.mask;
+                }
+                self.slots[i] = LSlot { a, b, idp: id as u32 + 1 };
             }
-            self.slots[i] = LSlot { k: *k, id: id as u32, stamp: self.gen };
         }
     }
+    #[cold]
+    #[inline(never)]
+    fn intern_long(&mut self, k: Key) -> u32 {
+        if let Some(&id) = self.long.get(&k) {
+            return id;
+        }
+        let id = self.persons.len() as u32;
+        self.long.insert(k, id);
+        self.persons.push(k);
+        id
+    }
+    /// The person id of the compact key `c` (escapes resolved through `esc`).
     #[inline(always)]
-    fn intern(&mut self, k: &Key) -> u32 {
-        let mut i = (hk(k) >> 20) as usize & self.mask;
+    fn intern(&mut self, c: &Ck, esc: &[Key]) -> u32 {
+        if c[2] & 0xFF == ESCAPE {
+            return self.intern_long(expand(c, esc));
+        }
+        let (a, b) = ck_words(c);
+        let mut i = self.home(a, b);
         loop {
             let s = unsafe { self.slots.get_unchecked_mut(i) };
-            if s.stamp != self.gen {
+            if s.idp == 0 {
                 let id = self.persons.len() as u32;
-                *s = LSlot { k: *k, id, stamp: self.gen };
-                self.persons.push(*k);
+                *s = LSlot { a, b, idp: id + 1 };
+                self.persons.push(expand(c, esc));
                 if self.persons.len() * 2 > self.mask + 1 {
                     self.grow();
                 }
                 return id;
             }
-            if s.k == *k {
-                return s.id;
+            if s.a == a && s.b == b {
+                return s.idp - 1;
             }
             i = (i + 1) & self.mask;
         }
     }
     #[inline(always)]
-    fn get(&self, k: &Key) -> Option<u32> {
-        let mut i = (hk(k) >> 20) as usize & self.mask;
+    fn get(&self, c: &Ck, esc: &[Key]) -> Option<u32> {
+        if c[2] & 0xFF == ESCAPE {
+            return self.long.get(&expand(c, esc)).copied();
+        }
+        let (a, b) = ck_words(c);
+        let mut i = self.home(a, b);
         loop {
             let s = unsafe { self.slots.get_unchecked(i) };
-            if s.stamp != self.gen {
+            if s.idp == 0 {
                 return None;
             }
-            if s.k == *k {
-                return Some(s.id);
+            if s.a == a && s.b == b {
+                return Some(s.idp - 1);
             }
             i = (i + 1) & self.mask;
         }
@@ -3305,7 +3357,7 @@ fn main() {
                         pk += purchase as usize;
                         continue;
                     }
-                    pids.push(lid.intern(&expand(&e.p, esc)));
+                    pids.push(lid.intern(&e.p, esc));
                     let x = if purchase != 0 {
                         lpur.push(unsafe { *side.get_unchecked(pk) });
                         pk += 1;
@@ -3349,8 +3401,7 @@ fn main() {
             for o in p1.iter() {
                 let esc = o.cesc[q].as_slice();
                 for c in o.clq[q].as_slice() {
-                    let user = expand(&c.p, esc);
-                    if let Some(id) = lid.get(&user) {
+                    if let Some(id) = lid.get(&c.p, esc) {
                         cls.push(((c.ts as u64) << 32) | ccamp.len() as u64);
                         ccamp.push(c.camp);
                         ccid.push(expand(&c.c, esc));
