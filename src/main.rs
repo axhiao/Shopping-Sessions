@@ -2200,17 +2200,77 @@ struct EvSlot {
     linked: bool,
 }
 
+/// An entry of a parse batch: the hash of its user key and whether the user
+/// may be in the link map.
+trait BatchSlot: Copy {
+    fn hash(&self) -> u64;
+    fn set_linked(&mut self, linked: bool);
+}
+
+impl BatchSlot for EvSlot {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        self.h
+    }
+    #[inline(always)]
+    fn set_linked(&mut self, linked: bool) {
+        self.linked = linked;
+    }
+}
+
 /// Pipeline stage 2: the filter words were prefetched while parsing; decide
 /// which users need a probe and prefetch their slots.
 #[inline(always)]
-fn stage2(base: *mut EvSlot, n: usize, lm: &LinkMap) {
+fn stage2<S: BatchSlot>(base: *mut S, n: usize, lm: &LinkMap) {
     for j in 0..n {
         let e = unsafe { &mut *base.add(j) };
-        let linked = lm.maybe_linked(e.h);
+        let linked = lm.maybe_linked(e.hash());
         if linked {
-            lm.prefetch(e.h);
+            lm.prefetch(e.hash());
         }
-        e.linked = linked;
+        e.set_linked(linked);
+    }
+}
+
+/// Two parse batches of EB entries: one fills while the other waits for the
+/// link-map slots prefetched for it. Points into storage owned by the caller.
+struct BatchQueue<S> {
+    /// Where the next entry is parsed; one past the end of the filling batch.
+    slot: *mut S,
+    end: *mut S,
+    /// The filling batch and the waiting one, with the latter's entry count.
+    fill: *mut S,
+    wait: *mut S,
+    nwait: usize,
+}
+
+impl<S: BatchSlot> BatchQueue<S> {
+    fn new(store: &mut [[S; EB]; 2]) -> Self {
+        let fill = store[0].as_mut_ptr();
+        BatchQueue { slot: fill, end: unsafe { fill.add(EB) }, fill, wait: store[1].as_mut_ptr(), nwait: 0 }
+    }
+    /// Keeps the entry just written to `slot`. When that fills the batch, the
+    /// waiting batch is returned: the caller must flush it before parsing on
+    /// (its storage is the next one to fill).
+    #[inline(always)]
+    fn keep(&mut self, lm: &LinkMap) -> Option<(*const S, usize)> {
+        self.slot = unsafe { self.slot.add(1) };
+        if self.slot != self.end {
+            return None;
+        }
+        stage2(self.fill, EB, lm);
+        let ready = (self.wait as *const S, self.nwait);
+        std::mem::swap(&mut self.fill, &mut self.wait);
+        self.nwait = EB;
+        self.slot = self.fill;
+        self.end = unsafe { self.fill.add(EB) };
+        Some(ready)
+    }
+    /// The batches still to flush at the end of the input, in order.
+    fn rest(&mut self, lm: &LinkMap) -> [(*const S, usize); 2] {
+        let n = unsafe { self.slot.offset_from(self.fill) } as usize;
+        stage2(self.fill, n, lm);
+        [(self.wait as *const S, self.nwait), (self.fill as *const S, n)]
     }
 }
 
@@ -2306,52 +2366,20 @@ unsafe fn event_fields<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &Li
     }
 }
 
-/// The two parse batches: one fills while the other waits for the link-map
-/// slots prefetched for it. Points into storage owned by the caller.
-struct EvQueue {
-    /// Where the next event is parsed; one past the end of the filling batch.
-    slot: *mut EvSlot,
-    end: *mut EvSlot,
-    /// The filling batch and the waiting one, with the latter's event count.
-    fill: *mut EvSlot,
-    wait: *mut EvSlot,
-    nwait: usize,
-}
+type EvQueue = BatchQueue<EvSlot>;
 
-type EvStore = [[EvSlot; EB]; 2];
+const EV_EMPTY: EvSlot = EvSlot { person: ZERO, h: 0, dd: RecD { fp: 0, b: 0 }, ts: 0, purchase: 0, pc: (0, 0), linked: false };
 
-fn ev_store() -> EvStore {
-    [[EvSlot { person: ZERO, h: 0, dd: RecD { fp: 0, b: 0 }, ts: 0, purchase: 0, pc: (0, 0), linked: false }; EB]; 2]
-}
-
-impl EvQueue {
-    fn new(store: &mut EvStore) -> Self {
-        let fill = store[0].as_mut_ptr();
-        EvQueue { slot: fill, end: unsafe { fill.add(EB) }, fill, wait: store[1].as_mut_ptr(), nwait: 0 }
-    }
-    /// Takes what `event_fields` left in the slot.
-    #[inline(always)]
-    fn commit(&mut self, kind: u32, lm: &LinkMap, o: &mut P1Work) {
-        if kind == EV_VALID {
-            self.slot = unsafe { self.slot.add(1) };
-            if self.slot == self.end {
-                stage2(self.fill, EB, lm);
-                flush_batch(self.wait, self.nwait, lm, o);
-                std::mem::swap(&mut self.fill, &mut self.wait);
-                self.nwait = EB;
-                self.slot = self.fill;
-                self.end = unsafe { self.fill.add(EB) };
-            }
-        } else if kind == EV_DEDUP {
-            let d = unsafe { (*self.slot).dd };
-            o.dd.push((d.fp >> (64 - pa_bits())) as usize, d);
+/// Takes what `event_fields` left in the queue's slot.
+#[inline(always)]
+fn event_commit(q: &mut EvQueue, kind: u32, lm: &LinkMap, o: &mut P1Work) {
+    if kind == EV_VALID {
+        if let Some((base, n)) = q.keep(lm) {
+            flush_batch(base, n, lm, o);
         }
-    }
-    fn finish(&mut self, lm: &LinkMap, o: &mut P1Work) {
-        let n = unsafe { self.slot.offset_from(self.fill) } as usize;
-        stage2(self.fill, n, lm);
-        flush_batch(self.wait, self.nwait, lm, o);
-        flush_batch(self.fill, n, lm, o);
+    } else if kind == EV_DEDUP {
+        let d = unsafe { (*q.slot).dd };
+        o.dd.push((d.fp >> (64 - pa_bits())) as usize, d);
     }
 }
 
@@ -2362,7 +2390,7 @@ fn event_slow(ctx: &Ctx, buf: &[u8], ls: usize, dc: &mut DateCache, lm: &LinkMap
     let (end, res) = slow_line::<7>(buf, ls);
     if let Some(f) = res {
         let kind = unsafe { event_fields(ctx, dc, lm, &mut ArrFields { f: &f, i: 0 }, q.slot) };
-        q.commit(kind, lm, o);
+        event_commit(q, kind, lm, o);
     }
     end + 1
 }
@@ -2373,7 +2401,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
         return;
     }
     debug_assert!(buf[n - 1] == b'\n');
-    let mut store = ev_store();
+    let mut store = [[EV_EMPTY; EB]; 2];
     let mut q = EvQueue::new(&mut store);
     let mut dc = DateCache::new();
     let ptr = buf.as_ptr();
@@ -2388,11 +2416,122 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
             Line::Good(c) => {
                 ls += c.e + 1;
                 let kind = unsafe { event_fields(ctx, &mut dc, lm, &mut MaskFields::new(p, &c), q.slot) };
-                q.commit(kind, lm, o);
+                event_commit(&mut q, kind, lm, o);
             }
         }
     }
-    q.finish(lm, o);
+    for (base, n) in q.rest(lm) {
+        flush_batch(base, n, lm, o);
+    }
+}
+
+/// One parsed click waiting in the batch (one cache line).
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct ClSlot {
+    /// The user as written; resolved to the person when the batch is flushed.
+    user: Key,
+    cid: Key,
+    /// Hash of the user key.
+    h: u64,
+    /// Click time, ms from a week before the window start.
+    ts: u32,
+    camp: u32,
+    linked: bool,
+}
+
+impl BatchSlot for ClSlot {
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        self.h
+    }
+    #[inline(always)]
+    fn set_linked(&mut self, linked: bool) {
+        self.linked = linked;
+    }
+}
+
+type ClQueue = BatchQueue<ClSlot>;
+
+const CL_EMPTY: ClSlot = ClSlot { user: ZERO, cid: ZERO, h: 0, ts: 0, camp: 0, linked: false };
+
+/// Parses the four fields of a click line, in order, into `slot`; false if
+/// the click is to be ignored.
+#[inline(always)]
+unsafe fn click_fields<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &LinkMap, src: &mut S, slot: *mut ClSlot) -> bool {
+    // click_id, user_id
+    let f0 = src.lo();
+    let f1 = src.lo();
+    if f0.is_empty() || f1.is_empty() {
+        return false;
+    }
+    let cid = key_of(f0);
+    (*slot).cid[0] = cid[0];
+    (*slot).cid[1] = cid[1];
+    let user = key_of(f1);
+    (*slot).user[0] = user[0];
+    (*slot).user[1] = user[1];
+    let h = hk(&user);
+    (*slot).h = h;
+    lm.prefetch_filter(h);
+    // campaign_id: a known campaign
+    let camp = match ctx.campaigns.get(&key_of(src.hi())) {
+        Some(c) => c,
+        None => return false,
+    };
+    (*slot).camp = camp;
+    // ts: from a week before the window to its end
+    let lo = ctx.ws - WEEK;
+    match parse_ts_dc(dc, src.hi()) {
+        Some(t) if t >= lo && t < ctx.we => {
+            (*slot).ts = (t - lo) as u32;
+            true
+        }
+        _ => false,
+    }
+}
+
+#[inline(always)]
+fn flush_clicks(base: *const ClSlot, n: usize, lm: &LinkMap, clq: &mut Parts<RecCc, 2>, cesc: &mut [PVec<Key>]) {
+    let pc_shift = 64 - pc_bits();
+    for j in 0..n {
+        let e = unsafe { &*base.add(j) };
+        let mut person = e.user;
+        let mut ph = e.h;
+        if e.linked {
+            person = lm.person(&person, ph);
+            ph = hk(&person);
+        }
+        let q = (ph >> pc_shift) as usize;
+        let esc = unsafe { cesc.get_unchecked_mut(q) };
+        let rec = RecCc { p: compact(&person, esc), c: compact(&e.cid, esc), ts: e.ts, camp: e.camp };
+        clq.push(q, rec);
+    }
+}
+
+/// A line that did not fit the scanner's windows: reference scanner.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn click_slow(
+    ctx: &Ctx,
+    buf: &[u8],
+    ls: usize,
+    dc: &mut DateCache,
+    lm: &LinkMap,
+    q: &mut ClQueue,
+    clq: &mut Parts<RecCc, 2>,
+    cesc: &mut [PVec<Key>],
+) -> usize {
+    let (end, res) = slow_line::<4>(buf, ls);
+    if let Some(f) = res {
+        if unsafe { click_fields(ctx, dc, lm, &mut ArrFields { f: &f, i: 0 }, q.slot) } {
+            if let Some((base, n)) = q.keep(lm) {
+                flush_clicks(base, n, lm, clq, cesc);
+            }
+        }
+    }
+    end + 1
 }
 
 fn parse_clicks(
@@ -2404,75 +2543,36 @@ fn parse_clicks(
     clq: &mut Parts<RecCc, 2>,
     cesc: &mut [PVec<Key>],
 ) {
-    let lo = ctx.ws - WEEK;
-    const B: usize = 16;
-    // Two batches, as for events: the filter word is prefetched while parsing,
-    // the slot when the batch is full, and the batch is resolved one batch later.
-    #[derive(Clone, Copy)]
-    struct Batch {
-        n: usize,
-        r: [RecC; B],
-        h: [u64; B],
-        linked: [bool; B],
+    let n = buf.len();
+    if begin >= n {
+        return;
     }
-    let empty = Batch { n: 0, r: [RecC { user: ZERO, cid: ZERO, ts: 0, camp: 0 }; B], h: [0; B], linked: [false; B] };
-    let mut bs = [empty, empty];
-    let mut cur = 0usize;
-    let stage2 = |b: &mut Batch| {
-        for j in 0..b.n {
-            let linked = lm.maybe_linked(b.h[j]);
-            if linked {
-                lm.prefetch(b.h[j]);
-            }
-            b.linked[j] = linked;
-        }
-    };
-    let flush = |b: &mut Batch, clq: &mut Parts<RecCc, 2>, cesc: &mut [PVec<Key>]| {
-        for j in 0..b.n {
-            let mut r = b.r[j];
-            let mut ph = b.h[j];
-            if b.linked[j] {
-                r.user = lm.person(&r.user, ph);
-                ph = hk(&r.user);
-            }
-            let q = (ph >> (64 - pc_bits())) as usize;
-            let esc = unsafe { cesc.get_unchecked_mut(q) };
-            let rec = RecCc { p: compact(&r.user, esc), c: compact(&r.cid, esc), ts: r.ts, camp: r.camp };
-            clq.push(q, rec);
-        }
-        b.n = 0;
-    };
+    debug_assert!(buf[n - 1] == b'\n');
+    let mut store = [[CL_EMPTY; EB]; 2];
+    let mut q = ClQueue::new(&mut store);
     let mut dc = DateCache::new();
-    scan_lean::<4, 2, _>(buf, begin, limit, #[inline(always)] |f| {
-        if f[0].is_empty() || f[1].is_empty() {
-            return;
+    let ptr = buf.as_ptr();
+    let mut ls = begin;
+    while ls < limit && ls < n {
+        let p = unsafe { ptr.add(ls) };
+        // (see scan_lean)
+        prefetch(p.wrapping_add(INPUT_AHEAD));
+        match unsafe { line_cursors::<4, 2>(p) } {
+            Line::Slow => ls = click_slow(ctx, buf, ls, &mut dc, lm, &mut q, clq, cesc),
+            Line::Bad(e) => ls += e + 1,
+            Line::Good(c) => {
+                ls += c.e + 1;
+                if unsafe { click_fields(ctx, &mut dc, lm, &mut MaskFields::new(p, &c), q.slot) } {
+                    if let Some((base, n)) = q.keep(lm) {
+                        flush_clicks(base, n, lm, clq, cesc);
+                    }
+                }
+            }
         }
-        let ts = match parse_ts_dc(&mut dc, f[3]) {
-            Some(t) if t >= lo && t < ctx.we => t,
-            _ => return,
-        };
-        let camp = match ctx.campaigns.get(&key_of(f[2])) {
-            Some(c) => c,
-            None => return,
-        };
-        let user = key_of(f[1]);
-        let h = hk(&user);
-        lm.prefetch_filter(h);
-        let b = &mut bs[cur];
-        b.r[b.n] = RecC { user, cid: key_of(f[0]), ts: (ts - lo) as u32, camp };
-        b.h[b.n] = h;
-        b.n += 1;
-        if b.n == B {
-            stage2(b);
-            let [b0, b1] = &mut bs;
-            let prev = if cur == 0 { b1 } else { b0 };
-            flush(prev, clq, cesc);
-            cur ^= 1;
-        }
-    });
-    stage2(&mut bs[cur]);
-    flush(&mut bs[cur ^ 1], clq, cesc);
-    flush(&mut bs[cur], clq, cesc);
+    }
+    for (base, n) in q.rest(lm) {
+        flush_clicks(base, n, lm, clq, cesc);
+    }
 }
 
 // ---------------------------------------------------------------------------
