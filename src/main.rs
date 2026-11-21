@@ -970,7 +970,34 @@ fn eight_digits(v: u64) -> u64 {
 }
 
 
+#[inline(always)]
+fn days_from_parts(before: u32, leap: bool, m: u32, d: u32) -> i64 {
+    const CUM: [u32; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    (before + CUM[m as usize] + (leap && m > 2) as u32 + d - 1) as i64 - 719_528
+}
+
+/// For each year 0..=9999: days from 0000-01-01 to its Jan 1, with bit 31 set
+/// for leap years. Built at compile time.
+static YEARS: [u32; 10000] = {
+    let mut t = [0u32; 10000];
+    let mut y = 0;
+    while y < 10000 {
+        let before = 365 * y + (y + 3) / 4 - (y + 99) / 100 + (y + 399) / 400;
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        t[y as usize] = before | ((leap as u32) << 31);
+        y += 1;
+    }
+    t
+};
+
+#[inline(always)]
+fn year_info(y: u32) -> (u32, bool) {
+    let v = YEARS[y as usize];
+    (v & 0x7FFF_FFFF, v >> 31 != 0)
+}
+
 /// Days since 1970-01-01 for a valid proleptic Gregorian date, y in 0..=9999.
+#[allow(dead_code)]
 #[inline(always)]
 fn days_fast(y: u32, m: u32, d: u32, leap: bool) -> i64 {
     const CUM: [u32; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
@@ -1036,12 +1063,12 @@ fn parse_iso_fast(s: &[u8]) -> Option<i64> {
     if mo.wrapping_sub(1) > 11 || h > 23 || mi > 59 || se > 59 || d < 1 {
         return None;
     }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let (before, leap) = year_info(y);
     const DIM: [u32; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     if d > DIM[mo as usize] + (leap && mo == 2) as u32 {
         return None;
     }
-    let days = days_fast(y, mo, d, leap);
+    let days = days_from_parts(before, leap, mo, d);
     Some(((days * 86_400 + (h * 3600 + mi * 60 + se) as i64) - off * 60) * 1000)
 }
 
@@ -1073,8 +1100,8 @@ fn parse_ingest_s(s: &[u8]) -> Option<(i64, i64)> {
     if mo.wrapping_sub(1) > 11 || d.wrapping_sub(1) > 30 {
         return slow(s);
     }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let secs = days_fast(y, mo, d, leap) * 86_400 + (h * 3600 + mi * 60 + se) as i64;
+    let (before, leap) = year_info(y);
+    let secs = days_from_parts(before, leap, mo, d) * 86_400 + (h * 3600 + mi * 60 + se) as i64;
     Some((secs, secs * 1000))
 }
 
@@ -1578,7 +1605,7 @@ struct URow {
 
 struct P3 {
     rows: PVec<URow>,
-    agg: Vec<[u64; 4]>, // (camp * ndays + day) -> sessions, purchasing, revenue, (unused)
+    agg: Vec<[u64; 4]>, // (day * (ncamp + 1) + camp) -> sessions, purchasing, revenue, assisted
     assist: Vec<u32>,   // (day * (ncamp + 1) + camp) -> assisted sessions
     cnt: Vec<u32>,
     pos: Vec<u32>,
@@ -1597,7 +1624,6 @@ struct Geo {
 /// `evs`: the person's events as ts << 32 | x, sorted; `pur`: (price, cat)
 /// for the purchase indices in x.
 fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u32)], cls: &[RecC]) {
-    let ndays = g.ndays;
     let mut lo = 0usize;
     let mut hi = 0usize;
     // day accumulators
@@ -1638,7 +1664,7 @@ fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u
                 lo += 1;
             }
             let credit = if lo < hi { cls[hi - 1].camp } else { g.organic } as usize;
-            let a = &mut st.agg[credit * ndays + s_didx];
+            let a = unsafe { st.agg.get_unchecked_mut(s_didx * (g.organic as usize + 1) + credit) };
             a[0] += 1;
             a[1] += s_purch as u64;
             a[2] += s_rev;
@@ -2379,7 +2405,7 @@ fn main() {
         }
         for d in 0..ndays {
             for c in 0..=ncamp {
-                st.agg[c * ndays + d][3] = st.assist[d * (ncamp + 1) + c] as u64;
+                st.agg[d * (ncamp + 1) + c][3] = st.assist[d * (ncamp + 1) + c] as u64;
             }
         }
         release_vec(&evs);
@@ -2420,7 +2446,7 @@ fn main() {
     let mut n = 0;
     for c in 0..=ncamp {
         for d in 0..ndays {
-            let a = total[c * ndays + d];
+            let a = total[d * (ncamp + 1) + c];
             if a[0] == 0 && a[3] == 0 {
                 continue;
             }

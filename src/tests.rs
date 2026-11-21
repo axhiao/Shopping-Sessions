@@ -143,3 +143,15 @@ fn ingest_matches_on_valid_f1() {
         assert_eq!(parse_ingest(&p[..20]), parse_ts(&p[..20]));
     }
 }
+
+#[test]
+fn year_table_matches() {
+    for y in 0..=9999u32 {
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let (b, l) = year_info(y);
+        assert_eq!(l, leap);
+        for m in 1..=12u32 {
+            assert_eq!(days_from_parts(b, l, m, 1), days_fast(y, m, 1, leap));
+        }
+    }
+}
