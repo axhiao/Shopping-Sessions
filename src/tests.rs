@@ -559,6 +559,17 @@ fn sequence_key_is_found() {
         let found = find_seq_key(&sample, bound, 3).expect("a key");
         assert!(sample.iter().all(|&v| seq_of(v, found) < bound));
     }
+    // a few ids that are not generated ones (also in the first places) do not hide the key
+    for round in 0..6 {
+        let key = rng(&mut x) & M40;
+        let bound = 1u64 << 20;
+        let mut sample: Vec<u64> = (0..48).map(|_| scramble(rng(&mut x) % bound, key)).collect();
+        for &at in [[0usize, 1, 17], [1, 2, 3], [0, 2, 47], [5, 6, 7], [0, 1, 2], [3, 30, 40]][round].iter() {
+            sample[at] = rng(&mut x) & M40;
+        }
+        let found = find_seq_key(&sample, bound, 3).expect("a key despite three odd ids");
+        assert_eq!(found, key);
+    }
     // unrelated numbers have no key
     let sample: Vec<u64> = (0..48).map(|_| rng(&mut x) & M40).collect();
     assert_eq!(find_seq_key(&sample, 1 << 16, 3), None);

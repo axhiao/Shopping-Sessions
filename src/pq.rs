@@ -292,6 +292,14 @@ const PERSONS_PER_FILE: usize = 32 << 10;
 /// Values below this may use an identity dictionary.
 const IDENTITY_MAX: u32 = 1 << 12;
 
+/// Mixes two words (for the diagnostic checksum).
+#[allow(dead_code)]
+#[inline(always)]
+pub fn ck_mix(a: u64, b: u64) -> u64 {
+    let r = ((a ^ 0x9E37_79B9_7F4A_7C15) as u128).wrapping_mul((b ^ 0xD6E8_FEB8_6659_FD93) as u128);
+    (r as u64) ^ ((r >> 64) as u64)
+}
+
 pub struct UserWriter {
     dir: std::path::PathBuf,
     worker: usize,
@@ -315,6 +323,10 @@ pub struct UserWriter {
     tmp: Vec<u8>,
     pub rows: usize,
     pub files: usize,
+    /// Diagnostic: a sum over all rows that does not depend on their order
+    /// (`ck_rows` is the current person's part).
+    pub ck: u64,
+    ck_rows: u64,
 }
 
 struct Chunk {
@@ -421,12 +433,19 @@ impl UserWriter {
             tmp: Vec::new(),
             rows: 0,
             files: 0,
+            ck: 0,
+            ck_rows: 0,
         }
     }
 
     /// One row of the current person; `top` < 0 is null.
     #[inline(always)]
     pub fn row(&mut self, day_idx: usize, sessions: u32, events: u32, revenue: u64, top: i32) {
+        #[cfg(feature = "diag")]
+        {
+            let x = day_idx as u64 ^ (sessions as u64) << 8 ^ (events as u64) << 36;
+            self.ck_rows = self.ck_rows.wrapping_add(ck_mix(x, revenue ^ (top as u16 as u64) << 48));
+        }
         self.days.push(day_idx as u8);
         self.sessions.push(sessions);
         self.events.push(events);
@@ -438,6 +457,12 @@ impl UserWriter {
     /// Ends the current person (who has at least one row).
     #[inline(always)]
     pub fn end_person(&mut self, name: &[u8]) {
+        #[cfg(feature = "diag")]
+        {
+            let h = name.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+            self.ck = self.ck.wrapping_add(ck_mix(h, self.ck_rows));
+            self.ck_rows = 0;
+        }
         self.names.extend_from_slice(&(name.len() as u32).to_le_bytes());
         self.names.extend_from_slice(name);
         self.runs.push(self.person_rows);

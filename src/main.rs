@@ -62,6 +62,8 @@ extern "C" {
     fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
     fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut std::ffi::c_void;
     fn getrlimit(resource: i32, rlim: *mut [u64; 2]) -> i32;
+    fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+    fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
     fn setrlimit(resource: i32, rlim: *const [u64; 2]) -> i32;
 }
 
@@ -1130,6 +1132,50 @@ fn scan_fast<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], begin:
 // stripped by moving the field start/end bits, so a field costs two TZCNTs.
 // Anything unusual (a long line, a long field) takes the plain scanner.
 
+/// How the masks of a line's window are computed.
+trait Masks {
+    /// (separators, newlines, quotes) of the bytes at p, as [bits 0..64, bits 64..].
+    unsafe fn win(p: *const u8) -> ([u64; 2], [u64; 2], [u64; 2]);
+}
+
+/// 96 bytes with 256-bit compares (the default).
+struct M256;
+
+impl Masks for M256 {
+    #[inline(always)]
+    unsafe fn win(p: *const u8) -> ([u64; 2], [u64; 2], [u64; 2]) {
+        win_masks(p)
+    }
+}
+
+/// Experiment (SS_A512, on a CPU that has it): 128 bytes with 512-bit
+/// compares, whose results are the masks. Only reachable through the
+/// `*_512` functions.
+#[cfg(feature = "diag")]
+struct M512;
+
+#[cfg(feature = "diag")]
+impl Masks for M512 {
+    #[inline(always)]
+    unsafe fn win(p: *const u8) -> ([u64; 2], [u64; 2], [u64; 2]) {
+        use std::arch::x86_64::*;
+        let (nl, cm, qt) = (_mm512_set1_epi8(b'\n' as i8), _mm512_set1_epi8(b',' as i8), _mm512_set1_epi8(b'"' as i8));
+        let a = _mm512_loadu_si512(p as *const _);
+        let b = _mm512_loadu_si512(p.add(64) as *const _);
+        let (na, nb) = (_mm512_cmpeq_epi8_mask(a, nl), _mm512_cmpeq_epi8_mask(b, nl));
+        let (ca, cb) = (_mm512_cmpeq_epi8_mask(a, cm), _mm512_cmpeq_epi8_mask(b, cm));
+        let (qa, qb) = (_mm512_cmpeq_epi8_mask(a, qt), _mm512_cmpeq_epi8_mask(b, qt));
+        ([na | ca, nb | cb], [na, nb], [qa, qb])
+    }
+}
+
+/// Whether the 512-bit scanner is asked for and possible.
+#[cfg(feature = "diag")]
+fn use_512() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("SS_A512").is_some() && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw"))
+}
+
 /// (separators, newlines, quotes) of the WIN bytes at p, as [bits 0..64, bits 64..].
 #[inline(always)]
 unsafe fn win_masks(p: *const u8) -> ([u64; 2], [u64; 2], [u64; 2]) {
@@ -1200,8 +1246,8 @@ enum Line {
 /// Finds the fields of the line at `p` (N fields, the first K within 63
 /// bytes, the rest within 64 more). `p` needs WIN readable bytes.
 #[inline(always)]
-unsafe fn line_cursors<const N: usize, const K: usize>(p: *const u8) -> Line {
-    let (sep, nl, qt) = win_masks(p);
+unsafe fn line_cursors<M: Masks, const N: usize, const K: usize>(p: *const u8) -> Line {
+    let (sep, nl, qt) = M::win(p);
     // the line ends at the first newline (128: none in the window)
     let e = if nl[0] != 0 { nl[0].trailing_zeros() } else { 64 + nl[1].trailing_zeros() } as usize;
     // s1: the low separators without the first K - 1; r: just past the K-th
@@ -1266,7 +1312,7 @@ fn scan_lean<'a, const N: usize, const K: usize, F: FnMut(&[&'a [u8]; N])>(buf: 
         if pf2 {
             prefetch(p.wrapping_add(pf + 64));
         }
-        match unsafe { line_cursors::<N, K>(p) } {
+        match unsafe { line_cursors::<M256, N, K>(p) } {
             Line::Slow => {
                 let (end, res) = slow_line::<N>(buf, ls);
                 if let Some(res) = res {
@@ -2192,31 +2238,42 @@ fn user_code_key(code: u64) -> Key {
     key_of(&buf[..n + 1])
 }
 
-/// The key under which the sampled ID numbers all have a sequence number
-/// below `bound`, if there is one: tries every number for the first sample.
+/// The key under which the sampled ID numbers have sequence numbers below
+/// `bound`, if there is one. An ID that is not a generated one must not hide
+/// the key: up to one sample in eight may fall outside, and four pairs of
+/// samples take turns as the anchor.
 fn find_seq_key(sample: &[u64], bound: u64, nthreads: usize) -> Option<u64> {
     if sample.len() < 8 || bound < 2 {
         return None;
     }
     let ms: Vec<u64> = sample.iter().map(|&v| unmix(v)).collect();
-    let (ma, delta) = (ms[0], ms[0] ^ ms[1]);
+    let allowed = ms.len() / 8;
+    (0..4).find_map(|pair| seq_key_from(&ms, 2 * pair, bound, allowed, nthreads))
+}
+
+/// Tries every number for sample `a` (and keeps the keys that also put sample
+/// `a + 1` below `bound`); the smallest key that leaves at most `allowed`
+/// samples outside.
+fn seq_key_from(ms: &[u64], a: usize, bound: u64, allowed: usize, nthreads: usize) -> Option<u64> {
+    let (ma, delta) = (ms[a], ms[a] ^ ms[a + 1]);
     let found = AtomicU64::new(u64::MAX);
     let per = bound.div_ceil(nthreads as u64);
     std::thread::scope(|sc| {
         for t in 0..nthreads as u64 {
-            let (ms, found) = (&ms, &found);
+            let found = &found;
             sc.spawn(move || {
                 let (lo, hi) = ((t * per).min(bound), ((t + 1) * per).min(bound));
-                // x = n * C1 for the candidate number n of the first sample
+                // x = n * C1 for the candidate number n of the anchor
                 let mut x = lo.wrapping_mul(SCR_C1) & M40;
                 let mut n = lo;
                 while n < hi {
                     let stop = (n + (1 << 16)).min(hi);
                     while n < stop {
-                        // with key = ma ^ x, the second sample's number is
+                        // with key = ma ^ x, the next sample's number is
                         if (delta ^ x).wrapping_mul(SCR_C1I) & M40 < bound {
                             let key = ma ^ x;
-                            if ms.iter().all(|&m| (m ^ key).wrapping_mul(SCR_C1I) & M40 < bound) {
+                            let outside = ms.iter().filter(|&&m| (m ^ key).wrapping_mul(SCR_C1I) & M40 >= bound).count();
+                            if outside <= allowed {
                                 found.fetch_min(key, Ordering::Relaxed);
                             }
                         }
@@ -2361,15 +2418,8 @@ fn map_file(f: &File, len: usize) -> *const u8 {
         if p as isize == -1 || p != base {
             return std::ptr::null();
         }
-        match knob(5) {
-            1 => {
-                madvise(p, len, 2 /* MADV_SEQUENTIAL */);
-            }
-            2 => {
-                madvise(p, len, 1 /* MADV_RANDOM */);
-            }
-            _ => {}
-        }
+        // read once, front to back: the kernel need not track which pages were used
+        madvise(p, len, 2 /* MADV_SEQUENTIAL */);
         p as *const u8
     }
 }
@@ -2431,12 +2481,9 @@ fn chunk_bytes<'a>(inf: &'a InFile, c: &Chunk, buf: &'a mut Vec<u8>) -> (&'a [u8
     let ok = !inf.map.is_null()
         && if c.end >= inf.len { inf.ends_nl } else { find_byte(all, c.end as usize - 1, b'\n') < all.len() };
     if ok {
-        // populate the page tables for this range in one go
-        let s = (c.start as usize) & !4095;
-        let e = ((c.end as usize + 65536).min(inf.len as usize) + 4095) & !4095;
-        if knob(4) != 0 {
-            unsafe { madvise(inf.map.add(s) as *mut _, e - s, 22 /* MADV_POPULATE_READ */) };
-        }
+        // (The page tables are filled by the faults of the scan itself: on the
+        // scorer that is 1.4% faster than MADV_POPULATE_READ per chunk, for
+        // the sequence path and the general one alike.)
         let begin = if c.start == 0 {
             find_byte(all, 0, b'\n') + 1
         } else {
@@ -2456,6 +2503,10 @@ fn chunk_bytes<'a>(inf: &'a InFile, c: &Chunk, buf: &'a mut Vec<u8>) -> (&'a [u8
 // ---------------------------------------------------------------------------
 // Phase 1: parse
 
+/// Diagnostic: a sum over the rows of both output tables that does not depend
+/// on their order (to compare the output of experiment switches).
+#[cfg(feature = "diag")]
+static CK_OUT: AtomicU64 = AtomicU64::new(0);
 static LINKS: Mutex<Vec<Vec<(Key, Key)>>> = Mutex::new(Vec::new());
 static LINKMAP: OnceLock<LinkMap> = OnceLock::new();
 
@@ -2793,6 +2844,21 @@ fn event_slow(ctx: &Ctx, ix: &IxCfg, buf: &[u8], ls: usize, dc: &mut DateCache, 
 }
 
 fn parse_events(ctx: &Ctx, ix: &IxCfg, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, o: &mut P1Work) {
+    #[cfg(feature = "diag")]
+    if use_512() {
+        return unsafe { parse_events_512(ctx, ix, buf, begin, limit, lm, o) };
+    }
+    parse_events_g::<M256>(ctx, ix, buf, begin, limit, lm, o)
+}
+
+#[cfg(feature = "diag")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn parse_events_512(ctx: &Ctx, ix: &IxCfg, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, o: &mut P1Work) {
+    parse_events_g::<M512>(ctx, ix, buf, begin, limit, lm, o)
+}
+
+#[inline(always)]
+fn parse_events_g<M: Masks>(ctx: &Ctx, ix: &IxCfg, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, o: &mut P1Work) {
     let n = buf.len();
     if begin >= n {
         return;
@@ -2811,7 +2877,7 @@ fn parse_events(ctx: &Ctx, ix: &IxCfg, buf: &[u8], begin: usize, limit: usize, l
         if pf2 {
             prefetch(p.wrapping_add(pf + 64));
         }
-        match unsafe { line_cursors::<7, 3>(p) } {
+        match unsafe { line_cursors::<M, 7, 3>(p) } {
             Line::Slow => ls = event_slow(ctx, ix, buf, ls, &mut dc, lm, &mut q, o),
             Line::Bad(e) => ls += e + 1,
             Line::Good(c) => {
@@ -2934,7 +3000,23 @@ fn click_slow(
     end + 1
 }
 
-fn parse_clicks(
+fn parse_clicks(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, clq: &mut Parts<RecCc, 2>, cesc: &mut [PVec<Key>]) {
+    #[cfg(feature = "diag")]
+    if use_512() {
+        return unsafe { parse_clicks_512(ctx, buf, begin, limit, lm, clq, cesc) };
+    }
+    parse_clicks_g::<M256>(ctx, buf, begin, limit, lm, clq, cesc)
+}
+
+#[cfg(feature = "diag")]
+#[target_feature(enable = "avx512f,avx512bw")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn parse_clicks_512(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, clq: &mut Parts<RecCc, 2>, cesc: &mut [PVec<Key>]) {
+    parse_clicks_g::<M512>(ctx, buf, begin, limit, lm, clq, cesc)
+}
+
+#[inline(always)]
+fn parse_clicks_g<M: Masks>(
     ctx: &Ctx,
     buf: &[u8],
     begin: usize,
@@ -2957,7 +3039,7 @@ fn parse_clicks(
         let p = unsafe { ptr.add(ls) };
         // (see scan_lean)
         prefetch(p.wrapping_add(INPUT_AHEAD));
-        match unsafe { line_cursors::<4, 2>(p) } {
+        match unsafe { line_cursors::<M, 4, 2>(p) } {
             Line::Slow => ls = click_slow(ctx, buf, ls, &mut dc, lm, &mut q, clq, cesc),
             Line::Bad(e) => ls += e + 1,
             Line::Good(c) => {
@@ -3367,6 +3449,27 @@ fn env_or(name: &str, dflt: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| dflt.to_string())
 }
 
+/// Experiment switch SS_PIN: worker `w` stays on the w-th of the CPUs the
+/// process may use (threads are otherwise placed by the scheduler).
+fn pin(w: usize) {
+    static CPUS: OnceLock<Vec<usize>> = OnceLock::new();
+    // (first asked by a fresh worker, whose mask is still the process's)
+    let cpus = CPUS.get_or_init(|| {
+        let mut mask = [0u64; 16];
+        if std::env::var_os("SS_PIN").is_none() || unsafe { sched_getaffinity(0, 128, mask.as_mut_ptr()) } != 0 {
+            return Vec::new();
+        }
+        (0..1024).filter(|&c| mask[c / 64] >> (c % 64) & 1 != 0).collect()
+    });
+    if cpus.is_empty() {
+        return;
+    }
+    let c = cpus[w % cpus.len()];
+    let mut mask = [0u64; 16];
+    mask[c / 64] = 1 << (c % 64);
+    unsafe { sched_setaffinity(0, 128, mask.as_ptr()) };
+}
+
 /// Hands out work-item indices to threads.
 fn run_workers<R: Send, F: Fn(usize) -> R + Sync>(n: usize, f: F) -> Vec<R> {
     std::thread::scope(|s| {
@@ -3375,6 +3478,7 @@ fn run_workers<R: Send, F: Fn(usize) -> R + Sync>(n: usize, f: F) -> Vec<R> {
                 let f = &f;
                 s.spawn(move || {
                     SUB.with(|c| c.set(w));
+                    pin(w);
                     f(w)
                 })
             })
@@ -3590,9 +3694,13 @@ fn main() {
                 });
                 let bound = (est_events as u64).max(1 << 12);
                 if let Some(key) = find_seq_key(&sample, bound, nthreads) {
-                    // partitions of 2^shift numbers, about 2500 of them at most
-                    let mut shift = 12;
-                    while (bound >> shift) > 2560 && shift < 16 {
+                    // Partitions of 2^14 numbers while that makes at most about
+                    // 4400 of them. Measured on the scorer at 20M events: 2^12
+                    // to 2^14 numbers per partition are equally fast, 2^15
+                    // costs 1% and 2^16 3% (in the sequence phase), and phase 1
+                    // is as fast with 5800 partitions as with 360.
+                    let mut shift = 14;
+                    while (bound >> shift) > 4400 && shift < 16 {
                         shift += 1;
                     }
                     #[cfg(feature = "diag")]
@@ -4349,6 +4457,8 @@ fn main() {
         }
         // the last user_daily file of this worker (worker 0 always writes one)
         st.uw.finish(w == 0);
+        #[cfg(feature = "diag")]
+        CK_OUT.fetch_add(st.uw.ck, Ordering::Relaxed);
         if verbose {
             eprintln!("  w{w}: {} user_daily rows in {} files", st.uw.rows, st.uw.files);
         }
@@ -4417,7 +4527,16 @@ fn main() {
             for k in 0..4 {
                 cols[3 + k].push_i64(a[k] as i64);
             }
+            #[cfg(feature = "diag")]
+            {
+                let row = pq::ck_mix((c * ndays + d) as u64, pq::ck_mix(a[0] ^ a[1] << 32, a[2] ^ a[3] << 32));
+                CK_OUT.fetch_add(row, Ordering::Relaxed);
+            }
         }
+    }
+    #[cfg(feature = "diag")]
+    if verbose {
+        eprintln!("  checksum {:016x}", CK_OUT.load(Ordering::Relaxed));
     }
     #[cfg(feature = "diag")]
     if std::env::var_os("SS_CHILD").is_none() {

@@ -181,7 +181,7 @@ fn synthesize(src: &Path, dst: &Path, copies: usize, nt: usize) -> (u64, bool) {
 /// Runs this binary as a child on `data` with extra environment. Returns the
 /// wall time in ms and [link map, phase 1 end, dedup end, phase 3 end, user s, sys s]
 /// from its phase lines (zeros if it failed).
-fn child(data: &Path, out: &Path, envs: &[(&str, &str)]) -> (f64, [f64; 8]) {
+fn child(data: &Path, out: &Path, envs: &[(&str, &str)]) -> (f64, [f64; 8], u64) {
     let _ = fs::remove_dir_all(out);
     let _ = fs::create_dir_all(out);
     let exe = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
@@ -196,6 +196,7 @@ fn child(data: &Path, out: &Path, envs: &[(&str, &str)]) -> (f64, [f64; 8]) {
     let ms = t.elapsed().as_secs_f64() * 1e3;
     // [link map, phase 1 end, dedup end, phase 3 end, user s, sys s, sequence phase end, sequence path on]
     let mut laps = [0f64; 8];
+    let mut ck = 0u64;
     match r {
         Ok(o) => {
             let text = String::from_utf8_lossy(&o.stderr);
@@ -214,6 +215,9 @@ fn child(data: &Path, out: &Path, envs: &[(&str, &str)]) -> (f64, [f64; 8]) {
                 } else {
                     if l.contains("sequence numbers: on=true") {
                         laps[7] = 1.0;
+                    }
+                    if let Some(h) = l.trim().strip_prefix("checksum ") {
+                        ck = u64::from_str_radix(h.trim(), 16).unwrap_or(0);
                     }
                     if l.contains("ms  done") {
                         let num = |key: &str| -> f64 {
@@ -240,7 +244,7 @@ fn child(data: &Path, out: &Path, envs: &[(&str, &str)]) -> (f64, [f64; 8]) {
         }
         Err(e) => dl!("[diag]     child failed: {e}"),
     }
-    (ms, laps)
+    (ms, laps, ck)
 }
 
 fn b36(mut v: u64, width: usize) -> String {
@@ -418,7 +422,7 @@ pub fn run(data: &Path, _out: &Path, nt: usize) {
     let _ = data;
     let t0 = Instant::now();
     let scratch = std::path::PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into()));
-    let mut row = String::from("v8;");
+    let mut row = String::from("v9;");
     // fingerprint of this binary (FNV-1a), to match it with a local build
     let exe = fs::read(std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into())).unwrap_or_default();
     let fnv = exe.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
@@ -429,27 +433,34 @@ pub fn run(data: &Path, _out: &Path, nt: usize) {
     row.push_str(&format!("q{};", seq as u32));
     let out = scratch.join("synout");
 
-    // pipeline variants: code:wall,link map,phase 1,dedup,sequence phase,phase 3,user,sys,sequence path on (best of 3)
+    // pipeline variants: code:wall,link map,phase 1,dedup,sequence phase,phase 3,user,sys,sequence path on,
+    // output checksum equal to the first variant's (best of 4)
     let sets: Vec<(&str, Vec<(&str, &str)>)> = vec![
         ("d", vec![]),
-        ("np", vec![("SS_POP", "0")]),
-        ("n2", vec![("SS_POP", "0"), ("SS_REL", "2")]),
-        ("nq", vec![("SS_POP", "0"), ("SS_ADV", "1")]),
-        ("nr", vec![("SS_POP", "0"), ("SS_ADV", "2")]),
-        ("nc", vec![("SS_POP", "0"), ("SS_CHUNK_KB", "1024")]),
-        ("m4", vec![("SS_NO_MMAP", "1")]),
-        ("m1", vec![("SS_NO_MMAP", "1"), ("SS_CHUNK_KB", "1024")]),
-        ("m5", vec![("SS_NO_MMAP", "1"), ("SS_CHUNK_KB", "512")]),
-        ("m2", vec![("SS_NO_MMAP", "1"), ("SS_CHUNK_KB", "256")]),
-        ("ns", vec![("SS_NO_SEQ", "1")]),
-        ("sp", vec![("SS_NO_SEQ", "1"), ("SS_POP", "0")]),
-        ("s5", vec![("SS_NO_SEQ", "1"), ("SS_NO_MMAP", "1"), ("SS_CHUNK_KB", "512")]),
+        ("pn", vec![("SS_PIN", "1")]),
+        ("a5", vec![("SS_A512", "1")]),
+        ("ap", vec![("SS_A512", "1"), ("SS_PIN", "1")]),
         ("d2", vec![]),
+        ("pn2", vec![("SS_PIN", "1")]),
+        ("a52", vec![("SS_A512", "1")]),
+        ("ns", vec![("SS_NO_SEQ", "1")]),
+        ("nsa", vec![("SS_NO_SEQ", "1"), ("SS_A512", "1")]),
+        ("nsp", vec![("SS_NO_SEQ", "1"), ("SS_PIN", "1")]),
+        ("d3", vec![]),
     ];
+    let mut ck0 = [0u64; 2];
     for (name, envs) in &sets {
-        let mut best = (f64::MAX, [0f64; 8]);
-        for _ in 0..3 {
+        let mut best = (f64::MAX, [0f64; 8], 0u64);
+        let mut same = 1;
+        for _ in 0..4 {
             let r = child(&syn, &out, envs);
+            // (the general path and the sequence path must agree too)
+            if ck0[0] == 0 {
+                ck0[0] = r.2;
+            }
+            if r.2 != ck0[0] || r.2 == 0 {
+                same = 0;
+            }
             if r.0 < best.0 && r.1[3] > 0.0 {
                 best = r;
             }
@@ -459,7 +470,7 @@ pub fn run(data: &Path, _out: &Path, nt: usize) {
         }
         let l = best.1;
         let rec = format!(
-            "{name}:{:.0},{:.0},{:.0},{:.0},{:.0},{:.0},{:.1},{:.1},{:.0};",
+            "{name}:{:.0},{:.0},{:.0},{:.0},{:.0},{:.0},{:.1},{:.1},{:.0},{same};",
             best.0,
             l[0],
             l[1] - l[0],
@@ -473,6 +484,7 @@ pub fn run(data: &Path, _out: &Path, nt: usize) {
         dl!("[diag] variant {rec}");
         row.push_str(&rec);
     }
+    row.push_str(&format!("c{:x};", ck0[0] & 0xFFFF_FFFF));
     row.push(';');
     row.push(';');
 
@@ -485,8 +497,8 @@ pub fn run(data: &Path, _out: &Path, nt: usize) {
     let (mut total, mut unknown, mut runs) = (0u64, 0u64, 0);
     while runs < 8 && t0.elapsed().as_secs_f64() < 90.0 {
         let _ = fs::remove_file(&prof);
-        // (the general path this time: the sequence path was profiled by v7)
-        child(&syn, &out, &[("SS_PROF", &prof_s), ("SS_NO_SEQ", "1")]);
+        // (with the 512-bit scanner where the CPU has it: its profile is the new information)
+        child(&syn, &out, &[("SS_PROF", &prof_s), ("SS_A512", "1")]);
         runs += 1;
         if let Ok(text) = fs::read_to_string(&prof) {
             for l in text.lines() {
