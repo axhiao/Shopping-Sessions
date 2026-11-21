@@ -84,4 +84,12 @@ pub fn dump(path: &str) {
         s.push_str(&format!("{a:x} {c}\n"));
     }
     let _ = std::fs::write(path, s);
+    // absolute addresses outside the binary, with the maps, for libraries
+    let mut abs = String::new();
+    for i in 0..n {
+        let r = unsafe { *(std::ptr::addr_of!(SAMPLES) as *const usize).add(i) };
+        abs.push_str(&format!("{r:x}\n"));
+    }
+    let _ = std::fs::write(format!("{path}.abs"), abs);
+    let _ = std::fs::write(format!("{path}.maps"), maps);
 }

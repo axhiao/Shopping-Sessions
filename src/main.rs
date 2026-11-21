@@ -64,6 +64,10 @@ struct Arena {
     base: usize,
     sub: usize,
     used: Vec<AtomicUsize>,
+    /// Per sub-arena, a range of dead (already faulted) memory to hand out
+    /// before fresh memory: [recycle_next, recycle_end).
+    recycle_next: Vec<AtomicUsize>,
+    recycle_end: Vec<AtomicUsize>,
 }
 
 /// Sub-arenas: one per worker, the last one for the main thread. Set before
@@ -87,7 +91,8 @@ fn arena() -> &'static Arena {
             if p as isize != -1 && !p.is_null() {
                 let base = (p as usize + (2 << 20) - 1) & !((2 << 20) - 1);
                 let sub = ((cap - (2 << 20)) / subs) & !4095;
-                return Arena { base, sub, used: (0..subs).map(|_| AtomicUsize::new(0)).collect() };
+                let z = || (0..subs).map(|_| AtomicUsize::new(0)).collect();
+                return Arena { base, sub, used: z(), recycle_next: z(), recycle_end: z() };
             }
         }
         panic!("cannot reserve arena");
@@ -99,9 +104,21 @@ fn arena_alloc(bytes: usize) -> *mut u8 {
     let a = arena();
     let s = SUB.with(|c| c.get()).min(a.used.len() - 1);
     let bytes = (bytes + 63) & !63;
+    let rn = a.recycle_next[s].load(Ordering::Relaxed);
+    if rn + bytes <= a.recycle_end[s].load(Ordering::Relaxed) {
+        a.recycle_next[s].store(rn + bytes, Ordering::Relaxed);
+        return rn as *mut u8;
+    }
     let off = a.used[s].fetch_add(bytes, Ordering::Relaxed);
     assert!(off + bytes <= a.sub, "arena exhausted");
     (a.base + s * a.sub + off) as *mut u8
+}
+
+/// Lets sub-arena `s` hand out [from, to) again (memory that is dead now).
+fn recycle(s: usize, from: usize, to: usize) {
+    let a = arena();
+    a.recycle_next[s].store((from + 63) & !63, Ordering::Relaxed);
+    a.recycle_end[s].store(to, Ordering::Relaxed);
 }
 
 /// Frees everything the calling thread's sub-arena handed out.
@@ -1361,6 +1378,7 @@ struct P1Work {
 }
 
 struct P1Out {
+    dd_region: (usize, usize),
     dd: Vec<PVec<RecD>>,
     pay: Vec<PVec<RecP>>,
     pur: Vec<PVec<(u32, u32)>>,
@@ -2040,6 +2058,13 @@ fn main() {
             pur: (0..pc).map(|_| PVec::with_capacity(res_pay / 24 + 16)).collect(),
             clq: Parts::new(pc, res_cl),
         };
+        // the dedup buffers were allocated first, contiguously; they are dead
+        // after phase 2a and phase 3 reuses that memory
+        let dd_region = {
+            let first = o.dd.out[0].ptr as usize;
+            let last = o.dd.out[pa - 1].ptr as usize + o.dd.out[pa - 1].cap * std::mem::size_of::<RecD>();
+            (first, last)
+        };
 
         loop {
             let i = counters[4].fetch_add(1, Ordering::Relaxed);
@@ -2058,7 +2083,7 @@ fn main() {
                 release(unsafe { inf.map.add(c.start as usize) }, (c.end - c.start) as usize);
             }
         }
-        let r = P1Out { dd: o.dd.finish(), pay: o.pay.finish(), pur: o.pur, clq: o.clq.finish() };
+        let r = P1Out { dd_region, dd: o.dd.finish(), pay: o.pay.finish(), pur: o.pur, clq: o.clq.finish() };
         if verbose {
             eprintln!("  p1 w{w} done at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
         }
@@ -2149,6 +2174,9 @@ fn main() {
         release_vec(&table);
     });
     lap("phase 2a dedup");
+    for (w, o) in p1.iter().enumerate() {
+        recycle(w, o.dd_region.0, o.dd_region.1);
+    }
 
 
     // --- phase 3: sessionize per person partition
