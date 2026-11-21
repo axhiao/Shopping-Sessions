@@ -390,7 +390,12 @@ struct LinkMap {
     /// Build-time state: parent (slot + 1, 0 = unclaimed) and best (slot + 1).
     parent: Vec<AtomicU32>,
     best: Vec<AtomicU32>,
+    /// One bit per hash (top 24 bits) of every ID whose person is not itself:
+    /// a clear bit means "the person is the ID", with no table probe.
+    filter: Vec<AtomicU64>,
 }
+
+const FILTER_BITS: u32 = 24;
 
 unsafe impl Sync for LinkMap {}
 unsafe impl Send for LinkMap {}
@@ -401,7 +406,13 @@ impl LinkMap {
         let size = (occ + 1).next_power_of_two().max(16);
         let slots: Vec<Slot> = zeroed_vec(size);
         let slots = Vec::leak(slots).as_mut_ptr();
-        LinkMap { slots, mask: size - 1, parent: zeroed_vec(size), best: zeroed_vec(size) }
+        LinkMap {
+            slots,
+            mask: size - 1,
+            parent: zeroed_vec(size),
+            best: zeroed_vec(size),
+            filter: zeroed_vec(1 << (FILTER_BITS - 6)),
+        }
     }
     fn empty() -> LinkMap {
         LinkMap::with_pairs(0)
@@ -422,6 +433,13 @@ impl LinkMap {
         let i = self.slot_of(h);
         prefetch(unsafe { self.slots.add(i) });
         prefetch(unsafe { self.slots.add((i + 2) & self.mask) });
+    }
+    /// False when user hash `h` surely maps to itself.
+    #[inline(always)]
+    fn maybe_linked(&self, h: u64) -> bool {
+        let b = h >> (64 - FILTER_BITS);
+        let w = unsafe { self.filter.get_unchecked((b >> 6) as usize) }.load(Ordering::Relaxed);
+        (w >> (b & 63)) & 1 != 0
     }
     /// The person for user `k` (hash `h`).
     #[inline(always)]
@@ -574,6 +592,10 @@ impl LinkMap {
             let b = self.best[r].load(Ordering::Relaxed) as usize - 1;
             let name = self.slot(b).k;
             unsafe { (*self.slots.add(i)).v = name };
+            if b != i {
+                let fb = hk(&self.slot(i).k) >> (64 - FILTER_BITS);
+                self.filter[(fb >> 6) as usize].fetch_or(1 << (fb & 63), Ordering::Relaxed);
+            }
         }
     }
 }
@@ -1322,6 +1344,7 @@ struct EvBatch {
     pay: [RecP; EB],
     pc: [(u32, u32); EB],
     h: [u64; EB],
+    linked: [bool; EB],
     dd: [RecD; EB],
 }
 
@@ -1329,7 +1352,7 @@ struct EvBatch {
 fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
     for j in 0..b.n {
         let mut p = b.pay[j];
-        if !exp(64) {
+        if b.linked[j] {
             p.person = lm.person(&p.person, b.h[j]);
         }
         let q = (hk(&p.person) >> (64 - PC_BITS)) as usize;
@@ -1365,11 +1388,12 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
         pay: [RecP { person: ZERO, ts: 0, x: 0 }; EB],
         pc: [(0, 0); EB],
         h: [0; EB],
+        linked: [false; EB],
         dd: [RecD { fp: 0, b: 0 }; EB],
     };
     let stop_scan = exp(16);
     let stop_push = exp(32);
-    let (x_nofp, x_noing, x_nots) = (exp(1 << 15), exp(1 << 16), exp(1 << 17));
+    let (x_nofp, x_noing, x_nots, x_nolm) = (exp(1 << 15), exp(1 << 16), exp(1 << 17), exp(64));
     scan_lines::<7, _>(buf, begin, limit, |f| {
         if stop_scan {
             std::hint::black_box(f);
@@ -1411,7 +1435,11 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
                 return;
             }
             let h = hk(&user);
-            lm.prefetch(h);
+            let linked = !x_nolm && lm.maybe_linked(h);
+            if linked {
+                lm.prefetch(h);
+            }
+            b.linked[b.n] = linked;
             b.pay[b.n] = p;
             b.pc[b.n] = (price, cat);
             b.h[b.n] = h;
@@ -1436,7 +1464,9 @@ fn parse_clicks(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
     let flush = |batch: &[RecC], hs: &[u64], clq: &mut Parts<RecC, 8>| {
         for (r, &h) in batch.iter().zip(hs) {
             let mut r = *r;
-            r.user = lm.person(&r.user, h);
+            if lm.maybe_linked(h) {
+                r.user = lm.person(&r.user, h);
+            }
             let q = (hk(&r.user) >> (64 - PC_BITS)) as usize;
             clq.push(q, r);
         }
@@ -1455,7 +1485,9 @@ fn parse_clicks(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
         };
         let user = key_of(f[1]);
         let h = hk(&user);
-        lm.prefetch(h);
+        if lm.maybe_linked(h) {
+            lm.prefetch(h);
+        }
         batch[n] = RecC { user, cid: key_of(f[0]), ts: (ts - lo) as u32, camp };
         hs[n] = h;
         n += 1;
