@@ -3500,6 +3500,7 @@ fn main() {
     let (res_dd, res_pay, res_cl) = (per(est_events, pa), per(est_events, pc), per(est_clicks, pc));
     // --- sequence numbers of generated event ids (see IxCfg): the key is
     // searched with the ids of the first lines of the biggest events file
+    let mut ix_sample = 0usize;
     let ix = {
         let mut cfg = IxCfg { on: false, key: 0, shift: 0, mask: 0, parts: 1, imax: 0 };
         let biggest = files.iter().filter(|f| f.kind == Kind::Event && !f.map.is_null()).max_by_key(|f| f.len);
@@ -3517,6 +3518,7 @@ fn main() {
                     }
                 });
                 let bound = (est_events as u64).max(1 << 12);
+                ix_sample = sample.len();
                 if let Some(key) = find_seq_key(&sample, bound, nthreads) {
                     // partitions of 2^shift numbers, about 2500 of them at most
                     let mut shift = 12;
@@ -3691,6 +3693,30 @@ fn main() {
         })
     });
     lap("phase 1 parse");
+    // Measurement build: nothing of a run on the hidden data can be seen but its
+    // time, so the time says whether the sequence path was taken. It only
+    // ever adds time: 0.4 s if the path was on but more than 5% of the event
+    // lines went the general way, 0.8 s if no key fitted the sampled ids,
+    // 1.2 s if fewer than 8 ids of the generated form were sampled.
+    {
+        let general: usize = p1.iter().map(|o| o.dd.iter().map(|p| p.len()).sum::<usize>()).sum();
+        let seq: usize = p1.iter().map(|o| o.ix.iter().map(|p| p.len()).sum::<usize>()).sum();
+        let wait = if !ix.on {
+            if ix_sample < 8 {
+                1200
+            } else {
+                800
+            }
+        } else if general * 20 > general + seq {
+            400
+        } else {
+            0
+        };
+        if verbose {
+            eprintln!("  measurement: sequence path on={} sampled={ix_sample} general={general} sequence={seq} wait={wait} ms", ix.on);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(wait));
+    }
     let ctx = ctx_cell.get().unwrap();
     let ncamp = ctx.camp_ids.len();
     let linkmap = LINKMAP.get().unwrap();
