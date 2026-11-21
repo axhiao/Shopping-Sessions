@@ -49,7 +49,7 @@ fn zeroed_vec<T>(n: usize) -> Vec<T> {
         assert!(!p.is_null());
         let start = (p as usize + (2 << 20) - 1) & !((2 << 20) - 1);
         let end = (p as usize + layout.size()) & !((2 << 20) - 1);
-        if end > start && !exp(1 << 18) {
+        if end > start {
             madvise(start as *mut _, end - start, 14 /* MADV_HUGEPAGE */);
         }
         Vec::from_raw_parts(p, n, n)
@@ -97,7 +97,7 @@ fn arena_alloc(bytes: usize) -> *mut u8 {
 fn release(p: *const u8, len: usize) {
     let a = (p as usize + 4095) & !4095;
     let b = (p as usize + len) & !4095;
-    if b > a && !exp(512) {
+    if b > a {
         unsafe { madvise(a as *mut _, b - a, 4 /* MADV_DONTNEED */) };
     }
 }
@@ -256,12 +256,6 @@ fn prefetch<T>(p: *const T) {
 
 type Key = [u64; 2];
 const ZERO: Key = [0, 0];
-
-static EXP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-#[inline(always)]
-fn exp(bit: u32) -> bool {
-    EXP.load(Ordering::Relaxed) & bit != 0
-}
 
 static LONG: Mutex<BTreeMap<Key, Vec<u8>>> = Mutex::new(BTreeMap::new());
 
@@ -1282,9 +1276,7 @@ fn chunk_bytes<'a>(inf: &'a InFile, c: &Chunk, buf: &'a mut Vec<u8>) -> (&'a [u8
         // populate the page tables for this range in one go
         let s = (c.start as usize) & !4095;
         let e = ((c.end as usize + 65536).min(inf.len as usize) + 4095) & !4095;
-        if !exp(8) {
-            unsafe { madvise(inf.map.add(s) as *mut _, e - s, 22 /* MADV_POPULATE_READ */) };
-        }
+        unsafe { madvise(inf.map.add(s) as *mut _, e - s, 22 /* MADV_POPULATE_READ */) };
         let begin = if c.start == 0 {
             find_byte(all, 0, b'\n') + 1
         } else {
@@ -1379,16 +1371,8 @@ fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
             IDX_OVERFLOW.store(true, Ordering::Relaxed);
         }
         d.b |= HAS_PAY | ((q as u64) << IDX_BITS) | (idx & ((1 << IDX_BITS) - 1));
-        if !exp(256) {
-            o.pay.push(q, p);
-        } else {
-            std::hint::black_box(&p);
-        }
-        if !exp(128) {
-            o.dd.push((d.fp >> (64 - pa_bits())) as usize, d);
-        } else {
-            std::hint::black_box(&d);
-        }
+        o.pay.push(q, p);
+        o.dd.push((d.fp >> (64 - pa_bits())) as usize, d);
     }
     b.n = 0;
 }
@@ -1406,19 +1390,12 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
     // two batches: `bs[cur]` fills while `bs[cur ^ 1]` waits for its slots
     let mut bs = [empty, empty];
     let mut cur = 0usize;
-    let stop_scan = exp(16);
-    let stop_push = exp(32);
-    let (x_nofp, x_noing, x_nots, x_nolm) = (exp(1 << 15), exp(1 << 16), exp(1 << 17), exp(64));
     scan_lines::<7, _>(buf, begin, limit, |f| {
-        if stop_scan {
-            std::hint::black_box(f);
-            return;
-        }
         if f[0].is_empty() {
             return;
         }
-        let (fp, fp2) = if x_nofp { (f[0].len() as u64 * 0x9E37_79B9_7F4A_7C15, 1) } else { eid_fp(&key_of(f[0])) };
-        let ingest_ms = if x_noing { 1_800_000_000_000 } else { parse_ingest(f[3]).unwrap_or(i64::MAX / 2) };
+        let (fp, fp2) = eid_fp(&key_of(f[0]));
+        let ingest_ms = parse_ingest(f[3]).unwrap_or(i64::MAX / 2);
         let ingest = (ingest_ms.div_euclid(1000) - ctx.ingest_base_s).clamp(0, 0xFF_FFFF) as u64;
         let d = RecD { fp, b: ((fp2 as u64) << 56) | (ingest << 32) };
         let part = (fp >> (64 - pa_bits())) as usize;
@@ -1426,7 +1403,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
             if f[1].is_empty() || f[5].is_empty() {
                 break 'v;
             }
-            let ts = match if x_nots { Some(ws + f[2].len() as i64) } else { parse_ts_fast(f[2]) } {
+            let ts = match parse_ts_fast(f[2]) {
                 Some(t) if t >= ws && t < we => t,
                 _ => break 'v,
             };
@@ -1445,11 +1422,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
             let cat = if ty == T_PURCHASE { ctx.products.get(&key_of(f[5])).unwrap_or(ctx.unknown_cat) } else { 0 };
             let user = key_of(f[1]);
             let p = RecP { person: user, ts: (ts - ws) as u32, x: (ty == T_PURCHASE) as u32 };
-            if stop_push {
-                std::hint::black_box((&p, &d));
-                return;
-            }
-            let h = if x_nolm { 0 } else { hk(&user) };
+            let h = hk(&user);
             lm.prefetch_filter(h);
             let b = &mut bs[cur];
             b.pay[b.n] = p;
@@ -1774,7 +1747,6 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
         .clamp(1, 31);
     let verbose = std::env::var("SS_VERBOSE").is_ok();
-    EXP.store(std::env::var("SS_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0), Ordering::Relaxed);
     let lap = |what: &str| {
         if verbose {
             let mut ru = [0i64; 18];
@@ -1860,7 +1832,7 @@ fn main() {
 
     // --- files and chunks: links first, then clicks (they do not need the
     // link map), then events.
-    let use_mmap = !exp(4);
+    let use_mmap = std::env::var_os("SS_NO_MMAP").is_none();
     let mut files: Vec<InFile> = Vec::new();
     for (kind, dir) in [(Kind::Link, "links"), (Kind::Click, "clicks"), (Kind::Event, "events")] {
         for (p, len) in csv_files(&data.join(dir)) {
@@ -1975,19 +1947,6 @@ fn main() {
             }
             let c = &chunks[data_chunks[i]];
             let (bytes, b, l) = chunk_bytes(&files[c.file], c, &mut buf);
-            if exp(4096) || (exp(8192) && c.kind == Kind::Click) {
-                std::hint::black_box(bytes);
-                continue;
-            }
-            if exp(16384) {
-                // just stream through the bytes
-                let mut acc = 0u64;
-                for ch in bytes[b..l.min(bytes.len())].chunks(64) {
-                    acc = acc.wrapping_add(ch[0] as u64);
-                }
-                std::hint::black_box(acc);
-                continue;
-            }
             match c.kind {
                 Kind::Event => parse_events(&ctx, bytes, b, l, lm, &mut o),
                 Kind::Click => parse_clicks(&ctx, bytes, b, l, lm, &mut o.clq),
