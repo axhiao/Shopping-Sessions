@@ -418,7 +418,7 @@ pub fn run(data: &Path, _out: &Path, nt: usize) {
     let _ = data;
     let t0 = Instant::now();
     let scratch = std::path::PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into()));
-    let mut row = String::from("v7;");
+    let mut row = String::from("v8;");
     // fingerprint of this binary (FNV-1a), to match it with a local build
     let exe = fs::read(std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into())).unwrap_or_default();
     let fnv = exe.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
@@ -432,16 +432,18 @@ pub fn run(data: &Path, _out: &Path, nt: usize) {
     // pipeline variants: code:wall,link map,phase 1,dedup,sequence phase,phase 3,user,sys,sequence path on (best of 3)
     let sets: Vec<(&str, Vec<(&str, &str)>)> = vec![
         ("d", vec![]),
-        ("ns", vec![("SS_NO_SEQ", "1")]),
-        ("x12", vec![("SS_IXSHIFT", "12")]),
-        ("x13", vec![("SS_IXSHIFT", "13")]),
-        ("x15", vec![("SS_IXSHIFT", "15")]),
-        ("x16", vec![("SS_IXSHIFT", "16")]),
-        ("r1", vec![("SS_REL", "1")]),
         ("np", vec![("SS_POP", "0")]),
-        ("p2", vec![("SS_PF2", "1")]),
-        ("nr1", vec![("SS_NO_SEQ", "1"), ("SS_REL", "1")]),
-        ("ns2", vec![("SS_NO_SEQ", "1")]),
+        ("n2", vec![("SS_POP", "0"), ("SS_REL", "2")]),
+        ("nq", vec![("SS_POP", "0"), ("SS_ADV", "1")]),
+        ("nr", vec![("SS_POP", "0"), ("SS_ADV", "2")]),
+        ("nc", vec![("SS_POP", "0"), ("SS_CHUNK_KB", "1024")]),
+        ("m4", vec![("SS_NO_MMAP", "1")]),
+        ("m1", vec![("SS_NO_MMAP", "1"), ("SS_CHUNK_KB", "1024")]),
+        ("m5", vec![("SS_NO_MMAP", "1"), ("SS_CHUNK_KB", "512")]),
+        ("m2", vec![("SS_NO_MMAP", "1"), ("SS_CHUNK_KB", "256")]),
+        ("ns", vec![("SS_NO_SEQ", "1")]),
+        ("sp", vec![("SS_NO_SEQ", "1"), ("SS_POP", "0")]),
+        ("s5", vec![("SS_NO_SEQ", "1"), ("SS_NO_MMAP", "1"), ("SS_CHUNK_KB", "512")]),
         ("d2", vec![]),
     ];
     for (name, envs) in &sets {
@@ -483,7 +485,8 @@ pub fn run(data: &Path, _out: &Path, nt: usize) {
     let (mut total, mut unknown, mut runs) = (0u64, 0u64, 0);
     while runs < 8 && t0.elapsed().as_secs_f64() < 90.0 {
         let _ = fs::remove_file(&prof);
-        child(&syn, &out, &[("SS_PROF", &prof_s)]);
+        // (the general path this time: the sequence path was profiled by v7)
+        child(&syn, &out, &[("SS_PROF", &prof_s), ("SS_NO_SEQ", "1")]);
         runs += 1;
         if let Ok(text) = fs::read_to_string(&prof) {
             for l in text.lines() {

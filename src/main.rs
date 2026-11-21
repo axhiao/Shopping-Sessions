@@ -44,12 +44,13 @@ const INPUT_AHEAD: usize = 512;
 /// distance), 1 = SS_PF2 (also prefetch the following cache line), 2 = SS_REL
 /// (input release: 0 per chunk, 1 per file at the end of phase 1, 2 never),
 /// 3 = SS_RES (partition reserve in percent of a sampled estimate, 0 = the
-/// fixed estimate), 4 = SS_POP (populate the input page tables per chunk).
+/// fixed estimate), 4 = SS_POP (populate the input page tables per chunk),
+/// 5 = SS_ADV (advice for the input mappings: 1 sequential, 2 random).
 fn knob(i: usize) -> i64 {
-    static V: OnceLock<[i64; 5]> = OnceLock::new();
+    static V: OnceLock<[i64; 6]> = OnceLock::new();
     V.get_or_init(|| {
         let g = |k: &str, d: i64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        [g("SS_PF", INPUT_AHEAD as i64), g("SS_PF2", 0), g("SS_REL", 0), g("SS_RES", 0), g("SS_POP", 1)]
+        [g("SS_PF", INPUT_AHEAD as i64), g("SS_PF2", 0), g("SS_REL", 0), g("SS_RES", 0), g("SS_POP", 1), g("SS_ADV", 0)]
     })[i]
 }
 
@@ -2360,6 +2361,15 @@ fn map_file(f: &File, len: usize) -> *const u8 {
         if p as isize == -1 || p != base {
             return std::ptr::null();
         }
+        match knob(5) {
+            1 => {
+                madvise(p, len, 2 /* MADV_SEQUENTIAL */);
+            }
+            2 => {
+                madvise(p, len, 1 /* MADV_RANDOM */);
+            }
+            _ => {}
+        }
         p as *const u8
     }
 }
@@ -3553,9 +3563,20 @@ fn main() {
     // searched with the ids of the first lines of the biggest events file
     let ix = {
         let mut cfg = IxCfg { on: false, key: 0, shift: 0, mask: 0, parts: 1, imax: 0 };
-        let biggest = files.iter().filter(|f| f.kind == Kind::Event && !f.map.is_null()).max_by_key(|f| f.len);
+        let biggest = files.iter().filter(|f| f.kind == Kind::Event && f.len > 0).max_by_key(|f| f.len);
         if let (Some(f), true) = (biggest, std::env::var_os("SS_NO_SEQ").is_none()) {
-            let head = unsafe { std::slice::from_raw_parts(f.map, (f.len as usize).min(96 << 10)) };
+            let hn = (f.len as usize).min(96 << 10);
+            let mut read = vec![0u8; if f.map.is_null() { hn } else { 0 }];
+            let head: &[u8] = if f.map.is_null() {
+                let got = File::open(&f.path).map(|fl| fl.read_exact_at(&mut read, 0).is_ok()).unwrap_or(false);
+                if got {
+                    &read
+                } else {
+                    &[]
+                }
+            } else {
+                unsafe { std::slice::from_raw_parts(f.map, hn) }
+            };
             if let Some(last) = head.iter().rposition(|&b| b == b'\n') {
                 let text = pad_buffer(head[..last + 1].to_vec());
                 let begin = find_byte(&text, 0, b'\n') + 1;
