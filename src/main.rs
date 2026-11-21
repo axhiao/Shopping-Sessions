@@ -404,9 +404,18 @@ fn key_of(s: &[u8]) -> Key {
     // the first n bytes, big-endian, zero-padded; n in the last byte
     let lo = unsafe { (s.as_ptr() as *const u64).read_unaligned() };
     let hi = unsafe { (s.as_ptr().add(8) as *const u64).read_unaligned() };
-    let lo = if n >= 8 { lo } else { lo & !(!0u64 << (8 * n)) };
-    let hi = if n > 8 { hi & !(!0u64 << (8 * n - 64)) } else { 0 };
-    [lo.swap_bytes(), hi.swap_bytes() | n as u64]
+    // KEEP[n]: masks of the first n bytes of the two words
+    static KEEP: [[u64; 2]; 16] = {
+        let mut t = [[0u64; 2]; 16];
+        let mut n = 1;
+        while n < 16 {
+            t[n] = if n >= 8 { [!0, if n == 8 { 0 } else { !(!0u64 << (8 * n - 64)) }] } else { [!(!0u64 << (8 * n)), 0] };
+            n += 1;
+        }
+        t
+    };
+    let m = unsafe { KEEP.get_unchecked(n) };
+    [(lo & m[0]).swap_bytes(), (hi & m[1]).swap_bytes() | n as u64]
 }
 
 #[inline(always)]
