@@ -45,6 +45,20 @@ extern "C" {
     fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
     fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
     fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut std::ffi::c_void;
+    fn getrlimit(resource: i32, rlim: *mut [u64; 2]) -> i32;
+    fn setrlimit(resource: i32, rlim: *const [u64; 2]) -> i32;
+}
+
+/// Every input file stays open while it is mapped: lift the soft limit on
+/// open files to the hard one.
+fn raise_fd_limit() {
+    let mut r = [0u64; 2];
+    unsafe {
+        if getrlimit(7 /* RLIMIT_NOFILE */, &mut r) == 0 && r[0] < r[1] {
+            r[0] = r[1];
+            setrlimit(7, &r);
+        }
+    }
 }
 
 /// A zero-filled Vec whose pages are not touched yet, advised to use huge pages.
@@ -2093,6 +2107,7 @@ fn run_workers<R: Send, F: Fn(usize) -> R + Sync>(n: usize, f: F) -> Vec<R> {
 
 fn main() {
     let t0 = Instant::now();
+    raise_fd_limit();
     let data = PathBuf::from(env_or("DATA_DIR", "/data"));
     let out = PathBuf::from(env_or("OUTPUT_DIR", "/output"));
     let nthreads: usize = std::env::var("NCPU")
