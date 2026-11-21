@@ -220,7 +220,7 @@ fn collect<const N: usize>(fast: bool, buf: &[u8], begin: usize, limit: usize) -
     let mut rows = Vec::new();
     let mut f = |fs: &[&[u8]; N]| rows.push(fs.iter().map(|v| v.to_vec()).collect::<Vec<_>>());
     if fast {
-        scan_fast::<N, _>(buf, begin, limit, &mut f);
+        scan_masks::<N, _>(buf, begin, limit, &mut f, 1);
     } else {
         scan_lines::<N, _>(buf, begin, limit, &mut f);
     }
@@ -305,7 +305,7 @@ fn bench_scan() {
                     acc = acc.wrapping_add(fs[0].len() as u64 + fs[3].as_ptr() as u64 + fs[6].len() as u64);
                 };
                 if fast {
-                    scan_fast::<7, _>(&buf, begin, buf.len(), &mut f);
+                    scan_masks::<7, _>(&buf, begin, buf.len(), &mut f, 1);
                 } else {
                     scan_lines::<7, _>(&buf, begin, buf.len(), &mut f);
                 }

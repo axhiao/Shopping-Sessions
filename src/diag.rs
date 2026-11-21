@@ -6,6 +6,77 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::time::Instant;
 
+/// Everything printed, kept so it can also be returned inside output rows.
+static LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+macro_rules! dl {
+    ($($a:tt)*) => {{
+        let s = format!($($a)*);
+        eprintln!("{s}");
+        let mut g = LOG.lock().unwrap();
+        g.push_str(s.strip_prefix("[diag] ").unwrap_or(&s));
+        g.push('\n');
+    }};
+}
+
+fn squeeze(l: &str) -> String {
+    let mut t = l.replace('\t', " ");
+    for (a, b) in [
+        ("/sys/kernel/mm/transparent_hugepage/", "thp_"),
+        ("/proc/self/status: ", ""),
+        ("/proc/cpuinfo: ", ""),
+        ("/proc/version: ", ""),
+        ("/proc/self/mountinfo: ", "mnt "),
+        ("threads=", "t"),
+        (" ms wall", "ms"),
+        ("AnonHugePages:", "AHP"),
+        ("us/4K-page cpu", "us/pg"),
+        ("status=Some(0) signal=None | ", ""),
+        ("phase_3_sessions_+_user_daily", "p3"),
+        ("phase_2a_dedup", "dd"),
+        ("phase_1_parse", "p1"),
+        ("link_map_built", "lm"),
+    ] {
+        t = t.replace(a, b);
+    }
+    while t.contains("  ") {
+        t = t.replace("  ", " ");
+    }
+    t.trim().chars().take(200).collect()
+}
+
+/// Text for the extra output rows: first the key facts, then the whole log in pieces.
+pub fn rows() -> Vec<String> {
+    let log = LOG.lock().unwrap().clone();
+    let pick = |keys: &[&str], max: usize| -> Vec<String> {
+        let mut v = Vec::new();
+        for k in keys {
+            for l in log.lines().filter(|l| l.contains(k)).take(max) {
+                let t = squeeze(l);
+                if !v.contains(&t) {
+                    v.push(t);
+                }
+            }
+        }
+        v
+    };
+    let mut out = Vec::new();
+    let mut a = pick(&["model name"], 1);
+    a.extend(pick(&["flags of interest", "Cpus_allowed_list", "processors listed"], 1));
+    a.extend(pick(&["siblings "], 8));
+    a.extend(pick(&["cache index", "Linux version", "hugepage/enabled", "hugepage/defrag", " /data ", " /output ", " /scratch ", "page cache before", "cpu.max", "memory.max"], 4));
+    out.push(a.join("; "));
+    out.push(pick(&["variant ", "synthetic"], 40).join("; "));
+    out.push(pick(&["fault ", "bandwidth ", "random read", "dontneed "], 40).join("; "));
+    out.push(pick(&["pread", "mmap+populate", "write output", "write scratch", "scan fast", "events:", "clicks:", "links:"], 40).join("; "));
+    out.push(pick(&["phase_1_parse="], 40).join("; "));
+    let flat: Vec<char> = log.replace('\t', " ").replace('\n', " | ").chars().collect();
+    for c in flat.chunks(1800) {
+        out.push(c.iter().collect());
+    }
+    out
+}
+
 extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -24,10 +95,10 @@ fn cat(path: &str, max_lines: usize) {
     match fs::read_to_string(path) {
         Ok(s) => {
             for l in s.lines().take(max_lines) {
-                eprintln!("[diag] {path}: {l}");
+                dl!("[diag] {path}: {l}");
             }
         }
-        Err(e) => eprintln!("[diag] {path}: <{e}>"),
+        Err(e) => dl!("[diag] {path}: <{e}>"),
     }
 }
 
@@ -36,7 +107,7 @@ fn grep(path: &str, keys: &[&str], max: usize) {
         let mut n = 0;
         for l in s.lines() {
             if keys.iter().any(|k| l.contains(k)) {
-                eprintln!("[diag] {path}: {l}");
+                dl!("[diag] {path}: {l}");
                 n += 1;
                 if n >= max {
                     break;
@@ -44,7 +115,7 @@ fn grep(path: &str, keys: &[&str], max: usize) {
             }
         }
     } else {
-        eprintln!("[diag] {path}: <unreadable>");
+        dl!("[diag] {path}: <unreadable>");
     }
 }
 
@@ -89,7 +160,7 @@ fn mem_tests(nt: usize) {
             .ok()
             .and_then(|s| s.lines().find(|l| l.starts_with("AnonHugePages")).map(|l| l.to_string()))
             .unwrap_or_default();
-        eprintln!(
+        dl!(
             "[diag] fault thp={thp} threads={nt}: {:.0} ms wall, user {:.2} sys {:.2}, {:.2} GB/s, {:.2} us/4K-page cpu  [{huge}]",
             w * 1e3,
             u,
@@ -136,7 +207,7 @@ fn mem_tests(nt: usize) {
                         }
                     }
                 });
-                eprintln!("[diag] bandwidth {name} threads={nt}: {:.1} GB/s", (nt * SZ) as f64 / w / 1e9);
+                dl!("[diag] bandwidth {name} threads={nt}: {:.1} GB/s", (nt * SZ) as f64 / w / 1e9);
             }
             // random 64-byte reads in the 256 MB block, 8 independent chains
             let (w, _, _) = timed(nt, |i| unsafe {
@@ -151,7 +222,7 @@ fn mem_tests(nt: usize) {
                 }
                 std::hint::black_box(acc);
             });
-            eprintln!("[diag] random read (8 chains) threads={nt}: {:.1} ns/read", w * 1e9 / 4e6);
+            dl!("[diag] random read (8 chains) threads={nt}: {:.1} ns/read", w * 1e9 / 4e6);
         } else {
             let (w, _, _) = timed(nt, |i| unsafe {
                 let p = ptrs[i] as *const u64;
@@ -165,12 +236,12 @@ fn mem_tests(nt: usize) {
                 }
                 std::hint::black_box(acc);
             });
-            eprintln!("[diag] random read thp (8 chains) threads={nt}: {:.1} ns/read", w * 1e9 / 4e6);
+            dl!("[diag] random read thp (8 chains) threads={nt}: {:.1} ns/read", w * 1e9 / 4e6);
         }
         let (w, u, s) = timed(nt, |i| unsafe {
             madvise(ptrs[i] as *mut u8, SZ, 4);
         });
-        eprintln!("[diag] dontneed thp={thp} threads={nt}: {:.0} ms wall, cpu {:.2}", w * 1e3, u + s);
+        dl!("[diag] dontneed thp={thp} threads={nt}: {:.0} ms wall, cpu {:.2}", w * 1e3, u + s);
         for p in ptrs {
             unsafe { munmap(p as *mut u8, SZ) };
         }
@@ -194,7 +265,7 @@ fn io_tests(data: &Path, out: &Path, scratch: &Path, nt: usize) {
                 }
             }
         }
-        eprintln!("[diag] {dir}: {n} files, {bytes} bytes");
+        dl!("[diag] {dir}: {n} files, {bytes} bytes");
     }
     files.sort();
     let total: u64 = files.iter().map(|f| f.1).sum();
@@ -221,7 +292,7 @@ fn io_tests(data: &Path, out: &Path, scratch: &Path, nt: usize) {
             munmap(m, *len as usize);
         }
     }
-    eprintln!("[diag] page cache before reading: {resident} of {pages} pages resident ({:.1} ms to check)", t.elapsed().as_secs_f64() * 1e3);
+    dl!("[diag] page cache before reading: {resident} of {pages} pages resident ({:.1} ms to check)", t.elapsed().as_secs_f64() * 1e3);
     let next = std::sync::atomic::AtomicUsize::new(0);
     for pass in 0..2 {
         next.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -243,7 +314,7 @@ fn io_tests(data: &Path, out: &Path, scratch: &Path, nt: usize) {
                 }
             }
         });
-        eprintln!("[diag] pread pass {pass} threads={nt}: {:.1} ms, {:.2} GB/s, user {:.2} sys {:.2}", w * 1e3, total as f64 / w / 1e9, u, s);
+        dl!("[diag] pread pass {pass} threads={nt}: {:.1} ms, {:.2} GB/s, user {:.2} sys {:.2}", w * 1e3, total as f64 / w / 1e9, u, s);
     }
     next.store(0, std::sync::atomic::Ordering::Relaxed);
     let (w, u, s) = timed(nt, |_| loop {
@@ -270,7 +341,7 @@ fn io_tests(data: &Path, out: &Path, scratch: &Path, nt: usize) {
             munmap(m, len);
         }
     });
-    eprintln!("[diag] mmap+populate+touch+release threads={nt}: {:.1} ms, {:.2} GB/s, user {:.2} sys {:.2}", w * 1e3, total as f64 / w / 1e9, u, s);
+    dl!("[diag] mmap+populate+touch+release threads={nt}: {:.1} ms, {:.2} GB/s, user {:.2} sys {:.2}", w * 1e3, total as f64 / w / 1e9, u, s);
     for (name, dir) in [("output", out), ("scratch", scratch)] {
         let _ = fs::create_dir_all(dir);
         let (w, u, s) = timed(nt, |i| {
@@ -287,7 +358,7 @@ fn io_tests(data: &Path, out: &Path, scratch: &Path, nt: usize) {
         for i in 0..nt {
             let _ = fs::remove_file(dir.join(format!("_diag{i}.tmp")));
         }
-        eprintln!(
+        dl!(
             "[diag] write {name} ({}x32 MB, ok={ok}): {:.1} ms, {:.2} GB/s, user {:.2} sys {:.2}; unlink {:.1} ms",
             nt,
             w * 1e3,
@@ -319,7 +390,7 @@ fn io_tests(data: &Path, out: &Path, scratch: &Path, nt: usize) {
                                 acc = acc.wrapping_add(fs[0].len() as u64 + fs[3].as_ptr() as u64 + fs[6].len() as u64);
                             };
                             if fast {
-                                crate::scan_fast::<7, _>(&buf, begin, buf.len(), &mut f);
+                                crate::scan_masks::<7, _>(&buf, begin, buf.len(), &mut f, 1);
                             } else {
                                 crate::scan_lines::<7, _>(&buf, begin, buf.len(), &mut f);
                             }
@@ -328,7 +399,7 @@ fn io_tests(data: &Path, out: &Path, scratch: &Path, nt: usize) {
                         lines.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                     });
                     let n = lines.load(std::sync::atomic::Ordering::Relaxed);
-                    eprintln!("[diag] scan fast={fast} threads={threads}: {:.2} ns/line/thread", w * 1e9 * threads as f64 / n as f64);
+                    dl!("[diag] scan fast={fast} threads={threads}: {:.2} ns/line/thread", w * 1e9 * threads as f64 / n as f64);
                 }
             }
         }
@@ -443,7 +514,7 @@ fn child(data: &Path, out: &Path, envs: &[(&str, &str)], show: bool) -> f64 {
                     }
                 }
                 use std::os::unix::process::ExitStatusExt;
-                eprintln!(
+                dl!(
                     "[diag]     {} status={:?} signal={:?} | {}",
                     envs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "),
                     o.status.code(),
@@ -452,12 +523,12 @@ fn child(data: &Path, out: &Path, envs: &[(&str, &str)], show: bool) -> f64 {
                 );
                 if !o.status.success() {
                     for l in text.lines().rev().take(6) {
-                        eprintln!("[diag]       child: {l}");
+                        dl!("[diag]       child: {l}");
                     }
                 }
             }
         }
-        Err(e) => eprintln!("[diag]     child failed: {e}"),
+        Err(e) => dl!("[diag]     child failed: {e}"),
     }
     ms
 }
@@ -466,7 +537,7 @@ fn variants(data: &Path, scratch: &Path, nt: usize) {
     let syn = scratch.join("syn");
     let t = Instant::now();
     let bytes = synthesize(data, &syn, 20, nt);
-    eprintln!("[diag] synthetic x20 data: {} MB in {:.0} ms", bytes >> 20, t.elapsed().as_secs_f64() * 1e3);
+    dl!("[diag] synthetic x20 data: {} MB in {:.0} ms", bytes >> 20, t.elapsed().as_secs_f64() * 1e3);
     let out = scratch.join("synout");
     let nts = nt.to_string();
     let half = (nt / 2).max(1).to_string();
@@ -494,7 +565,7 @@ fn variants(data: &Path, scratch: &Path, nt: usize) {
         for r in 0..3 {
             times.push(child(&syn, &out, envs, r == 2));
         }
-        eprintln!("[diag] variant {name}: {:.0} {:.0} {:.0} ms", times[0], times[1], times[2]);
+        dl!("[diag] variant {name}: {:.0} {:.0} {:.0} ms", times[0], times[1], times[2]);
     }
     let _ = fs::remove_dir_all(&out);
     let _ = fs::remove_dir_all(&syn);
@@ -502,17 +573,17 @@ fn variants(data: &Path, scratch: &Path, nt: usize) {
 
 pub fn run(data: &Path, out: &Path, nt: usize) {
     let t0 = Instant::now();
-    eprintln!("[diag] ---- machine");
+    dl!("[diag] ---- machine");
     grep("/proc/cpuinfo", &["model name", "cpu MHz", "cache size", "siblings", "cpu cores"], 6);
     if let Ok(s) = fs::read_to_string("/proc/cpuinfo") {
-        eprintln!("[diag] processors listed: {}", s.lines().filter(|l| l.starts_with("processor")).count());
+        dl!("[diag] processors listed: {}", s.lines().filter(|l| l.starts_with("processor")).count());
         if let Some(l) = s.lines().find(|l| l.starts_with("flags")) {
             let want = [
                 "avx2", "bmi2", "avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512_vbmi", "avx512_vbmi2", "avx512_bitalg",
                 "avx512_vpopcntdq", "vpclmulqdq", "gfni", "vaes", "erms", "fsrm", "hypervisor", "pdpe1gb", "movdir64b",
             ];
             let have: Vec<&str> = l.split_whitespace().filter(|f| want.contains(f)).collect();
-            eprintln!("[diag] flags of interest: {}", have.join(" "));
+            dl!("[diag] flags of interest: {}", have.join(" "));
         }
     }
     grep("/proc/self/status", &["Cpus_allowed_list", "Mems_allowed_list", "Threads"], 4);
@@ -525,7 +596,7 @@ pub fn run(data: &Path, out: &Path, nt: usize) {
                 let b: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(a);
                 for c in a..=b.min(a + 15) {
                     let r = |f: &str| fs::read_to_string(format!("/sys/devices/system/cpu/cpu{c}/{f}")).unwrap_or_default().trim().to_string();
-                    eprintln!(
+                    dl!(
                         "[diag] cpu{c}: siblings {} core {} pkg {} maxfreq {} cur {}",
                         r("topology/thread_siblings_list"),
                         r("topology/core_id"),
@@ -539,7 +610,7 @@ pub fn run(data: &Path, out: &Path, nt: usize) {
     }
     for i in 0..4 {
         let r = |f: &str| fs::read_to_string(format!("/sys/devices/system/cpu/cpu0/cache/index{i}/{f}")).unwrap_or_default().trim().to_string();
-        eprintln!("[diag] cache index{i}: level {} type {} size {} shared {}", r("level"), r("type"), r("size"), r("shared_cpu_list"));
+        dl!("[diag] cache index{i}: level {} type {} size {} shared {}", r("level"), r("type"), r("size"), r("shared_cpu_list"));
     }
     cat("/proc/version", 1);
     grep("/proc/meminfo", &["MemTotal", "MemFree", "MemAvailable", "Cached", "Dirty", "AnonHugePages", "HugePages_Total", "Hugepagesize"], 10);
@@ -567,15 +638,15 @@ pub fn run(data: &Path, out: &Path, nt: usize) {
     }
     grep("/proc/self/mountinfo", &[" /data ", " /output ", " /scratch ", " /tmp ", " / "], 8);
     for k in ["NCPU", "MEM_GB", "DATA_DIR", "OUTPUT_DIR", "SCRATCH_DIR", "HOME"] {
-        eprintln!("[diag] env {k}={:?}", std::env::var(k).ok());
+        dl!("[diag] env {k}={:?}", std::env::var(k).ok());
     }
-    eprintln!("[diag] ---- io ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
+    dl!("[diag] ---- io ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
     let scratch = std::path::PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into()));
     io_tests(data, out, &scratch, nt);
-    eprintln!("[diag] ---- memory ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
+    dl!("[diag] ---- memory ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
     mem_tests(1);
     mem_tests(nt);
-    eprintln!("[diag] ---- pipeline variants on 20x the dev set ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
+    dl!("[diag] ---- pipeline variants on 20x the dev set ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
     variants(data, &scratch, nt);
-    eprintln!("[diag] ---- done ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
+    dl!("[diag] ---- done ({:.0} ms)", t0.elapsed().as_secs_f64() * 1e3);
 }

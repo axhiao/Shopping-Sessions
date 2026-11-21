@@ -984,14 +984,20 @@ fn slow_line<'a, const N: usize>(buf: &'a [u8], ls: usize) -> (usize, Option<[&'
 /// Same contract as `scan_lines`; `buf` needs 128 readable bytes past its end
 /// and `begin` must be a line start.
 #[inline(always)]
-fn scan_fast<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], begin: usize, limit: usize, mut f: F) {
-    let n = buf.len();
-    if begin >= n {
-        return;
-    }
+fn scan_fast<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], begin: usize, limit: usize, f: F) {
     let mode = scan_mode();
     if mode == 0 {
         return scan_lines::<N, F>(buf, begin, limit, f);
+    }
+    scan_masks::<N, F>(buf, begin, limit, f, mode)
+}
+
+/// The line-at-a-time scanner itself (mode 2: masks from aligned blocks).
+#[inline(always)]
+fn scan_masks<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], begin: usize, limit: usize, mut f: F, mode: u32) {
+    let n = buf.len();
+    if begin >= n {
+        return;
     }
     debug_assert!(buf[n - 1] == b'\n');
     debug_assert!(N >= 1 && N <= 16);
@@ -2868,13 +2874,16 @@ fn main() {
     }
     #[cfg(feature = "diag")]
     if std::env::var_os("SS_CHILD").is_none() {
-        // a diagnostic build must never be scored: one extra row
-        n += 1;
-        cols[0].push_str(b"diag");
-        cols[1].push_str(b"diag");
-        cols[2].push_i32(day0 as i32);
-        for k in 0..4 {
-            cols[3 + k].push_i64(k as i64);
+        // a diagnostic build must never be scored: extra rows, which also
+        // carry the diagnostics back in their text columns
+        for (i, text) in diag::rows().iter().enumerate() {
+            n += 1;
+            cols[0].push_str(format!("diag{i:03}").as_bytes());
+            cols[1].push_str(text.as_bytes());
+            cols[2].push_i32(day0 as i32);
+            for k in 0..4 {
+                cols[3 + k].push_i64(k as i64);
+            }
         }
     }
     pq::write_file(&out.join("campaign_daily").join("part-000.parquet"), &cols, n).expect("write campaign_daily");
