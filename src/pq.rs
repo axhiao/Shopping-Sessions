@@ -276,3 +276,382 @@ pub fn write_file(path: &std::path::Path, cols: &[Column], nrows: usize) -> std:
     f.write_all(&t.buf)?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// user_daily writer: rows go straight into small reusable column buffers and
+// are written as a file every few tens of thousands of persons, with
+// dictionary encodings:
+//   user_id       dictionary of the file's persons, one RLE run per person
+//   day           dictionary of the window's days, bit-packed indices
+//   sessions      identity dictionary + bit-packed when small, else PLAIN
+//   events        same
+//   revenue_cents PLAIN INT64
+//   top_category  dictionary of all categories, bit-packed indices
+
+const PERSONS_PER_FILE: usize = 32 << 10;
+/// Values below this may use an identity dictionary.
+const IDENTITY_MAX: u32 = 1 << 12;
+
+pub struct UserWriter {
+    dir: std::path::PathBuf,
+    worker: usize,
+    seq: usize,
+    day0: i32,
+    ndays: usize,
+    /// PLAIN dictionary page of the categories, and their count.
+    cat_dict: Vec<u8>,
+    ncat: usize,
+    // per row
+    days: Vec<u8>,
+    sessions: Vec<u32>,
+    events: Vec<u32>,
+    revenue: Vec<u64>,
+    top: Vec<u16>, // category index, 0xFFFF = null
+    // per person
+    runs: Vec<u32>,
+    names: Vec<u8>, // PLAIN byte arrays
+    person_rows: u32,
+    out: Vec<u8>,
+    tmp: Vec<u8>,
+    pub rows: usize,
+    pub files: usize,
+}
+
+struct Chunk {
+    dict_off: i64, // 0 = no dictionary page
+    data_off: i64,
+    size: i64,
+    encoding: i32,
+}
+
+fn bits_for(max: u32) -> u32 {
+    (32 - max.leading_zeros()).max(1)
+}
+
+/// RLE/bit-packed hybrid: `vals` as bit-packed runs of up to 63 groups of 8.
+fn bitpack<I: Iterator<Item = u32>>(vals: I, bw: u32, out: &mut Vec<u8>) {
+    let mut vals = vals.peekable();
+    while vals.peek().is_some() {
+        let head = out.len();
+        out.push(0);
+        let mut groups = 0usize;
+        let (mut acc, mut nbits) = (0u64, 0u32);
+        while groups < 63 && vals.peek().is_some() {
+            for _ in 0..8 {
+                let v = vals.next().unwrap_or(0) as u64;
+                acc |= v << nbits;
+                nbits += bw;
+                while nbits >= 8 {
+                    out.push(acc as u8);
+                    acc >>= 8;
+                    nbits -= 8;
+                }
+            }
+            // 8 values of bw bits end on a byte boundary
+            groups += 1;
+        }
+        out[head] = ((groups << 1) | 1) as u8;
+    }
+}
+
+fn varint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn dict_page_header(out: &mut Vec<u8>, body: usize, nvalues: usize) {
+    let mut h = Thrift::new();
+    h.i32(1, 2); // DICTIONARY_PAGE
+    h.i32(2, body as i32);
+    h.i32(3, body as i32);
+    h.begin_struct(7);
+    h.i32(1, nvalues as i32);
+    h.i32(2, 0); // PLAIN
+    h.end_struct();
+    h.buf.push(0);
+    out.extend_from_slice(&h.buf);
+}
+
+fn data_page_header(out: &mut Vec<u8>, body: usize, nrows: usize, encoding: i32) {
+    let mut h = Thrift::new();
+    h.i32(1, 0); // DATA_PAGE
+    h.i32(2, body as i32);
+    h.i32(3, body as i32);
+    h.begin_struct(5);
+    h.i32(1, nrows as i32);
+    h.i32(2, encoding);
+    h.i32(3, 3); // RLE
+    h.i32(4, 3); // RLE
+    h.end_struct();
+    h.buf.push(0);
+    out.extend_from_slice(&h.buf);
+}
+
+const PLAIN: i32 = 0;
+const RLE_DICTIONARY: i32 = 8;
+
+impl UserWriter {
+    pub fn new(dir: &std::path::Path, worker: usize, day0: i32, ndays: usize, cat_names: &[Vec<u8>]) -> UserWriter {
+        let mut cat_dict = Vec::new();
+        for c in cat_names {
+            cat_dict.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            cat_dict.extend_from_slice(c);
+        }
+        let rows = PERSONS_PER_FILE * 5;
+        UserWriter {
+            dir: dir.to_path_buf(),
+            worker,
+            seq: 0,
+            day0,
+            ndays,
+            cat_dict,
+            ncat: cat_names.len(),
+            days: Vec::with_capacity(rows),
+            sessions: Vec::with_capacity(rows),
+            events: Vec::with_capacity(rows),
+            revenue: Vec::with_capacity(rows),
+            top: Vec::with_capacity(rows),
+            runs: Vec::with_capacity(PERSONS_PER_FILE),
+            names: Vec::with_capacity(PERSONS_PER_FILE * 16),
+            person_rows: 0,
+            out: Vec::new(),
+            tmp: Vec::new(),
+            rows: 0,
+            files: 0,
+        }
+    }
+
+    /// One row of the current person; `top` < 0 is null.
+    #[inline(always)]
+    pub fn row(&mut self, day_idx: usize, sessions: u32, events: u32, revenue: u64, top: i32) {
+        self.days.push(day_idx as u8);
+        self.sessions.push(sessions);
+        self.events.push(events);
+        self.revenue.push(revenue);
+        self.top.push(top as u16);
+        self.person_rows += 1;
+    }
+
+    /// Ends the current person (who has at least one row).
+    #[inline(always)]
+    pub fn end_person(&mut self, name: &[u8]) {
+        self.names.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        self.names.extend_from_slice(name);
+        self.runs.push(self.person_rows);
+        self.person_rows = 0;
+        if self.runs.len() >= PERSONS_PER_FILE {
+            self.flush();
+        }
+    }
+
+    pub fn finish(&mut self, always: bool) {
+        if !self.runs.is_empty() || (always && self.files == 0) {
+            self.flush();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn flush(&mut self) {
+        let nrows = self.days.len();
+        let mut out = std::mem::take(&mut self.out);
+        let mut tmp = std::mem::take(&mut self.tmp);
+        out.clear();
+        out.extend_from_slice(b"PAR1");
+        let mut chunks: Vec<Chunk> = Vec::new();
+        if nrows > 0 {
+            // user_id
+            {
+                let dict_off = out.len() as i64;
+                dict_page_header(&mut out, self.names.len(), self.runs.len());
+                out.extend_from_slice(&self.names);
+                let bw = bits_for(self.runs.len() as u32 - 1);
+                let bytes = (bw as usize).div_ceil(8);
+                tmp.clear();
+                tmp.push(bw as u8);
+                for (i, &n) in self.runs.iter().enumerate() {
+                    varint(&mut tmp, (n as u64) << 1);
+                    tmp.extend_from_slice(&(i as u32).to_le_bytes()[..bytes]);
+                }
+                let data_off = out.len() as i64;
+                data_page_header(&mut out, tmp.len(), nrows, RLE_DICTIONARY);
+                out.extend_from_slice(&tmp);
+                chunks.push(Chunk { dict_off, data_off, size: out.len() as i64 - dict_off, encoding: RLE_DICTIONARY });
+            }
+            // day
+            {
+                let dict_off = out.len() as i64;
+                dict_page_header(&mut out, self.ndays * 4, self.ndays);
+                for d in 0..self.ndays {
+                    out.extend_from_slice(&(self.day0 + d as i32).to_le_bytes());
+                }
+                let bw = bits_for(self.ndays as u32 - 1);
+                tmp.clear();
+                tmp.push(bw as u8);
+                bitpack(self.days.iter().map(|&d| d as u32), bw, &mut tmp);
+                let data_off = out.len() as i64;
+                data_page_header(&mut out, tmp.len(), nrows, RLE_DICTIONARY);
+                out.extend_from_slice(&tmp);
+                chunks.push(Chunk { dict_off, data_off, size: out.len() as i64 - dict_off, encoding: RLE_DICTIONARY });
+            }
+            // sessions, events
+            for vals in [&self.sessions, &self.events] {
+                let max = vals.iter().copied().max().unwrap_or(0);
+                if max < IDENTITY_MAX {
+                    let dict_off = out.len() as i64;
+                    dict_page_header(&mut out, (max as usize + 1) * 4, max as usize + 1);
+                    for v in 0..=max {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                    let bw = bits_for(max);
+                    tmp.clear();
+                    tmp.push(bw as u8);
+                    bitpack(vals.iter().copied(), bw, &mut tmp);
+                    let data_off = out.len() as i64;
+                    data_page_header(&mut out, tmp.len(), nrows, RLE_DICTIONARY);
+                    out.extend_from_slice(&tmp);
+                    chunks.push(Chunk { dict_off, data_off, size: out.len() as i64 - dict_off, encoding: RLE_DICTIONARY });
+                } else {
+                    let data_off = out.len() as i64;
+                    data_page_header(&mut out, nrows * 4, nrows, PLAIN);
+                    for v in vals.iter() {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                    chunks.push(Chunk { dict_off: 0, data_off, size: out.len() as i64 - data_off, encoding: PLAIN });
+                }
+            }
+            // revenue_cents
+            {
+                let data_off = out.len() as i64;
+                data_page_header(&mut out, nrows * 8, nrows, PLAIN);
+                for v in self.revenue.iter() {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                chunks.push(Chunk { dict_off: 0, data_off, size: out.len() as i64 - data_off, encoding: PLAIN });
+            }
+            // top_category
+            {
+                let dict_off = out.len() as i64;
+                dict_page_header(&mut out, self.cat_dict.len(), self.ncat);
+                out.extend_from_slice(&self.cat_dict);
+                tmp.clear();
+                tmp.extend_from_slice(&[0u8; 4]);
+                bitpack(self.top.iter().map(|&t| (t != 0xFFFF) as u32), 1, &mut tmp);
+                let dl = (tmp.len() - 4) as u32;
+                tmp[..4].copy_from_slice(&dl.to_le_bytes());
+                let bw = bits_for(self.ncat as u32 - 1);
+                tmp.push(bw as u8);
+                bitpack(self.top.iter().filter(|&&t| t != 0xFFFF).map(|&t| t as u32), bw, &mut tmp);
+                let data_off = out.len() as i64;
+                data_page_header(&mut out, tmp.len(), nrows, RLE_DICTIONARY);
+                out.extend_from_slice(&tmp);
+                chunks.push(Chunk { dict_off, data_off, size: out.len() as i64 - dict_off, encoding: RLE_DICTIONARY });
+            }
+        }
+        // footer
+        let cols: [(&str, Kind, bool); 6] = [
+            ("user_id", Kind::Str, false),
+            ("day", Kind::Date, false),
+            ("sessions", Kind::I32, false),
+            ("events", Kind::I32, false),
+            ("revenue_cents", Kind::I64, false),
+            ("top_category", Kind::Str, true),
+        ];
+        let mut t = Thrift::new();
+        t.i32(1, 1);
+        t.list(2, 12, cols.len() + 1);
+        t.push_scope();
+        t.bin(4, b"schema");
+        t.i32(5, cols.len() as i32);
+        t.end_struct();
+        for &(name, kind, optional) in &cols {
+            t.push_scope();
+            t.i32(1, ptype(kind));
+            t.i32(3, if optional { 1 } else { 0 });
+            t.bin(4, name.as_bytes());
+            match kind {
+                Kind::Str => {
+                    t.i32(6, 0);
+                    t.begin_struct(10);
+                    t.begin_struct(1);
+                    t.end_struct();
+                    t.end_struct();
+                }
+                Kind::Date => {
+                    t.i32(6, 6);
+                    t.begin_struct(10);
+                    t.begin_struct(6);
+                    t.end_struct();
+                    t.end_struct();
+                }
+                _ => {}
+            }
+            t.end_struct();
+        }
+        t.i64(3, nrows as i64);
+        if nrows > 0 {
+            t.list(4, 12, 1);
+            t.push_scope();
+            t.list(1, 12, cols.len());
+            let mut total = 0i64;
+            for (&(name, kind, _), c) in cols.iter().zip(&chunks) {
+                total += c.size;
+                let first = if c.dict_off != 0 { c.dict_off } else { c.data_off };
+                t.push_scope();
+                t.i64(2, first);
+                t.begin_struct(3);
+                t.i32(1, ptype(kind));
+                if c.encoding == PLAIN {
+                    t.list(2, 5, 2);
+                    t.list_i32(PLAIN);
+                    t.list_i32(3);
+                } else {
+                    t.list(2, 5, 3);
+                    t.list_i32(PLAIN);
+                    t.list_i32(3);
+                    t.list_i32(RLE_DICTIONARY);
+                }
+                t.list(3, 8, 1);
+                t.list_bin(name.as_bytes());
+                t.i32(4, 0);
+                t.i64(5, nrows as i64);
+                t.i64(6, c.size);
+                t.i64(7, c.size);
+                t.i64(9, c.data_off);
+                if c.dict_off != 0 {
+                    t.i64(11, c.dict_off);
+                }
+                t.end_struct();
+                t.end_struct();
+            }
+            t.i64(2, total);
+            t.i64(3, nrows as i64);
+            t.end_struct();
+        } else {
+            t.list(4, 12, 0);
+        }
+        t.bin(6, b"shopping-sessions");
+        t.buf.push(0);
+        let n = t.buf.len() as u32;
+        out.extend_from_slice(&t.buf);
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(b"PAR1");
+        let path = self.dir.join(format!("part-{:03}-{:04}.parquet", self.worker, self.seq));
+        std::fs::write(&path, &out).expect("write user_daily");
+        self.seq += 1;
+        self.files += 1;
+        self.rows += nrows;
+        self.days.clear();
+        self.sessions.clear();
+        self.events.clear();
+        self.revenue.clear();
+        self.top.clear();
+        self.runs.clear();
+        self.names.clear();
+        self.out = out;
+        self.tmp = tmp;
+    }
+}
