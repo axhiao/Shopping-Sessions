@@ -1512,7 +1512,8 @@ enum Kind {
 
 struct InFile {
     kind: Kind,
-    file: File,
+    /// Reopened for the few chunks that cannot be read through the mapping.
+    path: PathBuf,
     len: u64,
     /// Read-only mapping of the file followed by at least 4 KB of zeros, or
     /// null when mapping failed.
@@ -1612,7 +1613,8 @@ fn chunk_bytes<'a>(inf: &'a InFile, c: &Chunk, buf: &'a mut Vec<u8>) -> (&'a [u8
         let stop = if c.end >= inf.len { inf.len as usize } else { find_byte(all, c.end as usize - 1, b'\n') + 1 };
         (&all[..stop], begin, c.end as usize)
     } else {
-        let (b, l) = read_chunk(&inf.file, inf.len, c, buf);
+        let file = File::open(&inf.path).expect("open");
+        let (b, l) = read_chunk(&file, inf.len, c, buf);
         (&buf[..], b, l)
     }
 }
@@ -2222,7 +2224,9 @@ fn main() {
             let file = File::open(&p).expect("open");
             let map = if use_mmap { map_file(&file, len as usize) } else { std::ptr::null() };
             let ends_nl = !map.is_null() && unsafe { *map.add(len as usize - 1) } == b'\n';
-            files.push(InFile { kind, file, len, map, ends_nl });
+            // the mapping outlives the descriptor
+            drop(file);
+            files.push(InFile { kind, path: p, len, map, ends_nl });
         }
     }
     let mut chunks: Vec<Chunk> = Vec::new();
