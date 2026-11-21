@@ -2174,31 +2174,42 @@ fn user_code_key(code: u64) -> Key {
     key_of(&buf[..n + 1])
 }
 
-/// The key under which the sampled ID numbers all have a sequence number
-/// below `bound`, if there is one: tries every number for the first sample.
+/// The key under which the sampled ID numbers have sequence numbers below
+/// `bound`, if there is one. An ID that is not a generated one must not hide
+/// the key: up to one sample in eight may fall outside, and four pairs of
+/// samples take turns as the anchor.
 fn find_seq_key(sample: &[u64], bound: u64, nthreads: usize) -> Option<u64> {
     if sample.len() < 8 || bound < 2 {
         return None;
     }
     let ms: Vec<u64> = sample.iter().map(|&v| unmix(v)).collect();
-    let (ma, delta) = (ms[0], ms[0] ^ ms[1]);
+    let allowed = ms.len() / 8;
+    (0..4).find_map(|pair| seq_key_from(&ms, 2 * pair, bound, allowed, nthreads))
+}
+
+/// Tries every number for sample `a` (and keeps the keys that also put sample
+/// `a + 1` below `bound`); the smallest key that leaves at most `allowed`
+/// samples outside.
+fn seq_key_from(ms: &[u64], a: usize, bound: u64, allowed: usize, nthreads: usize) -> Option<u64> {
+    let (ma, delta) = (ms[a], ms[a] ^ ms[a + 1]);
     let found = AtomicU64::new(u64::MAX);
     let per = bound.div_ceil(nthreads as u64);
     std::thread::scope(|sc| {
         for t in 0..nthreads as u64 {
-            let (ms, found) = (&ms, &found);
+            let found = &found;
             sc.spawn(move || {
                 let (lo, hi) = ((t * per).min(bound), ((t + 1) * per).min(bound));
-                // x = n * C1 for the candidate number n of the first sample
+                // x = n * C1 for the candidate number n of the anchor
                 let mut x = lo.wrapping_mul(SCR_C1) & M40;
                 let mut n = lo;
                 while n < hi {
                     let stop = (n + (1 << 16)).min(hi);
                     while n < stop {
-                        // with key = ma ^ x, the second sample's number is
+                        // with key = ma ^ x, the next sample's number is
                         if (delta ^ x).wrapping_mul(SCR_C1I) & M40 < bound {
                             let key = ma ^ x;
-                            if ms.iter().all(|&m| (m ^ key).wrapping_mul(SCR_C1I) & M40 < bound) {
+                            let outside = ms.iter().filter(|&&m| (m ^ key).wrapping_mul(SCR_C1I) & M40 >= bound).count();
+                            if outside <= allowed {
                                 found.fetch_min(key, Ordering::Relaxed);
                             }
                         }
