@@ -2112,6 +2112,68 @@ fn id_number(letter: u8, s: &[u8]) -> Option<u64> {
     base36_40(unsafe { std::slice::from_raw_parts(s.as_ptr().add(1), s.len() - 1) })
 }
 
+/// A 'u' ID of up to 9 bytes whose other bytes are digits or lower-case
+/// letters, packed in 52 bits: six bits per byte (bits 0-4 and 6 of the byte:
+/// that tells every such byte apart), the number of bytes after the 'u' in
+/// bits 48-51. Exact: `user_code_key` gives the ID's key back. `s` needs 16
+/// readable bytes from its start.
+#[inline(always)]
+fn user_code(s: &[u8]) -> Option<u64> {
+    let n = s.len().wrapping_sub(1);
+    if n.wrapping_sub(1) >= 8 || unsafe { *s.as_ptr() } != b'u' {
+        return None;
+    }
+    let x = unsafe { (s.as_ptr().add(1) as *const u64).read_unaligned() };
+    // '0' in the bytes past the ID
+    let hi = (!0u64 << 1) << (8 * n - 1);
+    let y = (x & !hi) | (0x3030_3030_3030_3030 & hi);
+    #[cfg(all(target_feature = "ssse3", target_feature = "bmi2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let c = _mm_cvtsi64_si128(y as i64);
+        let alpha = _mm_cmpgt_epi8(c, _mm_set1_epi8(0x60));
+        let d = _mm_sub_epi8(c, _mm_add_epi8(_mm_set1_epi8(0x30), _mm_and_si128(alpha, _mm_set1_epi8(0x27))));
+        let lim = _mm_add_epi8(_mm_set1_epi8(9), _mm_and_si128(alpha, _mm_set1_epi8(26)));
+        if _mm_cvtsi128_si64(_mm_subs_epu8(d, lim)) != 0 {
+            return None;
+        }
+        Some(_pext_u64(y, 0x5F5F_5F5F_5F5F_5F5F) | (n as u64) << 48)
+    }
+    #[cfg(not(all(target_feature = "ssse3", target_feature = "bmi2")))]
+    {
+        let mut code = 0u64;
+        for i in 0..8 {
+            let c = (y >> (8 * i)) as u8;
+            if !(c.is_ascii_digit() || c.is_ascii_lowercase()) {
+                return None;
+            }
+            code |= (((c & 0x1F) | ((c & 0x40) >> 1)) as u64) << (6 * i);
+        }
+        Some(code | (n as u64) << 48)
+    }
+}
+
+/// The key of the ID packed by `user_code`.
+#[inline(always)]
+fn user_code_key(code: u64) -> Key {
+    let n = (code >> 48) as usize;
+    #[cfg(target_feature = "bmi2")]
+    let y = unsafe { std::arch::x86_64::_pdep_u64(code, 0x5F5F_5F5F_5F5F_5F5F) } | 0x2020_2020_2020_2020;
+    #[cfg(not(target_feature = "bmi2"))]
+    let y = {
+        let mut y = 0u64;
+        for i in 0..8 {
+            let v = (code >> (6 * i)) as u8 & 0x3F;
+            y |= (((v & 0x1F) | ((v & 0x20) << 1) | 0x20) as u64) << (8 * i);
+        }
+        y
+    };
+    let mut buf = [0u8; 32];
+    buf[0] = b'u';
+    buf[1..9].copy_from_slice(&y.to_le_bytes());
+    key_of(&buf[..n + 1])
+}
+
 /// The key of the ID `id_number` reads `v` from.
 fn id_key(letter: u8, v: u64) -> Key {
     let mut buf = [0u8; 32];
@@ -2187,9 +2249,9 @@ struct IxCfg {
 
 /// An event on the sequence-number path (16 bytes), partitioned by number.
 /// a: bits 0..16 the slot, 16..40 ingest (as in RecD), 40..64 user (high 24
-/// bits). b: bits 0..16 user (low 16), 16..47 ts (ms from the window start),
-/// then the flags. `user` is the number of a 'u' ID, or with X_ODD the index
-/// of its key in the partition's side list. A purchase is followed by one
+/// bits). b: bits 0..28 user (low 28), 28..59 ts (ms from the window start),
+/// then the flags. `user` is a `user_code`, or with X_ODD the index of the
+/// user's key in the partition's side list. A purchase is followed by one
 /// more record: a = price | category << 32.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -2198,9 +2260,9 @@ struct RecX {
     b: u64,
 }
 
-const X_PURCHASE: u64 = 1 << 47;
-const X_VALID: u64 = 1 << 48;
-const X_ODD: u64 = 1 << 49;
+const X_PURCHASE: u64 = 1 << 59;
+const X_VALID: u64 = 1 << 60;
+const X_ODD: u64 = 1 << 61;
 
 impl RecX {
     #[inline(always)]
@@ -2213,11 +2275,11 @@ impl RecX {
     }
     #[inline(always)]
     fn user(&self) -> u64 {
-        (self.a >> 40) << 16 | (self.b & 0xFFFF)
+        (self.a >> 40) << 28 | (self.b & 0xFFF_FFFF)
     }
     #[inline(always)]
     fn ts(&self) -> u32 {
-        ((self.b >> 16) & 0x7FFF_FFFF) as u32
+        ((self.b >> 28) & 0x7FFF_FFFF) as u32
     }
 }
 
@@ -2646,7 +2708,7 @@ unsafe fn event_ix<'a, S: Fields<'a>>(ctx: &Ctx, ix: &IxCfg, dc: &mut DateCache,
         o.ix.push(part, RecX { a, b: 0 });
         return;
     }
-    let (user, odd) = match id_number(b'u', f1) {
+    let (user, odd) = match user_code(f1) {
         Some(v) => (v, 0),
         None => {
             let list = o.ixodd.get_unchecked_mut(part);
@@ -2655,8 +2717,8 @@ unsafe fn event_ix<'a, S: Fields<'a>>(ctx: &Ctx, ix: &IxCfg, dc: &mut DateCache,
         }
     };
     let purchase = if ty == T_PURCHASE { X_PURCHASE } else { 0 };
-    let b = (user & 0xFFFF) | (((ts - ctx.ws) as u64) << 16) | purchase | X_VALID | odd;
-    o.ix.push(part, RecX { a: a | ((user >> 16) << 40), b });
+    let b = (user & 0xFFF_FFFF) | (((ts - ctx.ws) as u64) << 28) | purchase | X_VALID | odd;
+    o.ix.push(part, RecX { a: a | ((user >> 28) << 40), b });
     if purchase != 0 {
         o.ix.push(part, RecX { a: pc.0 as u64 | (pc.1 as u64) << 32, b: 0 });
     }
@@ -3474,7 +3536,7 @@ fn main() {
     }
     // a partition of numbers is dense: 2^shift events, their few extra copies
     // and the purchases' second records, spread over the threads
-    let res_ix = if ix.on { ((1usize << ix.shift) * 9 / 8 / nthreads) * 4 / 3 + 64 } else { 4 };
+    let res_ix = if ix.on { ((1usize << ix.shift) * 9 / 8 / nthreads) * 5 / 4 + 64 } else { 4 };
     // with sequence numbers the general path is for the odd rows only
     let (res_dd, res_pay1) = if ix.on { (res_dd / 8 + 64, res_pay / 8 + 64) } else { (res_dd, res_pay) };
     lap("chunks");
@@ -3784,7 +3846,8 @@ fn main() {
     let pb_barrier = std::sync::Barrier::new(nthreads);
     let pb: Vec<PbOut> = if ix.on {
         run_workers(nthreads, |_| {
-            let mut words: Parts<u32, 16> = Parts::new(pc, res_pay * 2 + 64);
+            // (a word per event and five per run: `res_pay` words leave a third to spare)
+            let mut words: Parts<u32, 16> = Parts::new(pc, res_pay);
             let mut pur: Vec<PVec<(u32, u32)>> = (0..pc).map(|_| PVec::with_capacity(res_pay / 24 + 16)).collect();
             let mut pesc: Vec<PVec<Key>> = (0..pc).map(|_| PVec::with_capacity(16)).collect();
             let mut table = vec![u64::MAX; 1usize << ix.shift];
@@ -3857,9 +3920,10 @@ fn main() {
                                 (key, h)
                             }
                         } else {
-                            let ce = unsafe { cache.get_unchecked_mut(user as usize % UC) };
+                            // (the low bits of a code are its first byte's)
+                            let ce = unsafe { cache.get_unchecked_mut((user ^ (user >> 23)) as usize % UC) };
                             if ce.0 != user {
-                                let key = id_key(b'u', user);
+                                let key = user_code_key(user);
                                 let h = hk(&key);
                                 *ce = if linkmap.maybe_linked(h) {
                                     let p = linkmap.person(&key, h);
