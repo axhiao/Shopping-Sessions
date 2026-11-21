@@ -2241,6 +2241,12 @@ struct P3 {
     pend_days: Vec<u32>,
     catsum: Vec<u64>,
     touched: Vec<u32>,
+    /// One person's events by 30-minute bucket: [min ts, max ts, count, 0]
+    /// (empty: [u32::MAX, 0, 0, 0]), and which buckets are in use.
+    cell: Vec<[u32; 4]>,
+    bits: Vec<u64>,
+    /// The person's purchases (ts << 32 | x).
+    purs: Vec<u64>,
 }
 
 struct Geo {
@@ -2249,8 +2255,13 @@ struct Geo {
     organic: u32,
 }
 
-/// `evs`: the person's events as ts << 32 | x, sorted; `pur`: (price, cat)
-/// for the purchase indices in x.
+/// `evs`: the person's events as ts << 32 | x, in any order; `pur`: (price,
+/// cat) for the purchase indices in x.
+///
+/// Events are not sorted: two events less than 30 minutes apart are always in
+/// one session, so events are summarized per 30-minute bucket (min, max,
+/// count) and sessions are built from the buckets in time order: a session
+/// breaks between two used buckets iff min(next) - max(previous) > 30 min.
 /// `cls`: the person's clicks as ts << 32 | index into `camps`, sorted by ts,
 /// ties by click id descending (so the last of equal ts has the smallest id).
 fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u32)], cls: &[u64], camps: &[u32]) {
@@ -2342,42 +2353,74 @@ fn process_person(g: &Geo, st: &mut P3, person: Key, evs: &[u64], pur: &[(u32, u
     }
 
     for &e in evs {
-        let t = (e >> 32) as i64;
-        if s_start < 0 || t - prev_t > GAP {
-            if s_start >= 0 {
-                finish_session!();
-            }
-            s_start = t;
-            s_rev = 0;
-            s_purch = false;
-            let day = (g.ws + t).div_euclid(DAY);
-            s_didx = (day - g.day0) as usize;
-            if day != cur_day {
-                if cur_day != i64::MIN {
-                    flush_day!();
-                    d_sessions = 0;
-                    d_events = 0;
-                    d_rev = 0;
-                }
-                cur_day = day;
-            }
-            d_sessions += 1;
+        let t = (e >> 32) as u32;
+        let b = (t / GAP as u32) as usize;
+        unsafe {
+            *st.bits.get_unchecked_mut(b >> 6) |= 1 << (b & 63);
+            let c = st.cell.get_unchecked_mut(b);
+            c[0] = c[0].min(t);
+            c[1] = c[1].max(t);
+            c[2] += 1;
         }
-        prev_t = t;
-        d_events += 1;
         if e as u32 & PURCHASE != 0 {
-            let (p, c) = unsafe { *pur.get_unchecked((e as u32 & !PURCHASE) as usize) };
-            let p = p as u64;
-            s_rev += p;
-            s_purch = true;
-            d_rev += p;
-            let c = c as usize;
-            if st.catsum[c] == 0 {
-                st.touched.push(c as u32);
-            }
-            st.catsum[c] += p;
+            st.purs.push(e);
         }
     }
+    if st.purs.len() > 1 {
+        st.purs.sort_unstable();
+    }
+    let mut pi = 0usize;
+    for wi in 0..st.bits.len() {
+        let mut word = st.bits[wi];
+        if word == 0 {
+            continue;
+        }
+        st.bits[wi] = 0;
+        while word != 0 {
+            let b = wi * 64 + word.trailing_zeros() as usize;
+            word &= word - 1;
+            let c = std::mem::replace(unsafe { st.cell.get_unchecked_mut(b) }, [u32::MAX, 0, 0, 0]);
+            let (t, last) = (c[0] as i64, c[1] as i64);
+            if s_start < 0 || t - prev_t > GAP {
+                if s_start >= 0 {
+                    finish_session!();
+                }
+                s_start = t;
+                s_rev = 0;
+                s_purch = false;
+                let day = (g.ws + t).div_euclid(DAY);
+                s_didx = (day - g.day0) as usize;
+                if day != cur_day {
+                    if cur_day != i64::MIN {
+                        flush_day!();
+                        d_sessions = 0;
+                        d_events = 0;
+                        d_rev = 0;
+                    }
+                    cur_day = day;
+                }
+                d_sessions += 1;
+            }
+            prev_t = last;
+            d_events += c[2];
+            // the purchases of this bucket
+            while pi < st.purs.len() && (st.purs[pi] >> 32) as i64 <= last {
+                let e = st.purs[pi];
+                pi += 1;
+                let (p, c) = unsafe { *pur.get_unchecked((e as u32 & !PURCHASE) as usize) };
+                let p = p as u64;
+                s_rev += p;
+                s_purch = true;
+                d_rev += p;
+                let c = c as usize;
+                if st.catsum[c] == 0 {
+                    st.touched.push(c as u32);
+                }
+                st.catsum[c] += p;
+            }
+        }
+    }
+    st.purs.clear();
     if s_start >= 0 {
         finish_session!();
         flush_day!();
@@ -2914,6 +2957,8 @@ fn main() {
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
     let geo = Geo { ws, day0, organic: ncamp as u32 };
+    // 30-minute buckets over the window (event times are 31-bit offsets from its start)
+    let nbuckets = ((((we - ws).clamp(0, 1 << 31) / GAP) as usize + 2) + 63) / 64 * 64;
     let ncat = ctx.cat_names.len();
     let _ = fs::create_dir_all(out.join("user_daily"));
     let _ = fs::create_dir_all(out.join("campaign_daily"));
@@ -2939,6 +2984,9 @@ fn main() {
             pend_days: Vec::new(),
             catsum: vec![0; ncat],
             touched: Vec::new(),
+            cell: vec![[u32::MAX, 0, 0, 0]; nbuckets],
+            bits: vec![0; nbuckets / 64],
+            purs: Vec::new(),
         };
         let mut lid = LocalIds::new();
         lid.reset(max_part / 16);
@@ -3064,12 +3112,6 @@ fn main() {
                 *f += 1;
             }
             tick!(2);
-            for p in 0..np {
-                let ev = &mut sorted[start[p] as usize..start[p + 1] as usize];
-                if ev.len() > 1 {
-                    ev.sort_unstable();
-                }
-            }
             tick!(5);
             for p in 0..np {
                 let cl = &mut csorted[cstart[p] as usize..cstart[p + 1] as usize];
