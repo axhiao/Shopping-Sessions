@@ -251,43 +251,41 @@ impl<T: Copy> PVec<T> {
 struct Parts<T: Copy, const K: usize> {
     out: Vec<PVec<T>>,
     buf: Vec<[T; K]>,
-    n: Vec<u32>,
+    /// Records pushed so far, per partition; the low bits are the fill of the
+    /// staging line (K is a power of two).
+    cnt: Vec<u32>,
 }
 
 impl<T: Copy, const K: usize> Parts<T, K> {
     fn new(parts: usize, reserve: usize) -> Self {
-        assert!(K * std::mem::size_of::<T>() % 64 == 0);
+        assert!(K * std::mem::size_of::<T>() % 64 == 0 && K.is_power_of_two());
         let reserve = reserve.div_ceil(K) * K;
         let mut buf = Vec::with_capacity(parts);
         unsafe {
             buf.set_len(parts);
             std::ptr::write_bytes(buf.as_mut_ptr(), 0, parts);
         }
-        Parts { out: (0..parts).map(|_| PVec::with_capacity(reserve)).collect(), buf, n: vec![0; parts] }
+        Parts { out: (0..parts).map(|_| PVec::with_capacity(reserve)).collect(), buf, cnt: vec![0; parts] }
     }
-    /// The index the next record pushed to partition q will get.
+    /// Appends `v` to partition q; returns the index it got there.
     #[inline(always)]
-    fn next_index(&self, q: usize) -> usize {
-        unsafe { self.out.get_unchecked(q).len + *self.n.get_unchecked(q) as usize }
-    }
-    #[inline(always)]
-    fn push(&mut self, q: usize, v: T) {
+    fn push(&mut self, q: usize, v: T) -> usize {
         unsafe {
-            let k = *self.n.get_unchecked(q) as usize;
+            let c = *self.cnt.get_unchecked(q);
+            *self.cnt.get_unchecked_mut(q) = c + 1;
+            let k = c as usize & (K - 1);
             if k + 1 == K {
                 #[cfg(target_feature = "avx2")]
                 if std::mem::size_of::<T>() == 16 || std::mem::size_of::<T>() == 32 {
                     self.flush_with(q, v);
-                    *self.n.get_unchecked_mut(q) = 0;
-                    return;
+                    return c as usize;
                 }
                 *self.buf.get_unchecked_mut(q).get_unchecked_mut(k) = v;
                 self.flush(q);
-                *self.n.get_unchecked_mut(q) = 0;
             } else {
                 *self.buf.get_unchecked_mut(q).get_unchecked_mut(k) = v;
-                *self.n.get_unchecked_mut(q) = (k + 1) as u32;
             }
+            c as usize
         }
     }
     /// Writes out partition q's staged K - 1 records followed by `v`. The last
@@ -355,7 +353,7 @@ impl<T: Copy, const K: usize> Parts<T, K> {
     /// Writes out the staged remainders and returns the partitions.
     fn finish(mut self) -> Vec<PVec<T>> {
         for q in 0..self.out.len() {
-            let k = self.n[q] as usize;
+            let k = self.cnt[q] as usize & (K - 1);
             for j in 0..k {
                 let v = self.buf[q][j];
                 self.out[q].push(v);
@@ -2191,18 +2189,12 @@ struct EvSlot {
     linked: bool,
 }
 
-#[derive(Clone, Copy)]
-struct EvBatch {
-    n: usize,
-    s: [EvSlot; EB],
-}
-
 /// Pipeline stage 2: the filter words were prefetched while parsing; decide
 /// which users need a probe and prefetch their slots.
 #[inline(always)]
-fn stage2(b: &mut EvBatch, lm: &LinkMap) {
-    for j in 0..b.n {
-        let e = unsafe { b.s.get_unchecked_mut(j) };
+fn stage2(base: *mut EvSlot, n: usize, lm: &LinkMap) {
+    for j in 0..n {
+        let e = unsafe { &mut *base.add(j) };
         let linked = lm.maybe_linked(e.h);
         if linked {
             lm.prefetch(e.h);
@@ -2212,30 +2204,29 @@ fn stage2(b: &mut EvBatch, lm: &LinkMap) {
 }
 
 #[inline(always)]
-fn flush_batch(b: &mut EvBatch, lm: &LinkMap, o: &mut P1Work) {
-    for j in 0..b.n {
-        let e = unsafe { b.s.get_unchecked(j) };
+fn flush_batch(base: *const EvSlot, n: usize, lm: &LinkMap, o: &mut P1Work) {
+    let (pc_shift, pa_shift) = (64 - pc_bits(), 64 - pa_bits());
+    for j in 0..n {
+        let e = unsafe { &*base.add(j) };
         let mut person = e.person;
         let mut ph = e.h;
         if e.linked {
             person = lm.person(&person, ph);
             ph = hk(&person);
         }
-        let q = (ph >> (64 - pc_bits())) as usize;
+        let q = (ph >> pc_shift) as usize;
         if e.purchase != 0 {
             unsafe { o.pur.get_unchecked_mut(q) }.push(e.pc);
         }
         let rec = RecP { p: compact(&person, unsafe { o.pesc.get_unchecked_mut(q) }), t: e.ts | (e.purchase << 31) };
         let mut d = e.dd;
-        let idx = o.pay.next_index(q) as u64;
+        let idx = o.pay.push(q, rec) as u64;
         if idx >= 1 << IDX_BITS {
             IDX_OVERFLOW.store(true, Ordering::Relaxed);
         }
         d.b |= HAS_PAY | ((q as u64) << IDX_BITS) | (idx & ((1 << IDX_BITS) - 1));
-        o.pay.push(q, rec);
-        o.dd.push((d.fp >> (64 - pa_bits())) as usize, d);
+        o.dd.push((d.fp >> pa_shift) as usize, d);
     }
-    b.n = 0;
 }
 
 /// What an event line is: nothing (no event id), a copy that only takes part
@@ -2260,7 +2251,8 @@ unsafe fn event_fields<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &Li
     let mut ok = !f1.is_empty();
     // (the key of an empty string is ZERO)
     let user = key_of(f1);
-    (*slot).person = user;
+    (*slot).person[0] = user[0];
+    (*slot).person[1] = user[1];
     let h = hk(&user);
     (*slot).h = h;
     lm.prefetch_filter(h);
@@ -2303,49 +2295,52 @@ unsafe fn event_fields<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &Li
     }
 }
 
-/// The two parse batches: `bs[cur]` fills while `bs[cur ^ 1]` waits for the
-/// link-map slots prefetched for it.
+/// The two parse batches: one fills while the other waits for the link-map
+/// slots prefetched for it. Points into storage owned by the caller.
 struct EvQueue {
-    bs: [EvBatch; 2],
-    cur: usize,
+    /// Where the next event is parsed; one past the end of the filling batch.
+    slot: *mut EvSlot,
+    end: *mut EvSlot,
+    /// The filling batch and the waiting one, with the latter's event count.
+    fill: *mut EvSlot,
+    wait: *mut EvSlot,
+    nwait: usize,
+}
+
+type EvStore = [[EvSlot; EB]; 2];
+
+fn ev_store() -> EvStore {
+    [[EvSlot { person: ZERO, h: 0, dd: RecD { fp: 0, b: 0 }, ts: 0, purchase: 0, pc: (0, 0), linked: false }; EB]; 2]
 }
 
 impl EvQueue {
-    fn new() -> Self {
-        let slot = EvSlot { person: ZERO, h: 0, dd: RecD { fp: 0, b: 0 }, ts: 0, purchase: 0, pc: (0, 0), linked: false };
-        let empty = EvBatch { n: 0, s: [slot; EB] };
-        EvQueue { bs: [empty, empty], cur: 0 }
-    }
-    /// The slot the next event is parsed into.
-    #[inline(always)]
-    fn slot(&mut self) -> *mut EvSlot {
-        unsafe {
-            let b = self.bs.get_unchecked_mut(self.cur);
-            b.s.as_mut_ptr().add(b.n)
-        }
+    fn new(store: &mut EvStore) -> Self {
+        let fill = store[0].as_mut_ptr();
+        EvQueue { slot: fill, end: unsafe { fill.add(EB) }, fill, wait: store[1].as_mut_ptr(), nwait: 0 }
     }
     /// Takes what `event_fields` left in the slot.
     #[inline(always)]
     fn commit(&mut self, kind: u32, lm: &LinkMap, o: &mut P1Work) {
         if kind == EV_VALID {
-            let cur = self.cur;
-            let b = unsafe { self.bs.get_unchecked_mut(cur) };
-            b.n += 1;
-            if b.n == EB {
-                stage2(b, lm);
-                flush_batch(unsafe { self.bs.get_unchecked_mut(cur ^ 1) }, lm, o);
-                self.cur = cur ^ 1;
+            self.slot = unsafe { self.slot.add(1) };
+            if self.slot == self.end {
+                stage2(self.fill, EB, lm);
+                flush_batch(self.wait, self.nwait, lm, o);
+                std::mem::swap(&mut self.fill, &mut self.wait);
+                self.nwait = EB;
+                self.slot = self.fill;
+                self.end = unsafe { self.fill.add(EB) };
             }
         } else if kind == EV_DEDUP {
-            let d = unsafe { (*self.slot()).dd };
+            let d = unsafe { (*self.slot).dd };
             o.dd.push((d.fp >> (64 - pa_bits())) as usize, d);
         }
     }
     fn finish(&mut self, lm: &LinkMap, o: &mut P1Work) {
-        let cur = self.cur;
-        stage2(&mut self.bs[cur], lm);
-        flush_batch(&mut self.bs[cur ^ 1], lm, o);
-        flush_batch(&mut self.bs[cur], lm, o);
+        let n = unsafe { self.slot.offset_from(self.fill) } as usize;
+        stage2(self.fill, n, lm);
+        flush_batch(self.wait, self.nwait, lm, o);
+        flush_batch(self.fill, n, lm, o);
     }
 }
 
@@ -2355,7 +2350,7 @@ impl EvQueue {
 fn event_slow(ctx: &Ctx, buf: &[u8], ls: usize, dc: &mut DateCache, lm: &LinkMap, q: &mut EvQueue, o: &mut P1Work) -> usize {
     let (end, res) = slow_line::<7>(buf, ls);
     if let Some(f) = res {
-        let kind = unsafe { event_fields(ctx, dc, lm, &mut ArrFields { f: &f, i: 0 }, q.slot()) };
+        let kind = unsafe { event_fields(ctx, dc, lm, &mut ArrFields { f: &f, i: 0 }, q.slot) };
         q.commit(kind, lm, o);
     }
     end + 1
@@ -2367,7 +2362,8 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
         return;
     }
     debug_assert!(buf[n - 1] == b'\n');
-    let mut q = EvQueue::new();
+    let mut store = ev_store();
+    let mut q = EvQueue::new(&mut store);
     let mut dc = DateCache::new();
     let ptr = buf.as_ptr();
     let mut ls = begin;
@@ -2380,7 +2376,7 @@ fn parse_events(ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap,
             Line::Bad(e) => ls += e + 1,
             Line::Good(c) => {
                 ls += c.e + 1;
-                let kind = unsafe { event_fields(ctx, &mut dc, lm, &mut MaskFields::new(p, &c), q.slot()) };
+                let kind = unsafe { event_fields(ctx, &mut dc, lm, &mut MaskFields::new(p, &c), q.slot) };
                 q.commit(kind, lm, o);
             }
         }
