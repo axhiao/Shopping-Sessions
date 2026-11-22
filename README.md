@@ -12,14 +12,29 @@ the two Parquet tables in `$OUTPUT_DIR` exactly as `rules.md` specifies.
 
 (AMD Threadripper PRO 5955WX, bare binary; the scorer's Xeons differ.)
 
-## Two engines
+## IDs are opaque strings (scorer version 5)
 
-`src/dense.rs` runs first. It takes inputs whose IDs have the shape the published
-generator writes; anything else, and anything it finds out of place, goes through the
-general pipeline in `src/main.rs` (described further down), which implements the rules
-for any IDs. Both write the same tables. `SS_NO_DENSE=1` skips the dense engine.
+Since version 5 of the scorer (22 November) the rules say that IDs are opaque
+variable-width strings: every ID passes through a keyed bijection that cannot be
+inverted, and one distinct ID in eight carries a 32-character suffix. What runs in the
+image is therefore **the general pipeline in `src/main.rs` alone** (described further
+down). It never interprets an ID: it hashes and compares its bytes.
 
-### The dense engine
+Two earlier shortcuts that decoded the IDs of the old generator are still in the source
+for the record, and both are off: the dense engine (`src/dense.rs`, only with
+`SS_DENSE=1`) and the sequence-number path (only with `SS_SEQ=1`). The Dockerfile sets
+neither, and neither can engage on current data. The two sections about them describe
+the old data format.
+
+How the general pipeline deals with long IDs: an ID of up to 15 bytes is its own key;
+a longer one is a 120-bit hash. The text of a long ID is only needed for the name of a
+person in the output and for ordering, so it is kept in a lock-free table (one entry per
+distinct long user ID that names its person), filled when a batch of parsed lines is
+flushed. A long click ID is never hashed at all: its key is the place of its bytes in
+the mapped file, since clicks are only ever ordered by ID. A line with a long first ID
+is parsed with the same layout memo as any other line, after taking the first field off.
+
+### The dense engine (off; old ID format only)
 
 The generator writes an event ID as `e` plus the base-36 digits of `scramble(n, key)` and
 a user ID as `u` plus the digits of `scramble(user * 512 + alias, key)`: `n` counts the
@@ -111,7 +126,7 @@ Memory: record buffers come from per-thread bump arenas (huge pages) that are re
 with one `MADV_DONTNEED` per thread at the end (and input mappings chunk by chunk), so the
 kernel has little to tear down at exit.
 
-### The sequence-number path
+### The sequence-number path (off; old ID format only)
 
 The published generator writes an event id as `e` plus the base-36 digits of
 `scramble(n, key)`: `n` counts the events and `scramble` is a fixed bijection on 40-bit
@@ -126,8 +141,8 @@ This is a shortcut for speed only. The number is an exact one-to-one function of
 text whatever key is used; an id of another form, or with a number outside the expected
 range, takes the general path (both paths feed the same session code, and the two never
 see the same id); persons always come from the links file; order is checked, never
-assumed. If no key fits, everything takes the general path. `SS_NO_SEQ=1` turns the
-shortcut off.
+assumed. If no key fits, everything takes the general path. The shortcut is off unless
+`SS_SEQ=1` is set.
 
 ## Build and test
 

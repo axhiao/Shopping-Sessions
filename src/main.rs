@@ -4820,6 +4820,10 @@ fn main() {
             evs.clear();
             pids.clear();
             lpur.clear();
+            // (the scratch vectors have room for every record of the biggest
+            // partition, so nothing is checked per event)
+            let (ep, pp, lp) = (evs.as_mut_ptr(), pids.as_mut_ptr(), lpur.as_mut_ptr());
+            let (mut nev, mut npu) = (0usize, 0usize);
             for o in p1.iter() {
                 let side = o.pur[q].as_slice();
                 let esc = o.pesc[q].as_slice();
@@ -4831,16 +4835,27 @@ fn main() {
                         pk += purchase as usize;
                         continue;
                     }
-                    pids.push(lid.intern(&e.p, esc));
+                    let id = lid.intern(&e.p, esc);
                     let x = if purchase != 0 {
-                        lpur.push(unsafe { *side.get_unchecked(pk) });
+                        unsafe { *lp.add(npu) = *side.get_unchecked(pk) };
                         pk += 1;
-                        PURCHASE | (lpur.len() - 1) as u32
+                        npu += 1;
+                        PURCHASE | (npu - 1) as u32
                     } else {
                         0
                     };
-                    evs.push(((ts as u64) << 32) | x as u64);
+                    unsafe {
+                        *pp.add(nev) = id;
+                        *ep.add(nev) = ((ts as u64) << 32) | x as u64;
+                    }
+                    nev += 1;
                 }
+            }
+            debug_assert!(nev <= evs.capacity() && npu <= lpur.capacity());
+            unsafe {
+                evs.set_len(nev);
+                pids.set_len(nev);
+                lpur.set_len(npu);
             }
             // the runs of the sequence-number path: one person each
             runs.clear();
@@ -4861,32 +4876,37 @@ fn main() {
             }
             tick!(0);
             let np = lid.persons.len();
-            // the runs by person
-            rstart.clear();
-            rstart.resize(np + 1, 0);
-            for r in runs.iter() {
-                rstart[r.pid as usize + 1] += 1;
+            // the runs by person (none unless the sequence-number path ran)
+            let has_runs = !runs.is_empty();
+            if has_runs {
+                rstart.clear();
+                rstart.resize(np + 1, 0);
+                for r in runs.iter() {
+                    rstart[r.pid as usize + 1] += 1;
+                }
+                for k in 0..np {
+                    rstart[k + 1] += rstart[k];
+                }
+                rsorted.clear();
+                rsorted.resize(runs.len(), RunRef::default());
+                fill.clear();
+                fill.extend_from_slice(&rstart[..np]);
+                for r in runs.iter() {
+                    let f = &mut fill[r.pid as usize];
+                    rsorted[*f as usize] = *r;
+                    *f += 1;
+                }
             }
-            for k in 0..np {
-                rstart[k + 1] += rstart[k];
-            }
-            rsorted.clear();
-            rsorted.resize(runs.len(), RunRef::default());
-            fill.clear();
-            fill.extend_from_slice(&rstart[..np]);
-            for r in runs.iter() {
-                let f = &mut fill[r.pid as usize];
-                rsorted[*f as usize] = *r;
-                *f += 1;
-            }
-            // counting sort by pid
+            // counting sort by pid (every pid is below np)
             start.clear();
             start.resize(np + 1, 0);
             for &p in pids.iter() {
-                start[p as usize + 1] += 1;
+                unsafe { *start.get_unchecked_mut(p as usize + 1) += 1 };
             }
-            for k in 0..np {
-                start[k + 1] += start[k];
+            let mut acc = 0u32;
+            for s in start.iter_mut() {
+                acc += *s;
+                *s = acc;
             }
             sorted.clear();
             sorted.reserve(evs.len());
@@ -4904,24 +4924,39 @@ fn main() {
             cpid.clear();
             ccamp.clear();
             ccid.clear();
+            // (room for every click record of the biggest partition)
+            let (clp, cap, cip, cpp) = (cls.as_mut_ptr(), ccamp.as_mut_ptr(), ccid.as_mut_ptr(), cpid.as_mut_ptr());
+            let mut ncl = 0usize;
             for o in p1.iter() {
                 let esc = o.cesc[q].as_slice();
                 for c in o.clq[q].as_slice() {
                     if let Some(id) = lid.get(&c.p, esc) {
-                        cls.push(((c.ts as u64) << 32) | ccamp.len() as u64);
-                        ccamp.push(c.camp);
-                        ccid.push(expand(&c.c, esc));
-                        cpid.push(id);
+                        unsafe {
+                            *clp.add(ncl) = ((c.ts as u64) << 32) | ncl as u64;
+                            *cap.add(ncl) = c.camp;
+                            *cip.add(ncl) = expand(&c.c, esc);
+                            *cpp.add(ncl) = id;
+                        }
+                        ncl += 1;
                     }
                 }
+            }
+            debug_assert!(ncl <= cls.capacity());
+            unsafe {
+                cls.set_len(ncl);
+                ccamp.set_len(ncl);
+                ccid.set_len(ncl);
+                cpid.set_len(ncl);
             }
             cstart.clear();
             cstart.resize(np + 1, 0);
             for &p in cpid.iter() {
-                cstart[p as usize + 1] += 1;
+                unsafe { *cstart.get_unchecked_mut(p as usize + 1) += 1 };
             }
-            for k in 0..np {
-                cstart[k + 1] += cstart[k];
+            let mut acc = 0u32;
+            for s in cstart.iter_mut() {
+                acc += *s;
+                *s = acc;
             }
             csorted.clear();
             csorted.reserve(cls.len());
@@ -4929,14 +4964,15 @@ fn main() {
             fill.clear();
             fill.extend_from_slice(&cstart[..np]);
             for (c, &p) in cls.iter().zip(cpid.iter()) {
-                let f = &mut fill[p as usize];
-                csorted[*f as usize] = *c;
+                let f = unsafe { fill.get_unchecked_mut(p as usize) };
+                unsafe { *csorted.get_unchecked_mut(*f as usize) = *c };
                 *f += 1;
             }
             tick!(2);
             tick!(5);
             for p in 0..np {
-                let cl = &mut csorted[cstart[p] as usize..cstart[p + 1] as usize];
+                // (cstart: np + 1 rising offsets into csorted)
+                let cl = unsafe { csorted.get_unchecked_mut(*cstart.get_unchecked(p) as usize..*cstart.get_unchecked(p + 1) as usize) };
                 if cl.len() > 1 {
                     cl.sort_unstable();
                     // equal timestamps: order by click id, descending
@@ -4956,9 +4992,9 @@ fn main() {
             tick!(6);
             let loose_pur = lpur.len();
             for p in 0..np {
-                let loose = &sorted[start[p] as usize..start[p + 1] as usize];
-                let prs = &rsorted[rstart[p] as usize..rstart[p + 1] as usize];
-                let cl = &csorted[cstart[p] as usize..cstart[p + 1] as usize];
+                let loose = unsafe { sorted.get_unchecked(*start.get_unchecked(p) as usize..*start.get_unchecked(p + 1) as usize) };
+                let prs: &[RunRef] = if has_runs { &rsorted[rstart[p] as usize..rstart[p + 1] as usize] } else { &[] };
+                let cl = unsafe { csorted.get_unchecked(*cstart.get_unchecked(p) as usize..*cstart.get_unchecked(p + 1) as usize) };
                 let mut ordered = None;
                 if loose.is_empty() && prs.len() == 1 {
                     // the usual case: one run. If it is in time order (it is,
