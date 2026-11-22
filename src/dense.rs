@@ -256,13 +256,13 @@ fn bucket_local(user: usize) -> (usize, u64) {
 }
 
 /// Campaign IDs of the form `c_` + number are looked up by the number.
-const CAMP_DIRECT: usize = 100_000;
+pub(crate) const CAMP_DIRECT: usize = 100_000;
 
 /// The number of an ID that is `c_` + 1 to 5 digits without a leading zero
 /// (two such IDs are equal exactly when their numbers are). `s` needs 8
 /// readable bytes.
 #[inline(always)]
-fn camp_number(s: &[u8]) -> Option<usize> {
+pub(crate) fn camp_number(s: &[u8]) -> Option<usize> {
     let l = s.len();
     if l.wrapping_sub(3) > 4 {
         return None;

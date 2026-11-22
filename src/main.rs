@@ -2686,6 +2686,9 @@ struct Ctx {
     unknown_cat: u32,
     cat_names: Vec<Vec<u8>>,
     campaigns: KeyMap<u32>,
+    /// Campaigns named `c_` + a number, by that number (0xFFFF: none); empty
+    /// if there are too many campaigns for 16 bits.
+    camp_direct: Vec<u16>,
     camp_ids: Vec<Vec<u8>>,
     camp_channels: Vec<Vec<u8>>,
 }
@@ -3352,9 +3355,19 @@ unsafe fn click_fields<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &Li
     // campaign_id: a known campaign (the key of an empty field is the map's
     // empty marker, so it must not be looked up)
     let fc = src.hi();
-    let camp = match ctx.campaigns.get(&key_of(fc)) {
-        Some(c) if !fc.is_empty() => c,
-        _ => return false,
+    let camp = match dense::camp_number(fc) {
+        // `c_` + number: two such IDs are equal exactly when the numbers are
+        Some(n) if !ctx.camp_direct.is_empty() => {
+            let c = *ctx.camp_direct.get_unchecked(n);
+            if c == 0xFFFF {
+                return false;
+            }
+            c as u32
+        }
+        _ => match ctx.campaigns.get(&key_of(fc)) {
+            Some(c) if !fc.is_empty() => c,
+            _ => return false,
+        },
     };
     (*slot).camp = camp;
     // ts: from a week before the window to its end
@@ -4095,6 +4108,18 @@ fn main() {
                 }
             });
         }
+        let mut camp_direct = if camp_ids.len() < 0xFFFF { vec![0xFFFFu16; dense::CAMP_DIRECT] } else { Vec::new() };
+        if !camp_direct.is_empty() {
+            for (i, id) in camp_ids.iter().enumerate() {
+                let mut padded = id.clone();
+                padded.resize(id.len() + 16, 0);
+                if let Some(n) = dense::camp_number(&padded[..id.len()]) {
+                    if camp_direct[n] == 0xFFFF {
+                        camp_direct[n] = i as u16;
+                    }
+                }
+            }
+        }
         Ctx {
             ws,
             we,
@@ -4103,6 +4128,7 @@ fn main() {
             unknown_cat,
             cat_names,
             campaigns,
+            camp_direct,
             camp_ids,
             camp_channels,
         }
