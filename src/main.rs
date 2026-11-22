@@ -4101,7 +4101,12 @@ fn main() {
     };
     let est_events = (bytes_of(Kind::Event) / line_len(Kind::Event, 70)) as usize * 33 / 32;
     let est_clicks = (bytes_of(Kind::Click) / line_len(Kind::Click, 40)) as usize * 33 / 32;
-    let per = |n: usize, parts: usize| n / parts / nthreads + n / parts / nthreads / 3 + 64;
+    // An eighth to spare per buffer (the line counts are estimated from a
+    // sample, and a partition's share of a thread's lines varies by a few
+    // percent): what is reserved is zeroed a huge page at a time whether it is
+    // used or not, and a tighter reserve was 3% faster.
+    let resk: usize = std::env::var("SS_RESK").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let per = |n: usize, parts: usize| n / parts / nthreads + n / parts / nthreads / resk + 64;
     // about 40k events per partition, between 256 and 1024 partitions
     let bits = ((est_events / 40_000).max(1) as f64).log2().round().clamp(8.0, MAX_PC_BITS as f64) as u32;
     let abits = std::env::var("SS_ABITS").ok().and_then(|v| v.parse().ok()).unwrap_or(bits);
@@ -4260,9 +4265,11 @@ fn main() {
             dd: Parts::new(pa, res_dd),
             pay: Parts::new(pc, res_pay1),
             pur: (0..pc).map(|_| PVec::with_capacity(res_pay1 / 24 + 16)).collect(),
-            pesc: (0..pc).map(|_| PVec::with_capacity(16)).collect(),
+            // (long IDs do not fit the compact form: about one event in six
+            // and one click in three leave a full key here)
+            pesc: (0..pc).map(|_| PVec::with_capacity(res_pay1 / 6 + 16)).collect(),
             clq: Parts::new(pc, res_cl),
-            cesc: (0..pc).map(|_| PVec::with_capacity(16)).collect(),
+            cesc: (0..pc).map(|_| PVec::with_capacity(res_cl / 3 + 16)).collect(),
         };
         // (the buffers of a Parts are allocated one after the other)
         let ix_region = {
