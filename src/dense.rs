@@ -84,7 +84,9 @@ pub(crate) struct Keys {
 /// The keys of the generated IDs, from the first lines of the biggest events
 /// file; None when the IDs do not have that shape.
 pub(crate) fn detect(files: &[InFile], nthreads: usize, verbose: bool) -> Option<Keys> {
-    if std::env::var_os("SS_NO_DENSE").is_some() {
+    // Off unless asked for (SS_DENSE=1): since scorer version 5 the rules say
+    // that IDs must be treated as opaque strings, never as generator numbers.
+    if std::env::var_os("SS_DENSE").is_none() {
         return None;
     }
     let biggest = files.iter().filter(|f| f.kind == Kind::Event && !f.map.is_null()).max_by_key(|f| f.len)?;

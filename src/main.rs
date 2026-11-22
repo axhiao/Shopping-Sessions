@@ -417,13 +417,32 @@ fn prefetch<T>(p: *const T) {
 type Key = [u64; 2];
 const ZERO: Key = [0, 0];
 
-/// Strings of more than 15 bytes, by their hashed key: sharded, and each
-/// thread remembers which keys it already registered.
+/// Strings of more than 15 bytes, by their hashed key, so that they can be
+/// printed and compared: a lock-free table (a slot is claimed through its
+/// first key word; the text and then the second word follow, and the second
+/// word publishes the slot). An ID whose stretch of the table is crowded goes
+/// to the sharded maps instead.
+struct LongSlot {
+    k0: AtomicU64,
+    k1: AtomicU64,
+    ptr: AtomicUsize,
+    len: AtomicUsize,
+}
+
+/// Slots of the table (a power of two): set from the input size before the
+/// first long string is met.
+static LONG_SLOTS: AtomicUsize = AtomicUsize::new(1 << 16);
+static LONG_TABLE: OnceLock<&'static [LongSlot]> = OnceLock::new();
+const LONG_PROBES: usize = 64;
 const LONG_SHARDS: usize = 64;
 static LONG: [Mutex<BTreeMap<Key, Vec<u8>>>; LONG_SHARDS] = [const { Mutex::new(BTreeMap::new()) }; LONG_SHARDS];
 
-thread_local! {
-    static LONG_SEEN: std::cell::RefCell<std::collections::HashSet<Key>> = std::cell::RefCell::new(std::collections::HashSet::new());
+#[inline]
+fn long_table() -> &'static [LongSlot] {
+    LONG_TABLE.get_or_init(|| {
+        let t: &'static mut [LongSlot] = zeroed_slice(LONG_SLOTS.load(Ordering::Relaxed).next_power_of_two());
+        t
+    })
 }
 
 #[inline]
@@ -437,9 +456,10 @@ fn fm(a: u64, b: u64) -> u64 {
     (r as u64) ^ ((r >> 64) as u64)
 }
 
-#[cold]
-#[inline(never)]
-fn long_key(s: &[u8]) -> Key {
+/// The key of a string of more than 15 bytes: a 120-bit hash, 0xFF in the
+/// last byte. (The first word is never 0: that marks an empty slot.)
+#[inline(always)]
+fn long_hash(s: &[u8]) -> Key {
     let mut h1: u64 = 0x243F_6A88_85A3_08D3 ^ s.len() as u64;
     let mut h2: u64 = 0x1319_8A2E_0370_7344;
     for c in s.chunks(8) {
@@ -449,12 +469,88 @@ fn long_key(s: &[u8]) -> Key {
         h1 = fm(h1 ^ x, 0x9E37_79B9_7F4A_7C15);
         h2 = fm(h2 ^ x, 0xC2B2_AE3D_27D4_EB4F) ^ h1;
     }
-    let k = [h1, (h2 & !0xFF) | 0xFF];
-    let fresh = LONG_SEEN.with(|seen| seen.borrow_mut().insert(k));
-    if fresh {
-        long_shard(&k).lock().unwrap().entry(k).or_insert_with(|| s.to_vec());
+    [h1 | (h1 == 0) as u64, (h2 & !0xFF) | 0xFF]
+}
+
+/// Where `k` is in the table: its slot if it is there, else None.
+fn long_find(k: &Key) -> Option<&'static LongSlot> {
+    let t = long_table();
+    let mask = t.len() - 1;
+    let mut i = (k[0] >> 20) as usize & mask;
+    for _ in 0..LONG_PROBES {
+        let sl = &t[i];
+        let k0 = sl.k0.load(Ordering::Acquire);
+        if k0 == 0 {
+            return None;
+        }
+        if k0 == k[0] {
+            let mut k1 = sl.k1.load(Ordering::Acquire);
+            while k1 == 0 {
+                std::hint::spin_loop();
+                k1 = sl.k1.load(Ordering::Acquire);
+            }
+            if k1 == k[1] {
+                return Some(sl);
+            }
+        }
+        i = (i + 1) & mask;
     }
+    None
+}
+
+/// Remembers the text of a long string under its key.
+fn long_register(k: &Key, s: &[u8]) {
+    let t = long_table();
+    let mask = t.len() - 1;
+    let mut i = (k[0] >> 20) as usize & mask;
+    let mut probes = 0;
+    while probes < LONG_PROBES {
+        let sl = &t[i];
+        let k0 = sl.k0.load(Ordering::Acquire);
+        if k0 == 0 {
+            if sl.k0.compare_exchange(0, k[0], Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                let text: &'static [u8] = Box::leak(s.to_vec().into_boxed_slice());
+                sl.ptr.store(text.as_ptr() as usize, Ordering::Relaxed);
+                sl.len.store(text.len(), Ordering::Relaxed);
+                sl.k1.store(k[1], Ordering::Release);
+                return;
+            }
+            // another thread took the slot: look at it again
+            continue;
+        }
+        if k0 == k[0] {
+            let mut k1 = sl.k1.load(Ordering::Acquire);
+            while k1 == 0 {
+                std::hint::spin_loop();
+                k1 = sl.k1.load(Ordering::Acquire);
+            }
+            if k1 == k[1] {
+                return;
+            }
+        }
+        i = (i + 1) & mask;
+        probes += 1;
+    }
+    long_shard(k).lock().unwrap().entry(*k).or_insert_with(|| s.to_vec());
+}
+
+#[cold]
+#[inline(never)]
+fn long_key(s: &[u8]) -> Key {
+    let k = long_hash(s);
+    long_register(&k, s);
     k
+}
+
+/// The key of a string whose text is never asked for again (an event ID is
+/// only ever compared for equality): a long one is hashed and not remembered.
+#[inline(always)]
+fn key_of_id(s: &[u8]) -> Key {
+    if s.len() > 15 {
+        long_hash(s)
+    } else {
+        key_of(s)
+    }
 }
 
 /// Every slice passed here must have at least 16 readable bytes from its start
@@ -494,6 +590,8 @@ fn key_bytes(k: &Key, out: &mut Vec<u8>) {
         b[..8].copy_from_slice(&k[0].to_be_bytes());
         b[8..].copy_from_slice(&k[1].to_be_bytes());
         out.extend_from_slice(&b[..n]);
+    } else if let Some(sl) = long_find(k) {
+        out.extend_from_slice(unsafe { std::slice::from_raw_parts(sl.ptr.load(Ordering::Relaxed) as *const u8, sl.len.load(Ordering::Relaxed)) });
     } else {
         out.extend_from_slice(&long_shard(k).lock().unwrap()[k]);
     }
@@ -2790,7 +2888,7 @@ const EV_VALID: u32 = 2;
 /// rest only matters for EV_VALID.
 #[inline(always)]
 unsafe fn event_tail<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &LinkMap, f0: &[u8], src: &mut S, slot: *mut EvSlot) -> u32 {
-    let (fp, fp2) = eid_fp(&key_of(f0));
+    let (fp, fp2) = eid_fp(&key_of_id(f0));
     (*slot).dd.fp = fp;
     // user_id
     let f1 = src.lo();
@@ -3743,9 +3841,6 @@ fn main() {
     // if its IDs have the generated shape; anything it declines goes through
     // the general pipeline below.
     let (files, chunks, dense_done) = std::thread::scope(|sc| {
-        let small = sc.spawn(|| {
-            ctx_cell.get_or_init(&build_ctx);
-        });
         // --- files and chunks: links first, then clicks (they do not need the
         // link map), then events.
         let use_mmap = std::env::var_os("SS_NO_MMAP").is_none();
@@ -3760,6 +3855,13 @@ fn main() {
                 files.push(InFile { kind, path: p, len, map, ends_nl });
             }
         }
+        // long IDs get a table with a slot for about every twelfth line (the
+        // generator writes one ID in eight long; only users and clicks are kept)
+        let lines = files.iter().map(|f| f.len).sum::<u64>() / 70;
+        LONG_SLOTS.store(((lines / 12) as usize).max(1 << 16).next_power_of_two(), Ordering::Relaxed);
+        let small = sc.spawn(|| {
+            ctx_cell.get_or_init(&build_ctx);
+        });
         let mut chunks: Vec<Chunk> = Vec::new();
         for (fi, f) in files.iter().enumerate() {
             let mut s = 0;
@@ -3808,7 +3910,8 @@ fn main() {
     let ix = {
         let mut cfg = IxCfg { on: false, key: 0, shift: 0, mask: 0, parts: 1, imax: 0 };
         let biggest = files.iter().filter(|f| f.kind == Kind::Event && !f.map.is_null()).max_by_key(|f| f.len);
-        if let (Some(f), true) = (biggest, std::env::var_os("SS_NO_SEQ").is_none()) {
+        // (off unless asked for: the rules say IDs are opaque strings)
+        if let (Some(f), true) = (biggest, std::env::var_os("SS_SEQ").is_some()) {
             let head = unsafe { std::slice::from_raw_parts(f.map, (f.len as usize).min(96 << 10)) };
             if let Some(last) = head.iter().rposition(|&b| b == b'\n') {
                 let text = pad_buffer(head[..last + 1].to_vec());
