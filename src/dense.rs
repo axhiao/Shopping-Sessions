@@ -569,6 +569,7 @@ fn event_slow(dx: &Dx, ctx: &Ctx, buf: &[u8], ls: usize, dc: &mut DateCache, o: 
     end + 1
 }
 
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn parse_events(dx: &Dx, ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, o: &mut D1, memo: &mut ShapeMemo, w: usize) {
     let n = buf.len();
@@ -646,6 +647,7 @@ unsafe fn click_line<'a, S: Fields<'a>>(dx: &Dx, ctx: &Ctx, dc: &mut DateCache, 
     o.odd_clicks.push(OddClick { user: key_of(f1), cid: key_of(f0), ts: ts as u32, camp });
 }
 
+#[inline(never)]
 fn parse_clicks(dx: &Dx, ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, o: &mut D1, memo: &mut ShapeMemo) {
     let n = buf.len();
     if begin >= n {
@@ -675,6 +677,7 @@ fn parse_clicks(dx: &Dx, ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, o: &
     }
 }
 
+#[inline(never)]
 fn parse_links(dx: &Dx, buf: &[u8], begin: usize, limit: usize, o: &mut D1) {
     scan_lean::<2, 1, _>(buf, begin, limit, #[inline(always)] |f| {
         if f[0].is_empty() || f[1].is_empty() {
