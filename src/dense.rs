@@ -30,19 +30,21 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 
 // A cell of the event table: two words, all zero while empty.
-// w0: PRESENT | VALID | PURCH | ODD | user (23 bits) << 35 | alias (4 bits)
-//     << 31 | ts (31 bits, ms from the window start). With ODD the user is not
-//     a plain (user, alias): the low 32 bits are thread << 27 | index of a
-//     side record that holds the row.
-// w1: ingest seconds << 32 | price << 8 | category.
+// w0: PRESENT | VALID | PURCH | ODD | ingest seconds (29 bits) << 31 | ts (31
+//     bits, ms from the window start).
+// w1: the user. A purchase: price << 40 | category << 32 | user << 4 | alias.
+//     Any other event: the bytes of the user ID after its `u` (at most 8,
+//     zero-padded); it is decoded when the table is read, once per stretch of
+//     equal IDs. With ODD the user is known not to be a plain (user, alias):
+//     thread << 27 | index of a side record that holds the row.
 const PRESENT: u64 = 1 << 63;
 const VALID: u64 = 1 << 62;
 const PURCH: u64 = 1 << 61;
 const ODD: u64 = 1 << 60;
-const IDX_SHIFT: u32 = 35;
+const ING_SHIFT: u32 = 31;
+const ING_MASK: u64 = (1 << 29) - 1;
 const IDX_BITS: u32 = 23;
 const IDX_MASK: u64 = (1 << IDX_BITS) - 1;
-const ALIAS_SHIFT: u32 = 31;
 const TS_MASK: u64 = 0x7FFF_FFFF;
 /// Aliases of a user that the plain path knows (4 bits each in the user's
 /// link word); a row or link with a higher alias is handled by text.
@@ -293,6 +295,26 @@ fn user_key(dx: &Dx, user: usize, alias: u64) -> Key {
     b36_key(b'u', scramble((user as u64) << 9 | alias, dx.ukey))
 }
 
+/// (user, alias) of the user ID `u` + the bytes of `text` if it is a plain
+/// one: generated shape, user in range, alias below 16.
+#[inline(always)]
+fn text_user(dx: &Dx, text: u64) -> Option<(usize, u64)> {
+    let n = 8 - (text.leading_zeros() / 8) as usize;
+    let b = [text, 0u64];
+    let s = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u8, n) };
+    let u = seq_of(base36_40(s)?, dx.ukey);
+    ((u >> 9) < dx.users && (u & 511) < ALIASES).then_some(((u >> 9) as usize, u & 15))
+}
+
+/// The key of the ID `letter` + the bytes of `text`.
+fn text_key(letter: u8, text: u64) -> Key {
+    let n = 8 - (text.leading_zeros() / 8) as usize;
+    let mut buf = [0u8; 32];
+    buf[0] = letter;
+    buf[1..9].copy_from_slice(&text.to_le_bytes());
+    key_of(&buf[..n + 1])
+}
+
 /// (user, alias) of a key that is a generated user ID with a user in range.
 fn plain_user(dx: &Dx, k: &Key) -> Option<(usize, u64)> {
     if !is_short(k) {
@@ -450,7 +472,7 @@ unsafe fn event_line<'a, S: Fields<'a>>(dx: &Dx, ctx: &Ctx, dc: &mut DateCache, 
     };
     let f3 = src.hi();
     let (ingest_s, ingest_ms) = parse_ingest_dc(dc, f3).unwrap_or((i64::MAX / 2000, i64::MAX / 2));
-    let ingest = (ingest_s - dx.ing_base).clamp(0, 0xFFFF_FFFF) as u64;
+    let ingest = (ingest_s - dx.ing_base).clamp(0, ING_MASK as i64) as u64;
     ok &= ingest_ms - ts <= DAY;
     let ty = event_type(src.hi());
     let f5 = src.hi();
@@ -467,21 +489,28 @@ unsafe fn event_line<'a, S: Fields<'a>>(dx: &Dx, ctx: &Ctx, dc: &mut DateCache, 
     }
     let purchase = (ty == T_PURCHASE) as u64;
     let ts_rel = (ts - dx.ws) as u64;
-    let w1 = ingest << 32 | pc;
     let side = |f1: &[u8]| SideEv { user: key_of(f1), ts: ts_rel as u32, purchase: purchase as u32, price: (pc >> 8) as u32, cat: (pc & 0xFF) as u32 };
     if n < dx.cap {
-        let w0 = if !ok {
-            PRESENT
+        let head = PRESENT | ingest << ING_SHIFT;
+        let (w0, w1) = if !ok {
+            (head, 0)
         } else {
-            let u = match id_number(b'u', f1) {
-                Some(v) => seq_of(v, dx.ukey),
-                None => u64::MAX,
-            };
-            if (u >> 9) < dx.users && (u & 511) < ALIASES {
-                PRESENT | VALID | purchase << 61 | (u >> 9) << IDX_SHIFT | (u & 15) << ALIAS_SHIFT | ts_rel
+            let l1 = f1.len();
+            let p1 = f1.as_ptr();
+            if purchase == 0 && l1.wrapping_sub(2) < 8 && *p1 == b'u' && *p1.add(l1 - 1) != 0 {
+                // the ID's bytes as they are (decoded when the table is read)
+                (head | VALID | ts_rel, (p1.add(1) as *const u64).read_unaligned() & (!0u64 >> (8 * (9 - l1))))
             } else {
-                o.side.push(side(f1));
-                PRESENT | VALID | ODD | (w as u64) << 27 | (o.side.len() - 1) as u64
+                let u = match id_number(b'u', f1) {
+                    Some(v) => seq_of(v, dx.ukey),
+                    None => u64::MAX,
+                };
+                if purchase != 0 && (u >> 9) < dx.users && (u & 511) < ALIASES {
+                    (head | VALID | PURCH | ts_rel, pc << 32 | (u >> 9) << 4 | (u & 15))
+                } else {
+                    o.side.push(side(f1));
+                    (head | VALID | ODD | ts_rel, (w as u64) << 27 | (o.side.len() - 1) as u64)
+                }
             }
         };
         o.nmax = o.nmax.max(n + 1);
@@ -691,24 +720,35 @@ fn id_text(letter: u8, v: u64, buf: &mut [u8; 16]) -> usize {
     17 - at
 }
 
-/// The name of the person made of the aliases of `user` linked with alias
-/// `comp` (the smallest of them): the smallest of their IDs.
+/// The ID text (the bytes after `u`, zero-padded) of alias `alias` of `user`.
 #[inline(always)]
-fn person_name(dx: &Dx, user: usize, comp: u64, flat: u64, buf: &mut [u8; 16]) -> usize {
-    let mut len = id_text(b'u', scramble((user as u64) << 9 | comp, dx.ukey), buf);
+fn user_text(dx: &Dx, user: usize, alias: u64) -> u64 {
+    let mut buf = [0u8; 16];
+    id_text(b'u', scramble((user as u64) << 9 | alias, dx.ukey), &mut buf);
+    u64::from_le_bytes(buf[1..9].try_into().unwrap())
+}
+
+/// The name of the person made of the aliases of `user` linked with alias
+/// `comp` (the smallest of them): the smallest of their IDs, into buf; its
+/// length. `texts[a]` is the text of alias a where `known` has bit a.
+#[inline(always)]
+fn person_name(dx: &Dx, user: usize, comp: u64, flat: u64, texts: &[u64; 16], known: u32, buf: &mut [u8; 16]) -> usize {
+    let get = |a: u64| if known >> a & 1 != 0 { texts[a as usize] } else { user_text(dx, user, a) };
+    let mut best = get(comp);
     if flat != UL_INIT {
-        let mut other = [0u8; 16];
         for a in comp + 1..16 {
             if (flat >> (4 * a)) & 15 == comp {
-                let l = id_text(b'u', scramble((user as u64) << 9 | a, dx.ukey), &mut other);
-                if other[..l] < buf[..len] {
-                    *buf = other;
-                    len = l;
+                let t = get(a);
+                // (zero padding: byte order of the IDs is the order of these)
+                if t.swap_bytes() < best.swap_bytes() {
+                    best = t;
                 }
             }
         }
     }
-    len
+    buf[0] = b'u';
+    buf[1..9].copy_from_slice(&best.to_le_bytes());
+    9 - (best.leading_zeros() / 8) as usize
 }
 
 /// The sessions of the person whose events are the plain cells of
@@ -837,7 +877,7 @@ fn person_cells(g: &Geo, st: &mut P3, dx: &Dx, start: usize, end: usize, cls: &[
         d_events += 1;
         if w0 & PURCH != 0 {
             let w1 = c[1].load(Ordering::Relaxed);
-            let (p, cat) = (w1 >> 8 & 0xFF_FFFF, (w1 & 0xFF) as usize);
+            let (p, cat) = (w1 >> 40, (w1 >> 32 & 0xFF) as usize);
             s_rev += p;
             s_purch = true;
             d_rev += p;
@@ -903,7 +943,7 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
         ws,
         we,
         cws: ws - WEEK,
-        ing_base: ws.div_euclid(1000) - (1 << 31),
+        ing_base: ws.div_euclid(1000) - (1 << 28),
     };
     let nb = bucket_of(users - 1) + 1;
     let bytes_of = |k: Kind| files.iter().filter(|f| f.kind == k).map(|f| f.len).sum::<u64>() as usize;
@@ -1111,7 +1151,7 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
                         dx.fetch(a[0] as usize);
                     }
                     let cell = dx.cell(r[0] as usize);
-                    if r[2] >> 32 < cell[1].load(Ordering::Relaxed) >> 32 {
+                    if r[1] >> ING_SHIFT & ING_MASK < cell[0].load(Ordering::Relaxed) >> ING_SHIFT & ING_MASK {
                         cell[0].store(r[1], Ordering::Relaxed);
                         cell[1].store(r[2], Ordering::Relaxed);
                     }
@@ -1134,9 +1174,16 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
     let key_at = |p: usize| -> u64 {
         let mut q = p;
         while q < nmax {
-            let w0 = cell(q)[0].load(Ordering::Relaxed);
+            let c = cell(q);
+            let w0 = c[0].load(Ordering::Relaxed);
             if w0 & (VALID | ODD) == VALID {
-                return (w0 >> IDX_SHIFT) & IDX_MASK;
+                let w1 = c[1].load(Ordering::Relaxed);
+                if w0 & PURCH != 0 {
+                    return (w1 >> 4) & IDX_MASK;
+                }
+                if let Some((user, _)) = text_user(&dx, w1) {
+                    return user as u64;
+                }
             }
             q += 1;
         }
@@ -1228,30 +1275,53 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
             let (lo, hi) = (bound_of(b), bound_of(b + 1));
             seen = [0u64; 16];
             let mut n = lo;
-            // Moves n to the next plain event (w0 returned; 0 at the end of the
-            // bucket); the rows by text on the way go to their persons.
-            macro_rules! next_plain {
-                () => {{
-                    let mut found = 0u64;
-                    while n < hi {
-                        let w0 = cell(n)[0].load(Ordering::Relaxed);
-                        if w0 & VALID != 0 {
-                            if w0 & ODD == 0 {
-                                found = w0;
-                                break;
-                            }
-                            let s = &p1[(w0 >> 27 & 31) as usize].side[(w0 & 0x7FF_FFFF) as usize];
-                            let person = person_of(&s.user);
-                            cev[hsel(&person, nthreads)].push(CEv { person, ts: s.ts, purchase: s.purchase, price: s.price, cat: s.cat });
-                        }
-                        n += 1;
+            // What the valid cell (w0, w1) is: Some((user, alias)) for a plain
+            // event; None for a row by text, which is handed to its person
+            // and taken out of the table.
+            macro_rules! plain_or_out {
+                ($c:expr, $w0:expr, $w1:expr) => {{
+                    let (c, w0, w1): (&Cell, u64, u64) = ($c, $w0, $w1);
+                    let ua = if w0 & ODD != 0 {
+                        None
+                    } else if w0 & PURCH != 0 {
+                        Some((((w1 >> 4) & IDX_MASK) as usize, w1 & 15))
+                    } else {
+                        text_user(&dx, w1)
+                    };
+                    if ua.is_none() {
+                        let (user, purchase, price, cat) = if w0 & ODD != 0 {
+                            let s = &p1[(w1 >> 27 & 31) as usize].side[(w1 & 0x7FF_FFFF) as usize];
+                            (s.user, s.purchase, s.price, s.cat)
+                        } else {
+                            (text_key(b'u', w1), 0, 0, 0)
+                        };
+                        let person = person_of(&user);
+                        cev[hsel(&person, nthreads)].push(CEv { person, ts: (w0 & TS_MASK) as u32, purchase, price, cat });
+                        c[0].store(PRESENT, Ordering::Relaxed);
                     }
-                    found
+                    ua
                 }};
             }
-            let mut w0 = next_plain!();
-            while w0 != 0 {
-                let user = ((w0 >> IDX_SHIFT) & IDX_MASK) as usize;
+            // the plain event at n, when it is known already
+            let mut next_ev: Option<(usize, u64)> = None;
+            'events: loop {
+                // --- the first event of a stretch
+                let (user, alias) = loop {
+                    if let Some(x) = next_ev.take() {
+                        break x;
+                    }
+                    if n >= hi {
+                        break 'events;
+                    }
+                    let c = cell(n);
+                    let w0 = c[0].load(Ordering::Relaxed);
+                    if w0 & VALID != 0 {
+                        if let Some(x) = plain_or_out!(c, w0, c[1].load(Ordering::Relaxed)) {
+                            break x;
+                        }
+                    }
+                    n += 1;
+                };
                 // every user in one stretch of the table, inside its bucket
                 let lu = user.wrapping_sub(ua);
                 if lu >= nu || seen[lu >> 6] >> (lu & 63) & 1 != 0 {
@@ -1260,33 +1330,97 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
                 }
                 seen[lu >> 6] |= 1 << (lu & 63);
                 let flat = ul_flat(ulink[user] ^ UL_INIT);
-                let comp_of = |w0: u64| (flat >> (4 * ((w0 >> ALIAS_SHIFT) & 15))) & 15;
-                let comp0 = comp_of(w0);
-                // the stretch: is it one person, in time order?
                 let start = n;
-                let (mut in_order, mut multi, mut prev) = (true, false, 0u64);
+                // the ID texts of the aliases met in the stretch; the last one
+                let mut texts = [0u64; 16];
+                let mut known = 0u32;
+                let (mut last_text, mut last_alias) = (0u64, 0u64);
+                let (mut in_order, mut prev, mut aset) = (true, 0u64, 1u32 << alias);
+                {
+                    let c = cell(n);
+                    if c[0].load(Ordering::Relaxed) & PURCH == 0 {
+                        last_text = c[1].load(Ordering::Relaxed);
+                        last_alias = alias;
+                        texts[alias as usize] = last_text;
+                        known |= 1 << alias;
+                    }
+                }
+                // --- to the end of the stretch: is it in time order?
                 loop {
-                    let t = w0 & TS_MASK;
-                    in_order &= t >= prev;
-                    prev = t;
-                    multi |= comp_of(w0) != comp0;
+                    let c = cell(n);
+                    let w0 = c[0].load(Ordering::Relaxed);
+                    if w0 & VALID != 0 {
+                        let w1 = c[1].load(Ordering::Relaxed);
+                        if w0 & (ODD | PURCH) != 0 || w1 != last_text {
+                            // not the ID of the event before: which alias, whose?
+                            let mut found = None;
+                            if w0 & (ODD | PURCH) == 0 {
+                                let mut k = known;
+                                while k != 0 {
+                                    let a = k.trailing_zeros() as usize;
+                                    k &= k - 1;
+                                    if texts[a] == w1 {
+                                        found = Some((user, a as u64));
+                                        break;
+                                    }
+                                }
+                            }
+                            if found.is_none() {
+                                found = plain_or_out!(c, w0, w1);
+                            }
+                            match found {
+                                None => {
+                                    n += 1;
+                                    if n >= hi {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Some((u2, a2)) => {
+                                    if u2 != user {
+                                        next_ev = Some((u2, a2));
+                                        break;
+                                    }
+                                    if w0 & PURCH == 0 {
+                                        texts[a2 as usize] = w1;
+                                        known |= 1 << a2;
+                                        last_text = w1;
+                                        last_alias = a2;
+                                    }
+                                    aset |= 1 << a2;
+                                }
+                            }
+                        }
+                        let t = w0 & TS_MASK;
+                        in_order &= t >= prev;
+                        prev = t;
+                    }
                     n += 1;
-                    w0 = next_plain!();
-                    if w0 == 0 || ((w0 >> IDX_SHIFT) & IDX_MASK) as usize != user {
+                    if n >= hi {
                         break;
                     }
                 }
                 let end = n;
+                // the alias of a plain event of the stretch
+                let alias_of = |w0: u64, w1: u64| {
+                    if w0 & PURCH != 0 {
+                        w1 & 15
+                    } else if w1 == last_text {
+                        last_alias
+                    } else {
+                        (0..16u64).find(|&a| known >> a & 1 != 0 && texts[a as usize] == w1).unwrap_or(0)
+                    }
+                };
                 let plain = |m: usize| {
                     let c = cell(m);
-                    let w = c[0].load(Ordering::Relaxed);
-                    (w & (VALID | ODD) == VALID).then_some((w, c))
+                    let w0 = c[0].load(Ordering::Relaxed);
+                    (w0 & (VALID | ODD) == VALID).then(|| (w0, c[1].load(Ordering::Relaxed)))
                 };
                 if is_complex(user) {
                     let mut ckey: [Option<Key>; 16] = [None; 16];
                     for m in start..end {
-                        if let Some((w, c)) = plain(m) {
-                            let alias = (w >> ALIAS_SHIFT) & 15;
+                        if let Some((w0, w1)) = plain(m) {
+                            let alias = alias_of(w0, w1);
                             let person = match ckey[alias as usize] {
                                 Some(k) => k,
                                 None => {
@@ -1295,40 +1429,44 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
                                     k
                                 }
                             };
-                            let purchase = w & PURCH != 0;
-                            let w1 = if purchase { c[1].load(Ordering::Relaxed) } else { 0 };
-                            cev[hsel(&person, nthreads)].push(CEv {
-                                person,
-                                ts: (w & TS_MASK) as u32,
-                                purchase: purchase as u32,
-                                price: (w1 >> 8 & 0xFF_FFFF) as u32,
-                                cat: (w1 & 0xFF) as u32,
-                            });
+                            let (purchase, price, cat) = if w0 & PURCH != 0 { (1, (w1 >> 40) as u32, (w1 >> 32 & 0xFF) as u32) } else { (0, 0, 0) };
+                            cev[hsel(&person, nthreads)].push(CEv { person, ts: (w0 & TS_MASK) as u32, purchase, price, cat });
                         }
                     }
                     continue;
+                }
+                // one person if the aliases met are all linked
+                let comp_of = |alias: u64| (flat >> (4 * alias)) & 15;
+                let comp0 = comp_of(aset.trailing_zeros() as u64);
+                let mut multi = false;
+                if aset & (aset - 1) != 0 {
+                    let mut k = aset;
+                    while k != 0 {
+                        multi |= comp_of(k.trailing_zeros() as u64) != comp0;
+                        k &= k - 1;
+                    }
                 }
                 let mine = cstart[lu] as usize..cstart[lu + 1] as usize;
                 if !multi && in_order {
                     cls.clear();
                     for i in mine {
                         let r = unsafe { ucl.get_unchecked(i) };
-                        if (flat >> (4 * (r[1] >> 47 & 15))) & 15 == comp0 {
+                        if comp_of(r[1] >> 47 & 15) == comp0 {
                             cls.push((r[1] & TS_MASK) << 32 | i as u64);
                         }
                     }
                     sort_clicks(&mut cls, |i, j| cmp_key(&b36_key(b'k', ucl[j][0] & M40), &b36_key(b'k', ucl[i][0] & M40)));
-                    let len = person_name(&dx, user, comp0, flat, &mut namebuf);
+                    let len = person_name(&dx, user, comp0, flat, &texts, known, &mut namebuf);
                     person_cells(&geo, &mut st, &dx, start, end, &cls, &ucl, &namebuf[..len]);
                     continue;
                 }
                 // Some alias with events is not linked to the others, or the
                 // events are not in time order: a person at a time, sorted.
                 let mut todo = 0u32;
-                for m in start..end {
-                    if let Some((w, _)) = plain(m) {
-                        todo |= 1 << comp_of(w);
-                    }
+                let mut k = aset;
+                while k != 0 {
+                    todo |= 1 << comp_of(k.trailing_zeros() as u64);
+                    k &= k - 1;
                 }
                 while todo != 0 {
                     let comp = todo.trailing_zeros() as u64;
@@ -1336,13 +1474,12 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
                     words.clear();
                     lpur.clear();
                     for m in start..end {
-                        if let Some((w, c)) = plain(m) {
-                            if comp_of(w) == comp {
-                                let purchase = w & PURCH != 0;
-                                words.push((w & TS_MASK) as u32 | (purchase as u32) << 31);
+                        if let Some((w0, w1)) = plain(m) {
+                            if comp_of(alias_of(w0, w1)) == comp {
+                                let purchase = w0 & PURCH != 0;
+                                words.push((w0 & TS_MASK) as u32 | (purchase as u32) << 31);
                                 if purchase {
-                                    let w1 = c[1].load(Ordering::Relaxed);
-                                    lpur.push(((w1 >> 8 & 0xFF_FFFF) as u32, (w1 & 0xFF) as u32));
+                                    lpur.push(((w1 >> 40) as u32, (w1 >> 32 & 0xFF) as u32));
                                 }
                             }
                         }
@@ -1352,14 +1489,14 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
                     cidx.clear();
                     for i in mine.clone() {
                         let r = &ucl[i];
-                        if (flat >> (4 * (r[1] >> 47 & 15))) & 15 == comp {
+                        if comp_of(r[1] >> 47 & 15) == comp {
                             cls.push((r[1] & TS_MASK) << 32 | camps.len() as u64);
                             camps.push((r[1] >> 31 & 0xFFFF) as u32);
                             cidx.push(i as u32);
                         }
                     }
                     sort_clicks(&mut cls, |i, j| cmp_key(&b36_key(b'k', ucl[cidx[j] as usize][0] & M40), &b36_key(b'k', ucl[cidx[i] as usize][0] & M40)));
-                    let len = person_name(&dx, user, comp, flat, &mut namebuf);
+                    let len = person_name(&dx, user, comp, flat, &texts, known, &mut namebuf);
                     one_person(&geo, &mut st, key_of(&namebuf[..len]), &words, &lpur, &cls, &camps);
                 }
             }

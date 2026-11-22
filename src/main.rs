@@ -1305,7 +1305,7 @@ struct Half {
     good: u8,
 }
 
-const MEMO_N: usize = 512;
+const MEMO_N: usize = 2048;
 
 /// The remembered sides of one kind of line (per thread).
 struct ShapeMemo {
