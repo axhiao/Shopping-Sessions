@@ -3050,7 +3050,77 @@ fn event_slow(ctx: &Ctx, ix: &IxCfg, buf: &[u8], ls: usize, dc: &mut DateCache, 
     end + 1
 }
 
-fn parse_events(ctx: &Ctx, ix: &IxCfg, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, o: &mut P1Work, memo: &mut ShapeMemo) {
+/// The first field of the line at `p` when it ends within the first 63 bytes
+/// and is plainly well-formed (no quote in it, or one at each end): its
+/// content and the offset just past its separator. None for anything else.
+#[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn first_field<'a>(p: *const u8) -> Option<(&'a [u8], usize)> {
+    use std::arch::x86_64::*;
+    let a = _mm256_loadu_si256(p as *const __m256i);
+    let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let m = |x: __m256i, y: __m256i, c: u8| {
+        let v = _mm256_set1_epi8(c as i8);
+        (_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, v)) as u32 as u64) | (_mm256_movemask_epi8(_mm256_cmpeq_epi8(y, v)) as u32 as u64) << 32
+    };
+    let (cm, nl, qt) = (m(a, b, b','), m(a, b, b'\n'), m(a, b, b'"'));
+    let c0 = cm.trailing_zeros() as usize;
+    // the separator must be a comma before any newline, within 63 bytes
+    if c0 > 62 || nl & ((1u64 << c0) - 1) != 0 {
+        return None;
+    }
+    let q = qt & ((1u64 << c0) - 1);
+    if q == 0 {
+        Some((std::slice::from_raw_parts(p, c0), c0 + 1))
+    } else if c0 >= 2 && q == 1 | 1 << (c0 - 1) {
+        Some((std::slice::from_raw_parts(p.add(1), c0 - 2), c0 + 1))
+    } else {
+        None
+    }
+}
+
+/// A first field handed out before the fields of the rest of the line.
+struct Lead<'a, S: Fields<'a>> {
+    first: Option<&'a [u8]>,
+    rest: S,
+}
+
+impl<'a, S: Fields<'a>> Fields<'a> for Lead<'a, S> {
+    #[inline(always)]
+    fn lo(&mut self) -> &'a [u8] {
+        match self.first.take() {
+            Some(f) => f,
+            None => self.rest.lo(),
+        }
+    }
+    #[inline(always)]
+    fn hi(&mut self) -> &'a [u8] {
+        self.rest.hi()
+    }
+}
+
+/// An event line whose first three fields do not fit the scanner's window
+/// (a long ID): the first field is taken off and the rest scanned as a line
+/// of six fields. Returns the next line's start, or None if that does not
+/// work either.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn event_long(ctx: &Ctx, ix: &IxCfg, p: *const u8, ls: usize, dc: &mut DateCache, lm: &LinkMap, q: &mut EvQueue, o: &mut P1Work, memo6: &mut ShapeMemo) -> Option<usize> {
+    let (f0, off) = first_field(p)?;
+    let pt = p.add(off);
+    match line_memo::<6, 2>(pt, memo6) {
+        LineM::Slow => None,
+        LineM::Bad(e) => Some(ls + off + e + 1),
+        LineM::Good(e, r, lo, hi) => {
+            let mut f = Lead { first: Some(f0), rest: MemoFields { p: pt, pr: pt.add(r), lo, hi, i: 0, j: 0, _buf: std::marker::PhantomData } };
+            event_line(ctx, ix, dc, lm, &mut f, q, o);
+            Some(ls + off + e + 1)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_events(ctx: &Ctx, ix: &IxCfg, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, o: &mut P1Work, memo: &mut ShapeMemo, memo6: &mut ShapeMemo) {
     let n = buf.len();
     if begin >= n {
         return;
@@ -3066,7 +3136,12 @@ fn parse_events(ctx: &Ctx, ix: &IxCfg, buf: &[u8], begin: usize, limit: usize, l
         // (see scan_lean)
         prefetch(p.wrapping_add(INPUT_AHEAD));
         match unsafe { line_memo::<7, 3>(p, memo) } {
-            LineM::Slow => ls = event_slow(ctx, ix, buf, ls, &mut dc, lm, &mut q, o),
+            LineM::Slow => {
+                ls = match unsafe { event_long(ctx, ix, p, ls, &mut dc, lm, &mut q, o, memo6) } {
+                    Some(next) => next,
+                    None => event_slow(ctx, ix, buf, ls, &mut dc, lm, &mut q, o),
+                }
+            }
             LineM::Bad(e) => ls += e + 1,
             LineM::Good(e, r, lo, hi) => {
                 ls += e + 1;
@@ -4044,6 +4119,7 @@ fn main() {
         }
         let ctx = ctx_cell.get_or_init(&build_ctx);
         let mut memo_ev = ShapeMemo::new();
+        let mut memo_ev6 = ShapeMemo::new();
         let mut memo_cl = ShapeMemo::new();
         let mut o = P1Work {
             ix: Parts::new(ix.parts, res_ix),
@@ -4077,7 +4153,7 @@ fn main() {
             let c = &chunks[data_chunks[i]];
             let (bytes, b, l) = chunk_bytes(&files[c.file], c, &mut buf);
             match c.kind {
-                Kind::Event => parse_events(ctx, &ix, bytes, b, l, lm, &mut o, &mut memo_ev),
+                Kind::Event => parse_events(ctx, &ix, bytes, b, l, lm, &mut o, &mut memo_ev, &mut memo_ev6),
                 Kind::Click => parse_clicks(ctx, bytes, b, l, lm, &mut o.clq, &mut o.cesc, &mut memo_cl),
                 Kind::Link => unreachable!(),
             }
