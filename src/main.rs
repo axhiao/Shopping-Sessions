@@ -1,5 +1,6 @@
 //! Shopping Sessions pipeline. See README.md for the design.
 
+mod dense;
 #[cfg(feature = "diag")]
 mod diag;
 mod pq;
@@ -258,14 +259,17 @@ struct Parts<T: Copy, const K: usize> {
 
 impl<T: Copy, const K: usize> Parts<T, K> {
     fn new(parts: usize, reserve: usize) -> Self {
+        Self::new_by(parts, |_| reserve)
+    }
+    /// With room for `reserve(q)` records in partition q.
+    fn new_by(parts: usize, reserve: impl Fn(usize) -> usize) -> Self {
         assert!(K * std::mem::size_of::<T>() % 64 == 0 && K.is_power_of_two());
-        let reserve = reserve.div_ceil(K) * K;
         let mut buf = Vec::with_capacity(parts);
         unsafe {
             buf.set_len(parts);
             std::ptr::write_bytes(buf.as_mut_ptr(), 0, parts);
         }
-        Parts { out: (0..parts).map(|_| PVec::with_capacity(reserve)).collect(), buf, cnt: vec![0; parts] }
+        Parts { out: (0..parts).map(|q| PVec::with_capacity(reserve(q).div_ceil(K) * K)).collect(), buf, cnt: vec![0; parts] }
     }
     /// Appends `v` to partition q; returns the index it got there.
     #[inline(always)]
@@ -2192,7 +2196,6 @@ const SCR_C1I: u64 = inv64(SCR_C1);
 const SCR_C2I: u64 = inv64(SCR_C2);
 
 /// The generator's bijection on 0..2^40.
-#[cfg(test)]
 fn scramble(n: u64, key: u64) -> u64 {
     let mut m = ((n & M40).wrapping_mul(SCR_C1) ^ key) & M40;
     m ^= m >> 17;
@@ -3015,10 +3018,12 @@ unsafe fn click_fields<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &Li
     let h = hk(&user);
     (*slot).h = h;
     lm.prefetch_filter(h);
-    // campaign_id: a known campaign
-    let camp = match ctx.campaigns.get(&key_of(src.hi())) {
-        Some(c) => c,
-        None => return false,
+    // campaign_id: a known campaign (the key of an empty field is the map's
+    // empty marker, so it must not be looked up)
+    let fc = src.hi();
+    let camp = match ctx.campaigns.get(&key_of(fc)) {
+        Some(c) if !fc.is_empty() => c,
+        _ => return false,
     };
     (*slot).camp = camp;
     // ts: from a week before the window to its end
@@ -3527,6 +3532,92 @@ fn run_workers<R: Send, F: Fn(usize) -> R + Sync>(n: usize, f: F) -> Vec<R> {
     })
 }
 
+/// A worker's session state (see `P3`).
+fn p3_new(out: &Path, w: usize, ctx: &Ctx, day0: i64, ndays: usize, nbuckets: usize) -> P3 {
+    let ncamp = ctx.camp_ids.len();
+    P3 {
+        uw: pq::UserWriter::new(&out.join("user_daily"), w, day0 as i32, ndays, &ctx.cat_names),
+        name: Vec::new(),
+        agg: vec![[0u64; 4]; (ncamp + 1) * ndays],
+        sess: vec![0; (ncamp + 1) * ndays],
+        assist: vec![0; (ncamp + 1) * ndays],
+        cnt: vec![0; ncamp + 1],
+        pos: vec![0; ncamp + 1],
+        active: Vec::new(),
+        pend: vec![0; ndays],
+        pend_days: Vec::new(),
+        catsum: vec![0; ctx.cat_names.len()],
+        touched: Vec::new(),
+        cell: vec![[u32::MAX, 0, 0, 0]; nbuckets],
+        bits: vec![0; nbuckets / 64],
+        purs: Vec::new(),
+    }
+}
+
+/// The worker's campaign counters, complete (sessions and assists folded in).
+fn p3_agg(mut st: P3) -> Vec<[u64; 4]> {
+    for (i, a) in st.agg.iter_mut().enumerate() {
+        a[0] = st.sess[i] as u64;
+        a[3] = st.assist[i] as u64;
+    }
+    st.agg
+}
+
+/// Sums the workers' counters and writes the campaign_daily table.
+fn write_campaign_daily(out: &Path, ctx: &Ctx, aggs: &[Vec<[u64; 4]>], day0: i64, ndays: usize) {
+    let ncamp = ctx.camp_ids.len();
+    let mut total = vec![[0u64; 4]; (ncamp + 1) * ndays];
+    for a in aggs {
+        for (t, x) in total.iter_mut().zip(a) {
+            for k in 0..4 {
+                t[k] += x[k];
+            }
+        }
+    }
+    let mut cols = vec![
+        pq::Column::new("campaign_id", pq::Kind::Str, false, 0),
+        pq::Column::new("channel", pq::Kind::Str, false, 0),
+        pq::Column::new("day", pq::Kind::Date, false, 0),
+        pq::Column::new("sessions", pq::Kind::I64, false, 0),
+        pq::Column::new("purchasing_sessions", pq::Kind::I64, false, 0),
+        pq::Column::new("revenue_cents", pq::Kind::I64, false, 0),
+        pq::Column::new("assisted_sessions", pq::Kind::I64, false, 0),
+    ];
+    let mut n = 0;
+    for c in 0..=ncamp {
+        for d in 0..ndays {
+            let a = total[d * (ncamp + 1) + c];
+            if a[0] == 0 && a[3] == 0 {
+                continue;
+            }
+            n += 1;
+            if c == ncamp {
+                cols[0].push_str(b"organic");
+                cols[1].push_str(b"organic");
+            } else {
+                cols[0].push_str(&ctx.camp_ids[c]);
+                cols[1].push_str(&ctx.camp_channels[c]);
+            }
+            cols[2].push_i32((day0 + d as i64) as i32);
+            for k in 0..4 {
+                cols[3 + k].push_i64(a[k] as i64);
+            }
+        }
+    }
+    #[cfg(feature = "diag")]
+    {
+        // a diagnostic build must never be scored: one extra row
+        n += 1;
+        cols[0].push_str(b"diag");
+        cols[1].push_str(b"diag");
+        cols[2].push_i32(day0 as i32);
+        for k in 0..4 {
+            cols[3 + k].push_i64(k as i64);
+        }
+    }
+    pq::write_file(&out.join("campaign_daily").join("part-000.parquet"), &cols, n).expect("write campaign_daily");
+}
+
 fn main() {
     let t0 = Instant::now();
     raise_fd_limit();
@@ -3634,30 +3725,54 @@ fn main() {
     let ctx_cell: OnceLock<Ctx> = OnceLock::new();
     lap("small inputs");
 
-    // --- files and chunks: links first, then clicks (they do not need the
-    // link map), then events.
-    let use_mmap = std::env::var_os("SS_NO_MMAP").is_none();
-    let mut files: Vec<InFile> = Vec::new();
-    for (kind, dir) in [(Kind::Link, "links"), (Kind::Click, "clicks"), (Kind::Event, "events")] {
-        for (p, len) in csv_files(&data.join(dir)) {
-            let file = File::open(&p).expect("open");
-            let map = if use_mmap { map_file(&file, len as usize) } else { std::ptr::null() };
-            let ends_nl = !map.is_null() && unsafe { *map.add(len as usize - 1) } == b'\n';
-            // the mapping outlives the descriptor
-            drop(file);
-            files.push(InFile { kind, path: p, len, map, ends_nl });
+    // The products and campaigns are read on a thread of their own while the
+    // input files are listed and mapped. Then the dense engine takes the data
+    // if its IDs have the generated shape; anything it declines goes through
+    // the general pipeline below.
+    let (files, chunks, dense_done) = std::thread::scope(|sc| {
+        let small = sc.spawn(|| {
+            ctx_cell.get_or_init(&build_ctx);
+        });
+        // --- files and chunks: links first, then clicks (they do not need the
+        // link map), then events.
+        let use_mmap = std::env::var_os("SS_NO_MMAP").is_none();
+        let mut files: Vec<InFile> = Vec::new();
+        for (kind, dir) in [(Kind::Link, "links"), (Kind::Click, "clicks"), (Kind::Event, "events")] {
+            for (p, len) in csv_files(&data.join(dir)) {
+                let file = File::open(&p).expect("open");
+                let map = if use_mmap { map_file(&file, len as usize) } else { std::ptr::null() };
+                let ends_nl = !map.is_null() && unsafe { *map.add(len as usize - 1) } == b'\n';
+                // the mapping outlives the descriptor
+                drop(file);
+                files.push(InFile { kind, path: p, len, map, ends_nl });
+            }
         }
-    }
-    let mut chunks: Vec<Chunk> = Vec::new();
-    for (fi, f) in files.iter().enumerate() {
-        let mut s = 0;
-        while s < f.len {
-            // link files are few and small: small chunks keep every thread busy
-            let step = if f.kind == Kind::Link { 256 << 10 } else { chunk_size() };
-            let e = (s + step).min(f.len);
-            chunks.push(Chunk { kind: f.kind, file: fi, start: s, end: e });
-            s = e;
+        let mut chunks: Vec<Chunk> = Vec::new();
+        for (fi, f) in files.iter().enumerate() {
+            let mut s = 0;
+            while s < f.len {
+                // link files are few and small: small chunks keep every thread busy
+                let step = if f.kind == Kind::Link { 256 << 10 } else { chunk_size() };
+                let e = (s + step).min(f.len);
+                chunks.push(Chunk { kind: f.kind, file: fi, start: s, end: e });
+                s = e;
+            }
         }
+        let done = match dense::detect(&files, nthreads, verbose) {
+            Some(keys) => {
+                let _ = small.join();
+                dense::run(&keys, ctx_cell.get().unwrap(), &files, &chunks, &out, nthreads, verbose, t0)
+            }
+            None => false,
+        };
+        (files, chunks, done)
+    });
+    if dense_done {
+        lap("done");
+        if let Some(p) = &prof_path {
+            prof::dump(p);
+        }
+        std::process::exit(0);
     }
     // estimate line counts to pre-size the partition buffers
     let bytes_of = |k: Kind| files.iter().filter(|f| f.kind == k).map(|f| f.len).sum::<u64>();
@@ -4477,57 +4592,7 @@ fn main() {
     });
     lap("phase 3 sessions + user_daily");
 
-    // --- campaign_daily
-    let mut total = vec![[0u64; 4]; (ncamp + 1) * ndays];
-    for a in &aggs {
-        for (t, x) in total.iter_mut().zip(a) {
-            for k in 0..4 {
-                t[k] += x[k];
-            }
-        }
-    }
-    let mut cols = vec![
-        pq::Column::new("campaign_id", pq::Kind::Str, false, 0),
-        pq::Column::new("channel", pq::Kind::Str, false, 0),
-        pq::Column::new("day", pq::Kind::Date, false, 0),
-        pq::Column::new("sessions", pq::Kind::I64, false, 0),
-        pq::Column::new("purchasing_sessions", pq::Kind::I64, false, 0),
-        pq::Column::new("revenue_cents", pq::Kind::I64, false, 0),
-        pq::Column::new("assisted_sessions", pq::Kind::I64, false, 0),
-    ];
-    let mut n = 0;
-    for c in 0..=ncamp {
-        for d in 0..ndays {
-            let a = total[d * (ncamp + 1) + c];
-            if a[0] == 0 && a[3] == 0 {
-                continue;
-            }
-            n += 1;
-            if c == ncamp {
-                cols[0].push_str(b"organic");
-                cols[1].push_str(b"organic");
-            } else {
-                cols[0].push_str(&ctx.camp_ids[c]);
-                cols[1].push_str(&ctx.camp_channels[c]);
-            }
-            cols[2].push_i32((day0 + d as i64) as i32);
-            for k in 0..4 {
-                cols[3 + k].push_i64(a[k] as i64);
-            }
-        }
-    }
-    #[cfg(feature = "diag")]
-    {
-        // a diagnostic build must never be scored: one extra row
-        n += 1;
-        cols[0].push_str(b"diag");
-        cols[1].push_str(b"diag");
-        cols[2].push_i32(day0 as i32);
-        for k in 0..4 {
-            cols[3 + k].push_i64(k as i64);
-        }
-    }
-    pq::write_file(&out.join("campaign_daily").join("part-000.parquet"), &cols, n).expect("write campaign_daily");
+    write_campaign_daily(&out, ctx, &aggs, day0, ndays);
     lap("done");
     if let Some(p) = &prof_path {
         prof::dump(p);
