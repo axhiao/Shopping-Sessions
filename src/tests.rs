@@ -603,3 +603,92 @@ fn user_codes_are_exact() {
     }
     assert!(accepted > 10_000);
 }
+
+/// The remembered layouts give what the scanner gives, line for line.
+#[test]
+fn memo_scanner_matches() {
+    fn fields_of<'a, const N: usize, const K: usize>(buf: &'a [u8], at: usize) -> (u8, usize, Vec<&'a [u8]>) {
+        let p = unsafe { buf.as_ptr().add(at) };
+        match unsafe { line_cursors::<N, K>(p) } {
+            Line::Slow => (0, 0, Vec::new()),
+            Line::Bad(e) => (1, e, Vec::new()),
+            Line::Good(c) => {
+                let mut f = unsafe { MaskFields::new(p, &c) };
+                let mut v = Vec::new();
+                for _ in 0..K {
+                    v.push(f.lo());
+                }
+                for _ in K..N {
+                    v.push(f.hi());
+                }
+                (2, c.e, v)
+            }
+        }
+    }
+    fn memo_of<'a, const N: usize, const K: usize>(buf: &'a [u8], at: usize, memo: &mut ShapeMemo) -> (u8, usize, Vec<&'a [u8]>) {
+        let p = unsafe { buf.as_ptr().add(at) };
+        match unsafe { line_memo::<N, K>(p, memo) } {
+            LineM::Slow => (0, 0, Vec::new()),
+            LineM::Bad(e) => (1, e, Vec::new()),
+            LineM::Good(e, r, lo, hi) => {
+                let mut f = MemoFields { p, pr: unsafe { p.add(r) }, lo, hi, i: 0, j: 0, _buf: std::marker::PhantomData };
+                let mut v: Vec<&'a [u8]> = Vec::new();
+                for _ in 0..K {
+                    v.push(f.lo());
+                }
+                for _ in K..N {
+                    v.push(f.hi());
+                }
+                (2, e, v)
+            }
+        }
+    }
+    let mut x = 0x0DDB_A11C_0FFE_E123u64;
+    let mut memo7 = ShapeMemo::new();
+    let mut memo4 = ShapeMemo::new();
+    let mut good = [0usize; 2];
+    for round in 0..300_000 {
+        // a line of fields of a few lengths, most well formed, some with stray quotes, extra or missing separators
+        let nf = match rng(&mut x) % 20 {
+            0 => 3,
+            1 => 6,
+            2 => 8,
+            3 => 5,
+            _ => if round % 2 == 0 { 7 } else { 4 },
+        };
+        let mut line: Vec<u8> = Vec::new();
+        for i in 0..nf {
+            if i > 0 {
+                line.push(b',');
+            }
+            let len = [0usize, 1, 4, 6, 8, 9, 13, 20, 25, 31][(rng(&mut x) % 10) as usize];
+            let quoted = rng(&mut x) % 5 == 0;
+            if quoted {
+                line.push(b'"');
+            }
+            for _ in 0..len {
+                line.push(match rng(&mut x) % 400 {
+                    0 => b'"',
+                    1 => b',',
+                    _ => b'a' + (rng(&mut x) % 26) as u8,
+                });
+            }
+            if quoted && rng(&mut x) % 50 != 0 {
+                line.push(b'"');
+            }
+        }
+        line.push(b'\n');
+        // followed by another line and padding, as in a file
+        line.extend_from_slice(b"zz,\"q\",zz,zz,zz,zz,zz\n");
+        line.extend_from_slice(&[0u8; 160]);
+        let a = fields_of::<7, 3>(&line, 0);
+        let b = memo_of::<7, 3>(&line, 0, &mut memo7);
+        assert_eq!(a, b, "7 fields: {:?}", String::from_utf8_lossy(&line[..line.len() - 160]));
+        good[0] += (a.0 == 2) as usize;
+        let a = fields_of::<4, 2>(&line, 0);
+        let b = memo_of::<4, 2>(&line, 0, &mut memo4);
+        assert_eq!(a, b, "4 fields: {:?}", String::from_utf8_lossy(&line[..line.len() - 160]));
+        good[1] += (a.0 == 2) as usize;
+    }
+    assert!(good[0] > 20_000 && good[1] > 20_000, "{good:?}");
+}

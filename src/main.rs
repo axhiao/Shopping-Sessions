@@ -1283,6 +1283,167 @@ fn scan_lean<'a, const N: usize, const K: usize, F: FnMut(&[&'a [u8]; N])>(buf: 
     }
 }
 
+/// One side of a line's layout (its first K fields, or the others), as it
+/// follows from where that side's separators and quotes are: start and
+/// length of each field's content, relative to the side's first byte. The
+/// same few hundred patterns make up nearly all lines (every field is quoted
+/// or not, and has one of a few lengths), so a side is worked out once per
+/// pattern and looked up after that.
+#[derive(Clone, Copy)]
+#[repr(C, align(32))]
+struct Half {
+    /// The pattern: separator bits and quote bits of the side (never both 0).
+    a: u64,
+    b: u64,
+    s: [u8; 4],
+    l: [u8; 4],
+    /// 0: quotes not around whole fields, or not the right number of fields.
+    good: u8,
+}
+
+const MEMO_N: usize = 512;
+
+/// The remembered sides of one kind of line (per thread).
+struct ShapeMemo {
+    lo: [Half; MEMO_N],
+    hi: [Half; MEMO_N],
+}
+
+impl ShapeMemo {
+    fn new() -> Box<ShapeMemo> {
+        const E: Half = Half { a: 0, b: 0, s: [0; 4], l: [0; 4], good: 0 };
+        Box::new(ShapeMemo { lo: [E; MEMO_N], hi: [E; MEMO_N] })
+    }
+}
+
+#[cfg(all(target_feature = "bmi2", target_feature = "sse4.2"))]
+#[inline(always)]
+fn memo_slot(a: u64, b: u64) -> usize {
+    use std::arch::x86_64::_mm_crc32_u64;
+    unsafe { _mm_crc32_u64(_mm_crc32_u64(0, a), b) as usize & (MEMO_N - 1) }
+}
+
+/// The low side from its pattern: `seps` = its K separators, `q` = the quotes
+/// before the K-th separator (the same rules as `line_cursors`).
+#[cold]
+#[inline(never)]
+fn half_lo(h: &mut Half, seps: u64, q: u64, k: usize) {
+    let top = 1u64 << (63 - seps.leading_zeros());
+    let starts = ((seps ^ top) << 1) | 1;
+    let (o, c) = (q & starts, q & (seps >> 1));
+    let bad = (q ^ o ^ c) | (((!seps).wrapping_add(o) ^ (c << 1)) & seps);
+    let (mut cs, mut ce) = (starts + o, seps - c);
+    *h = Half { a: seps, b: q, s: [0; 4], l: [0; 4], good: (bad == 0) as u8 };
+    for i in 0..k {
+        let (x, y) = (cs.trailing_zeros(), ce.trailing_zeros());
+        h.s[i] = x as u8;
+        h.l[i] = y.wrapping_sub(x) as u8;
+        cs &= cs.wrapping_sub(1);
+        ce &= ce.wrapping_sub(1);
+    }
+}
+
+/// The high side from its pattern: `w` = the separators from the side's first
+/// byte to the line's newline (its top bit), `qf` = the quotes there; `m`
+/// fields are expected.
+#[cold]
+#[inline(never)]
+fn half_hi(h: &mut Half, w: u64, qf: u64, m: usize) {
+    let mut t1 = w;
+    for _ in 1..m {
+        t1 &= t1.wrapping_sub(1);
+    }
+    // well-formed needs exactly m separators (the last is the newline)
+    let count_ok = t1 != 0 && t1 & t1.wrapping_sub(1) == 0;
+    let t2 = t1 & t1.wrapping_sub(1);
+    let sepw = w ^ t2;
+    let startw = ((w ^ t1) << 1) | 1;
+    let qw = qf & (t1 ^ t1.wrapping_sub(1));
+    let (ow, cw) = (qw & startw, qw & (sepw >> 1));
+    let bad = (qw ^ ow ^ cw) | (((!sepw).wrapping_add(ow) ^ (cw << 1)) & sepw);
+    let (mut cs, mut ce) = (startw + ow, sepw - cw);
+    *h = Half { a: w, b: qf, s: [0; 4], l: [0; 4], good: (bad == 0 && count_ok) as u8 };
+    if h.good != 0 {
+        for i in 0..m {
+            let (x, y) = (cs.trailing_zeros(), ce.trailing_zeros());
+            h.s[i] = x as u8;
+            h.l[i] = y.wrapping_sub(x) as u8;
+            cs &= cs.wrapping_sub(1);
+            ce &= ce.wrapping_sub(1);
+        }
+    }
+}
+
+/// What `line_memo` finds.
+enum LineM {
+    Slow,
+    Bad(usize),
+    /// newline offset, offset of the high side, the two sides
+    Good(usize, usize, *const Half, *const Half),
+}
+
+/// `line_cursors` with the two sides looked up by their patterns: the same
+/// lines are Slow, Bad and Good, with the same fields. N - K and K at most 4.
+#[cfg(all(target_feature = "avx2", target_feature = "bmi2", target_feature = "sse4.2"))]
+#[inline(always)]
+unsafe fn line_memo<const N: usize, const K: usize>(p: *const u8, memo: &mut ShapeMemo) -> LineM {
+    use std::arch::x86_64::_bzhi_u64;
+    let (sep, nl, qt) = win_masks(p);
+    let e = if nl[0] != 0 { nl[0].trailing_zeros() } else { 64 + nl[1].trailing_zeros() } as usize;
+    let mut s1 = sep[0];
+    for _ in 1..K {
+        s1 &= s1.wrapping_sub(1);
+    }
+    let r = s1.trailing_zeros() as usize + 1;
+    if r > 63 || e.wrapping_sub(r) >= 64 {
+        return LineM::Slow;
+    }
+    // low side: the separators and quotes before byte r
+    let (ka, kb) = (_bzhi_u64(sep[0], r as u32), _bzhi_u64(qt[0], r as u32));
+    let lo = memo.lo.as_mut_ptr().add(memo_slot(ka, kb));
+    if ((*lo).a ^ ka) | ((*lo).b ^ kb) != 0 {
+        half_lo(&mut *lo, ka, kb, K);
+    }
+    // high side: from byte r to the newline
+    let n = (e - r + 1) as u32;
+    let ha = _bzhi_u64((sep[0] >> r) | (sep[1] << (64 - r)), n);
+    let hb = _bzhi_u64((qt[0] >> r) | (qt[1] << (64 - r)), n);
+    let hi = memo.hi.as_mut_ptr().add(memo_slot(ha, hb));
+    if ((*hi).a ^ ha) | ((*hi).b ^ hb) != 0 {
+        half_hi(&mut *hi, ha, hb, N - K);
+    }
+    if (*lo).good & (*hi).good == 0 {
+        return LineM::Bad(e);
+    }
+    LineM::Good(e, r, lo, hi)
+}
+
+/// Fields from the remembered sides of a line.
+struct MemoFields<'a> {
+    p: *const u8,
+    pr: *const u8,
+    lo: *const Half,
+    hi: *const Half,
+    i: usize,
+    j: usize,
+    _buf: std::marker::PhantomData<&'a [u8]>,
+}
+
+impl<'a> Fields<'a> for MemoFields<'a> {
+    #[inline(always)]
+    fn lo(&mut self) -> &'a [u8] {
+        let k = self.i;
+        self.i += 1;
+        unsafe { std::slice::from_raw_parts(self.p.add(*(*self.lo).s.get_unchecked(k) as usize), *(*self.lo).l.get_unchecked(k) as usize) }
+    }
+    #[inline(always)]
+    fn hi(&mut self) -> &'a [u8] {
+        let k = self.j;
+        self.j += 1;
+        unsafe { std::slice::from_raw_parts(self.pr.add(*(*self.hi).s.get_unchecked(k) as usize), *(*self.hi).l.get_unchecked(k) as usize) }
+    }
+}
+
 /// The fields of a line, handed out in order: the first K with `lo`, the
 /// others with `hi`.
 trait Fields<'a> {
@@ -2775,7 +2936,7 @@ fn event_slow(ctx: &Ctx, ix: &IxCfg, buf: &[u8], ls: usize, dc: &mut DateCache, 
     end + 1
 }
 
-fn parse_events(ctx: &Ctx, ix: &IxCfg, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, o: &mut P1Work) {
+fn parse_events(ctx: &Ctx, ix: &IxCfg, buf: &[u8], begin: usize, limit: usize, lm: &LinkMap, o: &mut P1Work, memo: &mut ShapeMemo) {
     let n = buf.len();
     if begin >= n {
         return;
@@ -2790,12 +2951,13 @@ fn parse_events(ctx: &Ctx, ix: &IxCfg, buf: &[u8], begin: usize, limit: usize, l
         let p = unsafe { ptr.add(ls) };
         // (see scan_lean)
         prefetch(p.wrapping_add(INPUT_AHEAD));
-        match unsafe { line_cursors::<7, 3>(p) } {
-            Line::Slow => ls = event_slow(ctx, ix, buf, ls, &mut dc, lm, &mut q, o),
-            Line::Bad(e) => ls += e + 1,
-            Line::Good(c) => {
-                ls += c.e + 1;
-                unsafe { event_line(ctx, ix, &mut dc, lm, &mut MaskFields::new(p, &c), &mut q, o) };
+        match unsafe { line_memo::<7, 3>(p, memo) } {
+            LineM::Slow => ls = event_slow(ctx, ix, buf, ls, &mut dc, lm, &mut q, o),
+            LineM::Bad(e) => ls += e + 1,
+            LineM::Good(e, r, lo, hi) => {
+                ls += e + 1;
+                let mut f = MemoFields { p, pr: unsafe { p.add(r) }, lo, hi, i: 0, j: 0, _buf: std::marker::PhantomData };
+                unsafe { event_line(ctx, ix, &mut dc, lm, &mut f, &mut q, o) };
             }
         }
     }
@@ -2913,6 +3075,7 @@ fn click_slow(
     end + 1
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_clicks(
     ctx: &Ctx,
     buf: &[u8],
@@ -2921,6 +3084,7 @@ fn parse_clicks(
     lm: &LinkMap,
     clq: &mut Parts<RecCc, 2>,
     cesc: &mut [PVec<Key>],
+    memo: &mut ShapeMemo,
 ) {
     let n = buf.len();
     if begin >= n {
@@ -2936,12 +3100,13 @@ fn parse_clicks(
         let p = unsafe { ptr.add(ls) };
         // (see scan_lean)
         prefetch(p.wrapping_add(INPUT_AHEAD));
-        match unsafe { line_cursors::<4, 2>(p) } {
-            Line::Slow => ls = click_slow(ctx, buf, ls, &mut dc, lm, &mut q, clq, cesc),
-            Line::Bad(e) => ls += e + 1,
-            Line::Good(c) => {
-                ls += c.e + 1;
-                if unsafe { click_fields(ctx, &mut dc, lm, &mut MaskFields::new(p, &c), q.slot) } {
+        match unsafe { line_memo::<4, 2>(p, memo) } {
+            LineM::Slow => ls = click_slow(ctx, buf, ls, &mut dc, lm, &mut q, clq, cesc),
+            LineM::Bad(e) => ls += e + 1,
+            LineM::Good(e, r, lo, hi) => {
+                ls += e + 1;
+                let mut f = MemoFields { p, pr: unsafe { p.add(r) }, lo, hi, i: 0, j: 0, _buf: std::marker::PhantomData };
+                if unsafe { click_fields(ctx, &mut dc, lm, &mut f, q.slot) } {
                     if let Some((base, n)) = q.keep(lm) {
                         flush_clicks(base, n, lm, clq, cesc);
                     }
@@ -3647,6 +3812,8 @@ fn main() {
             eprintln!("{:>8.1} ms  link map built ({} pairs)", t0.elapsed().as_secs_f64() * 1e3, total_pairs.load(Ordering::Relaxed));
         }
         let ctx = ctx_cell.get_or_init(&build_ctx);
+        let mut memo_ev = ShapeMemo::new();
+        let mut memo_cl = ShapeMemo::new();
         let mut o = P1Work {
             ix: Parts::new(ix.parts, res_ix),
             ixodd: (0..ix.parts).map(|_| PVec::with_capacity(16)).collect(),
@@ -3679,8 +3846,8 @@ fn main() {
             let c = &chunks[data_chunks[i]];
             let (bytes, b, l) = chunk_bytes(&files[c.file], c, &mut buf);
             match c.kind {
-                Kind::Event => parse_events(ctx, &ix, bytes, b, l, lm, &mut o),
-                Kind::Click => parse_clicks(ctx, bytes, b, l, lm, &mut o.clq, &mut o.cesc),
+                Kind::Event => parse_events(ctx, &ix, bytes, b, l, lm, &mut o, &mut memo_ev),
+                Kind::Click => parse_clicks(ctx, bytes, b, l, lm, &mut o.clq, &mut o.cesc, &mut memo_cl),
                 Kind::Link => unreachable!(),
             }
             let inf = &files[c.file];
