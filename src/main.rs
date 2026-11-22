@@ -456,8 +456,13 @@ fn fm(a: u64, b: u64) -> u64 {
     (r as u64) ^ ((r >> 64) as u64)
 }
 
-/// The key of a string of more than 15 bytes: a 120-bit hash, 0xFF in the
+/// The key of a string of more than 15 bytes: an 88-bit hash, 0xFF in the
 /// last byte. (The first word is never 0: that marks an empty slot.)
+/// The 32 bits above the last byte are left zero on purpose: that is the
+/// shape `compact_plain` asks for, so a long key travels in 12 bytes like a
+/// short one, with no entry in a side list and no map lookup per record in
+/// the session phase. (88 bits: two of a billion long IDs collide with a
+/// chance of about 1 in 600 million.)
 #[inline(always)]
 fn long_hash(s: &[u8]) -> Key {
     let mut h1: u64 = 0x243F_6A88_85A3_08D3 ^ s.len() as u64;
@@ -486,7 +491,7 @@ fn long_hash(s: &[u8]) -> Key {
         h1 = fm(h1 ^ x, 0x9E37_79B9_7F4A_7C15);
         h2 = fm(h2 ^ x, 0xC2B2_AE3D_27D4_EB4F) ^ h1;
     }
-    [h1 | (h1 == 0) as u64, (h2 & !0xFF) | 0xFF]
+    [h1 | (h1 == 0) as u64, (h2 & 0xFFFF_FF00_0000_0000) | 0xFF]
 }
 
 /// Where `k` is in the table: its slot if it is there, else None.
@@ -3643,7 +3648,13 @@ fn person_add_run(st: &mut P3, words: &[u32], pur0: u32) {
 /// breaks between two used buckets iff min(next) - max(previous) > 30 min.
 /// `cls`: the person's clicks as ts << 32 | index into `camps`, sorted by ts,
 /// ties by click id descending (so the last of equal ts has the smallest id).
-fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u64], camps: &[u32], ordered: Option<&[u32]>) {
+/// Safety: every index it uses is one the pipeline made itself. `cls` holds
+/// indices into `camps`, whose values are campaign numbers (below the length
+/// of `st.cnt` and `st.pos`); the purchases in `st.purs` index `pur`, whose
+/// categories are below the length of `st.catsum`; event times lie inside
+/// the window, so their days are below the length of `st.pend` and their
+/// buckets inside `st.bits` and `st.cell`.
+unsafe fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u64], camps: &[u32], ordered: Option<&[u32]>) {
     let mut lo = 0usize;
     let mut hi = 0usize;
     // day accumulators
@@ -3664,8 +3675,8 @@ fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u
     macro_rules! flush_assists {
         () => {{
             for &d in &st.pend_days {
-                let n = st.pend[d as usize];
-                st.pend[d as usize] = 0;
+                let n = *st.pend.get_unchecked_mut(d as usize);
+                *st.pend.get_unchecked_mut(d as usize) = 0;
                 let row = d as usize * stride;
                 for &c in &st.active {
                     unsafe { *st.assist.get_unchecked_mut(row + c as usize) += n };
@@ -3677,31 +3688,31 @@ fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u
     macro_rules! finish_session {
         () => {{
             let sc = s_start + WEEK;
-            while hi < cls.len() && ((cls[hi] >> 32) as i64) <= sc {
-                let c = unsafe { *camps.get_unchecked(cls[hi] as u32 as usize) } as usize;
-                if st.cnt[c] == 0 {
+            while hi < cls.len() && ((*cls.get_unchecked(hi) >> 32) as i64) <= sc {
+                let c = unsafe { *camps.get_unchecked(*cls.get_unchecked(hi) as u32 as usize) } as usize;
+                if *st.cnt.get_unchecked_mut(c) == 0 {
                     flush_assists!();
-                    st.pos[c] = st.active.len() as u32;
+                    *st.pos.get_unchecked_mut(c) = st.active.len() as u32;
                     st.active.push(c as u32);
                 }
-                st.cnt[c] += 1;
+                *st.cnt.get_unchecked_mut(c) += 1;
                 hi += 1;
             }
-            while lo < hi && ((cls[lo] >> 32) as i64) < sc - WEEK {
-                let c = unsafe { *camps.get_unchecked(cls[lo] as u32 as usize) } as usize;
-                st.cnt[c] -= 1;
-                if st.cnt[c] == 0 {
+            while lo < hi && ((*cls.get_unchecked(lo) >> 32) as i64) < sc - WEEK {
+                let c = unsafe { *camps.get_unchecked(*cls.get_unchecked(lo) as u32 as usize) } as usize;
+                *st.cnt.get_unchecked_mut(c) -= 1;
+                if *st.cnt.get_unchecked_mut(c) == 0 {
                     flush_assists!();
-                    let p = st.pos[c] as usize;
+                    let p = *st.pos.get_unchecked_mut(c) as usize;
                     let last = st.active.pop().unwrap();
                     if p < st.active.len() {
-                        st.active[p] = last;
-                        st.pos[last as usize] = p as u32;
+                        *st.active.get_unchecked_mut(p) = last;
+                        *st.pos.get_unchecked_mut(last as usize) = p as u32;
                     }
                 }
                 lo += 1;
             }
-            let credit = if lo < hi { unsafe { *camps.get_unchecked(cls[hi - 1] as u32 as usize) } } else { g.organic } as usize;
+            let credit = if lo < hi { unsafe { *camps.get_unchecked(*cls.get_unchecked(hi - 1) as u32 as usize) } } else { g.organic } as usize;
             let cell = s_didx * (g.organic as usize + 1) + credit;
             unsafe { *st.sess.get_unchecked_mut(cell) += 1 };
             if s_purch {
@@ -3710,10 +3721,10 @@ fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u
                 a[2] += s_rev;
             }
             if !st.active.is_empty() {
-                if st.pend[s_didx] == 0 {
+                if *st.pend.get_unchecked_mut(s_didx) == 0 {
                     st.pend_days.push(s_didx as u32);
                 }
-                st.pend[s_didx] += 1;
+                *st.pend.get_unchecked_mut(s_didx) += 1;
             }
         }};
     }
@@ -3722,12 +3733,12 @@ fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u
             let mut top = -1i32;
             let mut best = 0u64;
             for &c in &st.touched {
-                let v = st.catsum[c as usize];
+                let v = *st.catsum.get_unchecked_mut(c as usize);
                 if v > best || (v == best && (c as i32) < top) {
                     best = v;
                     top = c as i32;
                 }
-                st.catsum[c as usize] = 0;
+                *st.catsum.get_unchecked_mut(c as usize) = 0;
             }
             st.touched.clear();
             st.uw.row((cur_day - g.day0) as usize, d_sessions, d_events, d_rev, top);
@@ -3763,8 +3774,8 @@ fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u
             prev_t = last;
             d_events += $n;
             // the purchases of this stretch
-            while pi < st.purs.len() && (st.purs[pi] >> 32) as i64 <= last {
-                let e = st.purs[pi];
+            while pi < st.purs.len() && (*st.purs.get_unchecked(pi) >> 32) as i64 <= last {
+                let e = *st.purs.get_unchecked(pi);
                 pi += 1;
                 let (p, c) = unsafe { *pur.get_unchecked((e as u32 & !PURCHASE) as usize) };
                 let p = p as u64;
@@ -3772,10 +3783,10 @@ fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u
                 s_purch = true;
                 d_rev += p;
                 let c = c as usize;
-                if st.catsum[c] == 0 {
+                if *st.catsum.get_unchecked_mut(c) == 0 {
                     st.touched.push(c as u32);
                 }
-                st.catsum[c] += p;
+                *st.catsum.get_unchecked_mut(c) += p;
             }
         }};
     }
@@ -3790,11 +3801,11 @@ fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u
             st.purs.sort_unstable();
         }
         for wi in 0..st.bits.len() {
-            let mut word = st.bits[wi];
+            let mut word = *st.bits.get_unchecked_mut(wi);
             if word == 0 {
                 continue;
             }
-            st.bits[wi] = 0;
+            *st.bits.get_unchecked_mut(wi) = 0;
             while word != 0 {
                 let b = wi * 64 + word.trailing_zeros() as usize;
                 word &= word - 1;
@@ -3813,7 +3824,7 @@ fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u
     }
     flush_assists!();
     for &c in &st.active {
-        st.cnt[c as usize] = 0;
+        *st.cnt.get_unchecked_mut(c as usize) = 0;
     }
     st.active.clear();
 }
@@ -3894,7 +3905,8 @@ impl LocalIds {
     }
     #[inline(always)]
     fn home(&self, a: u64, b: u32) -> usize {
-        (fm(a ^ 0x9E37_79B9_7F4A_7C15, b as u64 ^ 0xD6E8_FEB8_6659_FD93) >> 20) as usize & self.mask
+        // (one multiplication: the table is small and the full key is compared)
+        ((a ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & self.mask
     }
     #[cold]
     fn grow(&mut self) {
@@ -4431,11 +4443,12 @@ fn main() {
             dd: Parts::new(pa, res_dd),
             pay: Parts::new(pc, res_pay1),
             pur: (0..pc).map(|_| PVec::with_capacity(res_pay1 / 24 + 16)).collect(),
-            // (long IDs do not fit the compact form: about one event in six
-            // and one click in three leave a full key here)
-            pesc: (0..pc).map(|_| PVec::with_capacity(res_pay1 / 6 + 16)).collect(),
+            // (keys that do not fit the compact form leave a full key here:
+            // a person ID of 12 to 15 bytes, which the generator does not
+            // write, and a long click ID, one click in eight)
+            pesc: (0..pc).map(|_| PVec::with_capacity(res_pay1 / 64 + 16)).collect(),
             clq: Parts::new(pc, res_cl),
-            cesc: (0..pc).map(|_| PVec::with_capacity(res_cl / 3 + 16)).collect(),
+            cesc: (0..pc).map(|_| PVec::with_capacity(res_cl / 7 + 16)).collect(),
         };
         // (the buffers of a Parts are allocated one after the other)
         let ix_region = {
@@ -5096,7 +5109,7 @@ fn main() {
                         person_add_run(&mut st, words, pur0);
                     }
                 }
-                person_finish(&geo, &mut st, lid.persons[p], &lpur, cl, &ccamp, ordered);
+                unsafe { person_finish(&geo, &mut st, lid.persons[p], &lpur, cl, &ccamp, ordered) };
                 unsafe { lpur.set_len(loose_pur) };
             }
             tick!(3);

@@ -860,11 +860,11 @@ fn one_person(geo: &Geo, st: &mut P3, name: Key, words: &[u32], lpur: &[(u32, u3
         }
     }
     if in_order {
-        person_finish(geo, st, name, lpur, cls, camps, Some(words));
+        unsafe { person_finish(geo, st, name, lpur, cls, camps, Some(words)) };
     } else {
         st.purs.clear();
         person_add_run(st, words, 0);
-        person_finish(geo, st, name, lpur, cls, camps, None);
+        unsafe { person_finish(geo, st, name, lpur, cls, camps, None) };
     }
 }
 
@@ -1799,7 +1799,7 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
                 }
                 sort_clicks(&mut cls, |i, j| cmp_key(&cl[j].2, &cl[i].2));
                 person_add(&mut st, &pev[p]);
-                person_finish(&geo, &mut st, names[p], &lpur, &cls, &pcamps, None);
+                unsafe { person_finish(&geo, &mut st, names[p], &lpur, &cls, &pcamps, None) };
             }
         }
         st.uw.finish(w == 0);
