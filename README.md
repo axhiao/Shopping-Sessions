@@ -4,13 +4,13 @@ A single static Rust binary (no dependencies, `FROM scratch` image) for the Data
 *Shopping Sessions* buildathon track: it turns the click-stream CSVs in `$DATA_DIR` into
 the two Parquet tables in `$OUTPUT_DIR` exactly as `rules.md` specifies.
 
-| Dataset (generator) | Local, bare | Local, Docker with scorer flags pinned to 4 cores / 8 threads |
-| --- | --- | --- |
-| 1M events (dev, seed 1) | 0.13 s | 0.35 s |
-| 20M events (practice size) | 0.82 s | 1.15 s |
-| 60M events (final size) | 2.40 s | 2.77 s |
+| Dataset (generator) | Local, 4 cores / 8 threads |
+| --- | --- |
+| 1M events (dev, seed 1) | 0.04 s |
+| 20M events (practice size) | 0.55 s |
+| 60M events (final size) | 1.75 s |
 
-(AMD Threadripper PRO 5955WX; the scorer's Xeons will differ.)
+(AMD Threadripper PRO 5955WX, bare binary; the scorer's Xeons differ.)
 
 ## Two engines
 

@@ -873,12 +873,13 @@ fn person_name(dx: &Dx, user: usize, comp: u64, flat: u64, texts: &[u64; 16], kn
     9 - (best.leading_zeros() / 8) as usize
 }
 
-/// The sessions of the person whose events are the plain cells of
-/// table[start..end), in time order (checked by the caller). `cls`: the
-/// person's clicks as ts << 32 | index into `ucl`, in time order, equal times
-/// by click ID descending. The same bookkeeping as `person_finish`.
+/// The sessions of the person whose events are `words` (ts | PURCHASE), in
+/// time order (checked by the caller), with the purchases' (price, category)
+/// in `lpur`. `cls`: the person's clicks as ts << 32 | index into `ucl`, in
+/// time order, equal times by click ID descending. The same bookkeeping as
+/// `person_finish`.
 #[inline(always)]
-fn person_cells(g: &Geo, st: &mut P3, dx: &Dx, start: usize, end: usize, cls: &[u64], ucl: &[[u64; 2]], name: &[u8]) {
+fn person_words(g: &Geo, st: &mut P3, words: &[u32], lpur: &[(u32, u32)], cls: &[u64], ucl: &[[u64; 2]], name: &[u8]) {
     let camp_of = |e: u64| unsafe { (ucl.get_unchecked(e as u32 as usize)[1] >> 31 & 0xFFFF) as usize };
     let mut lo = 0usize;
     let mut hi = 0usize;
@@ -968,13 +969,9 @@ fn person_cells(g: &Geo, st: &mut P3, dx: &Dx, start: usize, end: usize, cls: &[
             st.uw.row((cur_day - g.day0) as usize, d_sessions, d_events, d_rev, top);
         }};
     }
-    for n in start..end {
-        let c = dx.cell(n);
-        let w0 = c[0].load(Ordering::Relaxed);
-        if w0 & (VALID | ODD) != VALID {
-            continue;
-        }
-        let t = (w0 & TS_MASK) as i64;
+    let mut pi = 0usize;
+    for &wd in words {
+        let t = (wd & TS_DEAD) as i64;
         if s_start < 0 || t - prev_t > GAP {
             if s_start >= 0 {
                 finish_session!();
@@ -997,9 +994,10 @@ fn person_cells(g: &Geo, st: &mut P3, dx: &Dx, start: usize, end: usize, cls: &[
         }
         prev_t = t;
         d_events += 1;
-        if w0 & PURCH != 0 {
-            let w1 = c[1].load(Ordering::Relaxed);
-            let (p, cat) = (w1 >> 40, (w1 >> 32 & 0xFF) as usize);
+        if wd & PURCHASE != 0 {
+            let (p, cat) = unsafe { *lpur.get_unchecked(pi) };
+            pi += 1;
+            let (p, cat) = (p as u64, cat as usize);
             s_rev += p;
             s_purch = true;
             d_rev += p;
@@ -1371,6 +1369,9 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
         let mut words: Vec<u32> = Vec::new();
         let mut lpur: Vec<(u32, u32)> = Vec::new();
         let (mut camps, mut cidx): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+        // the events of the stretch being read (ts | PURCHASE) and its purchases
+        let mut evs: Vec<u32> = Vec::new();
+        let mut epur: Vec<(u32, u32)> = Vec::new();
         let mut seen;
         let mut namebuf = [0u8; 16];
         'units: loop {
@@ -1410,6 +1411,8 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
             let (lo, hi) = (bound_of(b), bound_of(b + 1));
             seen = [0u64; 16];
             let mut n = lo;
+            evs.clear();
+            evs.reserve(hi - lo);
             // What the valid cell (w0, w1) is: Some((user, alias)) for a plain
             // event; None for a row by text, which is handed to its person
             // and taken out of the table.
@@ -1471,6 +1474,8 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
                 let mut known = 0u32;
                 let (mut last_text, mut last_alias) = (0u64, 0u64);
                 let (mut in_order, mut prev, mut aset) = (true, 0u64, 1u32 << alias);
+                evs.clear();
+                epur.clear();
                 {
                     let c = cell(n);
                     if c[0].load(Ordering::Relaxed) & PURCH == 0 {
@@ -1529,6 +1534,15 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
                         let t = w0 & TS_MASK;
                         in_order &= t >= prev;
                         prev = t;
+                        // (room for every cell of the bucket was reserved)
+                        unsafe {
+                            let l = evs.len();
+                            *evs.as_mut_ptr().add(l) = (t | (w0 >> 30 & 0x8000_0000)) as u32;
+                            evs.set_len(l + 1);
+                        }
+                        if w0 & PURCH != 0 {
+                            epur.push(((w1 >> 40) as u32, (w1 >> 32 & 0xFF) as u32));
+                        }
                     }
                     n += 1;
                     if n >= hi {
@@ -1592,7 +1606,7 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
                     }
                     sort_clicks(&mut cls, |i, j| ucl[j][0].swap_bytes().cmp(&ucl[i][0].swap_bytes()));
                     let len = person_name(&dx, user, comp0, flat, &texts, known, &mut namebuf);
-                    person_cells(&geo, &mut st, &dx, start, end, &cls, &ucl, &namebuf[..len]);
+                    person_words(&geo, &mut st, &evs, &epur, &cls, &ucl, &namebuf[..len]);
                     continue;
                 }
                 // Some alias with events is not linked to the others, or the
