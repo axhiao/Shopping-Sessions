@@ -926,8 +926,43 @@ fn person_name(dx: &Dx, user: usize, comp: u64, flat: u64, texts: &[u64; 16], kn
 /// in `lpur`. `cls`: the person's clicks as ts << 32 | index into `ucl`, in
 /// time order, equal times by click ID descending. The same bookkeeping as
 /// `person_finish`.
-#[inline(always)]
-fn person_words(g: &Geo, st: &mut P3, words: &[u32], lpur: &[(u32, u32)], cls: &[u64], ucl: &[[u64; 2]], name: &[u8]) {
+/// From cell n on: skips the cells that are no events and takes the views and
+/// carts whose user bytes are `text` (their ts goes to `evs`), up to a valid
+/// cell that is anything else, or `hi`. Returns where it stopped.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn same_text_run(t: *const Cell, mut n: usize, hi: usize, text: u64, evs: *mut u32, len: &mut usize, prev: &mut u64, in_order: &mut bool) -> usize {
+    let (mut l, mut p, mut ok) = (*len, *prev, *in_order);
+    while n < hi {
+        let c = &*t.add(n);
+        let w0 = c[0].load(Ordering::Relaxed);
+        if w0 & VALID != 0 {
+            if w0 & (ODD | PURCH) != 0 || c[1].load(Ordering::Relaxed) != text {
+                break;
+            }
+            let ts = w0 & TS_MASK;
+            ok &= ts >= p;
+            p = ts;
+            *evs.add(l) = ts as u32;
+            l += 1;
+        }
+        n += 1;
+    }
+    *len = l;
+    *prev = p;
+    *in_order = ok;
+    n
+}
+
+/// Per campaign, the number of the last session it was counted for.
+struct Stamps {
+    of: Vec<u32>,
+    serial: u32,
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn person_words(g: &Geo, st: &mut P3, stamp: &mut Stamps, words: &[u32], lpur: &[(u32, u32)], cls: &[u64], ucl: &[[u64; 2]], name: &[u8]) {
     let camp_of = |e: u64| unsafe { (ucl.get_unchecked(e as u32 as usize)[1] >> 31 & 0xFFFF) as usize };
     let mut lo = 0usize;
     let mut hi = 0usize;
@@ -935,12 +970,25 @@ fn person_words(g: &Geo, st: &mut P3, words: &[u32], lpur: &[(u32, u32)], cls: &
     let mut d_sessions = 0u32;
     let mut d_events = 0u32;
     let mut d_rev = 0u64;
-    let mut s_start: i64 = -1;
-    let mut s_didx = 0usize;
-    let mut s_rev = 0u64;
-    let mut s_purch = false;
-    let mut prev_t: i64 = 0;
+    let mut s_start: i64;
+    let mut s_didx: usize;
+    let mut s_rev: u64;
+    let mut s_purch: bool;
     let stride = g.organic as usize + 1;
+    // A person with few clicks (nearly everyone): the clicks' times and
+    // campaigns side by side, and every session looks at its window directly
+    // (a campaign counts once: it is stamped with the session's number).
+    // Many clicks: the window slides over them with a count per campaign.
+    const FEW: usize = 64;
+    let few = cls.len() <= FEW;
+    let mut cts = [0i64; FEW];
+    let mut ccamp = [0u32; FEW];
+    if few {
+        for (i, &e) in cls.iter().enumerate() {
+            cts[i] = (e >> 32) as i64;
+            ccamp[i] = camp_of(e) as u32;
+        }
+    }
     macro_rules! flush_assists {
         () => {{
             for &d in &st.pend_days {
@@ -957,7 +1005,28 @@ fn person_words(g: &Geo, st: &mut P3, words: &[u32], lpur: &[(u32, u32)], cls: &
     macro_rules! finish_session {
         () => {{
             let sc = s_start + WEEK;
-            if !cls.is_empty() {
+            if few {
+                unsafe {
+                    while hi < cls.len() && *cts.get_unchecked(hi) <= sc {
+                        hi += 1;
+                    }
+                    while lo < hi && *cts.get_unchecked(lo) < sc - WEEK {
+                        lo += 1;
+                    }
+                    // every campaign of the window once
+                    let row = s_didx * stride;
+                    stamp.serial += 1;
+                    let serial = stamp.serial;
+                    for i in lo..hi {
+                        let c = *ccamp.get_unchecked(i) as usize;
+                        let seen = stamp.of.get_unchecked_mut(c);
+                        if *seen != serial {
+                            *seen = serial;
+                            *st.assist.get_unchecked_mut(row + c) += 1;
+                        }
+                    }
+                }
+            } else {
                 while hi < cls.len() && ((cls[hi] >> 32) as i64) <= sc {
                     let c = camp_of(cls[hi]);
                     if st.cnt[c] == 0 {
@@ -1017,54 +1086,69 @@ fn person_words(g: &Geo, st: &mut P3, words: &[u32], lpur: &[(u32, u32)], cls: &
             st.uw.row((cur_day - g.day0) as usize, d_sessions, d_events, d_rev, top);
         }};
     }
+    // a session at a time: its first event, then the events less than 30
+    // minutes after the one before
+    let n = words.len();
     let mut pi = 0usize;
-    for &wd in words {
-        let t = (wd & TS_DEAD) as i64;
-        if s_start < 0 || t - prev_t > GAP {
-            if s_start >= 0 {
-                finish_session!();
+    let mut i = 0usize;
+    while i < n {
+        let t = unsafe { (*words.get_unchecked(i) & TS_DEAD) as i64 };
+        s_start = t;
+        s_rev = 0;
+        s_purch = false;
+        let day = (g.ws + t).div_euclid(DAY);
+        s_didx = (day - g.day0) as usize;
+        if day != cur_day {
+            if cur_day != i64::MIN {
+                flush_day!();
+                d_sessions = 0;
+                d_events = 0;
+                d_rev = 0;
             }
-            s_start = t;
-            s_rev = 0;
-            s_purch = false;
-            let day = (g.ws + t).div_euclid(DAY);
-            s_didx = (day - g.day0) as usize;
-            if day != cur_day {
-                if cur_day != i64::MIN {
-                    flush_day!();
-                    d_sessions = 0;
-                    d_events = 0;
-                    d_rev = 0;
+            cur_day = day;
+        }
+        d_sessions += 1;
+        let mut prev = t;
+        let mut j = i;
+        loop {
+            let wd = unsafe { *words.get_unchecked(j) };
+            if wd & PURCHASE != 0 {
+                let (p, cat) = unsafe { *lpur.get_unchecked(pi) };
+                pi += 1;
+                let (p, cat) = (p as u64, cat as usize);
+                s_rev += p;
+                s_purch = true;
+                d_rev += p;
+                if st.catsum[cat] == 0 {
+                    st.touched.push(cat as u32);
                 }
-                cur_day = day;
+                st.catsum[cat] += p;
             }
-            d_sessions += 1;
-        }
-        prev_t = t;
-        d_events += 1;
-        if wd & PURCHASE != 0 {
-            let (p, cat) = unsafe { *lpur.get_unchecked(pi) };
-            pi += 1;
-            let (p, cat) = (p as u64, cat as usize);
-            s_rev += p;
-            s_purch = true;
-            d_rev += p;
-            if st.catsum[cat] == 0 {
-                st.touched.push(cat as u32);
+            j += 1;
+            if j == n {
+                break;
             }
-            st.catsum[cat] += p;
+            let tn = unsafe { (*words.get_unchecked(j) & TS_DEAD) as i64 };
+            if tn - prev > GAP {
+                break;
+            }
+            prev = tn;
         }
-    }
-    if s_start >= 0 {
+        d_events += (j - i) as u32;
+        i = j;
         finish_session!();
+    }
+    if n > 0 {
         flush_day!();
         st.uw.end_person(name);
     }
-    flush_assists!();
-    for &c in &st.active {
-        st.cnt[c as usize] = 0;
+    if !few {
+        flush_assists!();
+        for &c in &st.active {
+            st.cnt[c as usize] = 0;
+        }
+        st.active.clear();
     }
-    st.active.clear();
 }
 
 #[inline(always)]
@@ -1380,6 +1464,7 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
         // the events of the stretch being read (ts | PURCHASE) and its purchases
         let mut evs: Vec<u32> = Vec::new();
         let mut epur: Vec<(u32, u32)> = Vec::new();
+        let mut stamp = Stamps { of: vec![0u32; ncamp + 1], serial: 0 };
         let mut seen;
         let mut namebuf = [0u8; 16];
         'units: loop {
@@ -1480,90 +1565,78 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
                 // the ID texts of the aliases met in the stretch; the last one
                 let mut texts = [0u64; 16];
                 let mut known = 0u32;
-                let (mut last_text, mut last_alias) = (0u64, 0u64);
+                let mut last_text = 0u64;
                 let (mut in_order, mut prev, mut aset) = (true, 0u64, 1u32 << alias);
-                evs.clear();
                 epur.clear();
                 {
                     let c = cell(n);
                     if c[0].load(Ordering::Relaxed) & PURCH == 0 {
                         last_text = c[1].load(Ordering::Relaxed);
-                        last_alias = alias;
                         texts[alias as usize] = last_text;
                         known |= 1 << alias;
                     }
                 }
                 // --- to the end of the stretch: is it in time order?
+                let mut len = 0usize;
                 loop {
-                    let c = cell(n);
-                    let w0 = c[0].load(Ordering::Relaxed);
-                    if w0 & VALID != 0 {
-                        let w1 = c[1].load(Ordering::Relaxed);
-                        if w0 & (ODD | PURCH) != 0 || w1 != last_text {
-                            // not the ID of the event before: which alias, whose?
-                            let mut found = None;
-                            if w0 & (ODD | PURCH) == 0 {
-                                let mut k = known;
-                                while k != 0 {
-                                    let a = k.trailing_zeros() as usize;
-                                    k &= k - 1;
-                                    if texts[a] == w1 {
-                                        found = Some((user, a as u64));
-                                        break;
-                                    }
-                                }
-                            }
-                            if found.is_none() {
-                                found = plain_or_out!(c, w0, w1);
-                            }
-                            match found {
-                                None => {
-                                    n += 1;
-                                    if n >= hi {
-                                        break;
-                                    }
-                                    continue;
-                                }
-                                Some((u2, a2)) => {
-                                    if u2 != user {
-                                        next_ev = Some((u2, a2));
-                                        break;
-                                    }
-                                    if w0 & PURCH == 0 {
-                                        texts[a2 as usize] = w1;
-                                        known |= 1 << a2;
-                                        last_text = w1;
-                                        last_alias = a2;
-                                    }
-                                    aset |= 1 << a2;
-                                }
-                            }
-                        }
-                        let t = w0 & TS_MASK;
-                        in_order &= t >= prev;
-                        prev = t;
-                        // (room for every cell of the bucket was reserved)
-                        unsafe {
-                            let l = evs.len();
-                            *evs.as_mut_ptr().add(l) = (t | (w0 >> 30 & 0x8000_0000)) as u32;
-                            evs.set_len(l + 1);
-                        }
-                        if w0 & PURCH != 0 {
-                            epur.push(((w1 >> 40) as u32, (w1 >> 32 & 0xFF) as u32));
-                        }
-                    }
-                    n += 1;
+                    // the events with the ID of the one before, in one go
+                    n = unsafe { same_text_run(dx.t, n, hi, last_text, evs.as_mut_ptr(), &mut len, &mut prev, &mut in_order) };
                     if n >= hi {
                         break;
                     }
+                    // a valid cell with another ID, a purchase or a row by text
+                    let c = cell(n);
+                    let w0 = c[0].load(Ordering::Relaxed);
+                    let w1 = c[1].load(Ordering::Relaxed);
+                    let mut found = None;
+                    if w0 & (ODD | PURCH) == 0 {
+                        let mut k = known;
+                        while k != 0 {
+                            let a = k.trailing_zeros() as usize;
+                            k &= k - 1;
+                            if texts[a] == w1 {
+                                found = Some((user, a as u64));
+                                break;
+                            }
+                        }
+                    }
+                    if found.is_none() {
+                        found = plain_or_out!(c, w0, w1);
+                    }
+                    match found {
+                        None => {
+                            n += 1;
+                            continue;
+                        }
+                        Some((u2, a2)) => {
+                            if u2 != user {
+                                next_ev = Some((u2, a2));
+                                break;
+                            }
+                            if w0 & PURCH == 0 {
+                                texts[a2 as usize] = w1;
+                                known |= 1 << a2;
+                                last_text = w1;
+                            } else {
+                                epur.push(((w1 >> 40) as u32, (w1 >> 32 & 0xFF) as u32));
+                            }
+                            aset |= 1 << a2;
+                        }
+                    }
+                    let t = w0 & TS_MASK;
+                    in_order &= t >= prev;
+                    prev = t;
+                    // (room for every cell of the bucket was reserved)
+                    unsafe { *evs.as_mut_ptr().add(len) = (t | (w0 >> 30 & 0x8000_0000)) as u32 };
+                    len += 1;
+                    n += 1;
                 }
+                unsafe { evs.set_len(len) };
                 let end = n;
                 // the alias of a plain event of the stretch
                 let alias_of = |w0: u64, w1: u64| {
                     if w0 & PURCH != 0 {
                         w1 & 15
-                    } else if w1 == last_text {
-                        last_alias
                     } else {
                         (0..16u64).find(|&a| known >> a & 1 != 0 && texts[a as usize] == w1).unwrap_or(0)
                     }
@@ -1614,7 +1687,7 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
                     }
                     sort_clicks(&mut cls, |i, j| ucl[j][0].swap_bytes().cmp(&ucl[i][0].swap_bytes()));
                     let len = person_name(&dx, user, comp0, flat, &texts, known, &mut namebuf);
-                    person_words(&geo, &mut st, &evs, &epur, &cls, &ucl, &namebuf[..len]);
+                    person_words(&geo, &mut st, &mut stamp, &evs, &epur, &cls, &ucl, &namebuf[..len]);
                     continue;
                 }
                 // Some alias with events is not linked to the others, or the

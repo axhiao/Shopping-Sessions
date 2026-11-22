@@ -34,17 +34,16 @@ small), and then:
    separators and quotes, so the layout is worked out once per pattern.
    - An event copy is stored straight into a table indexed by the event's number (16
      bytes: flags, `ingest_ts`, `ts`, the user): the first copy takes the cell with one
-     compare-and-swap, later copies are set aside and settled after the parse (the
-     smallest `ingest_ts` keeps the cell). Dedup is an array store; no partitions, no
-     hash table. A copy that is not a valid event still takes its cell, so a later valid
-     copy cannot rescue it.
+     compare-and-swap, and a later copy replaces it there only if its `ingest_ts` is
+     smaller. Dedup is an array store; no partitions, no hash table. A copy that is not
+     a valid event still takes its cell, so a later valid copy cannot rescue it.
    - The user ID of a row goes into the cell as its bytes; it is decoded when the table
      is read, once per stretch of equal IDs.
    - A click keeps its ID's bytes and goes to its user's bucket. Copies of a click are
      identical by the rules and the session code only asks for the latest click and the
      set of campaigns, so clicks need no dedup.
-   - A link between two aliases of one user is four bytes; per user a 64-bit word says
-     which of its aliases are linked.
+   - A link between two aliases of one user is merged into that user's 64-bit word,
+     which says which of its aliases are linked.
 2. **Sessions (all threads, a bucket of users at a time).** The generator numbers events
    user by user in time order, so reading the table in order meets each user's events
    together and already sorted: one pass checks that (order, and that the aliases met
