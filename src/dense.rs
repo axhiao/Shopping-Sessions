@@ -179,6 +179,8 @@ struct Dx {
     /// Start of the click window.
     cws: i64,
     ing_base: i64,
+    /// Campaign by number (see `camp_number`); 0xFFFF: none.
+    camp_direct: Vec<u16>,
 }
 
 unsafe impl Sync for Dx {}
@@ -223,6 +225,39 @@ fn bucket_of(user: usize) -> usize {
     } else {
         12 + (user >> 10)
     }
+}
+
+/// The bucket of a user and the user's place in it.
+#[inline(always)]
+fn bucket_local(user: usize) -> (usize, u64) {
+    if user < 1024 {
+        let b = HEAD_LUT[user] as usize;
+        (b, (user - HEAD[b]) as u64)
+    } else {
+        (12 + (user >> 10), (user & 1023) as u64)
+    }
+}
+
+/// Campaign IDs of the form `c_` + number are looked up by the number.
+const CAMP_DIRECT: usize = 100_000;
+
+/// The number of an ID that is `c_` + 1 to 5 digits without a leading zero
+/// (two such IDs are equal exactly when their numbers are). `s` needs 8
+/// readable bytes.
+#[inline(always)]
+fn camp_number(s: &[u8]) -> Option<usize> {
+    let l = s.len();
+    if l.wrapping_sub(3) > 4 {
+        return None;
+    }
+    let x = load8(s, 0);
+    let nd = l - 2;
+    // the digits moved to the top bytes, '0' below them
+    let d = ((x >> 16) << (8 * (8 - nd))) | (0x3030_3030_3030_3030u64 >> (8 * nd));
+    if x as u16 != u16::from_le_bytes(*b"c_") || !all_digits(d, !0) || (nd > 1 && (x >> 16) as u8 == b'0') {
+        return None;
+    }
+    Some(eight_digits(d) as usize)
 }
 
 fn bucket_start(b: usize) -> usize {
@@ -380,8 +415,9 @@ struct D1 {
     /// Links inside one user: user << 8 | alias << 4 | alias.
     edges: PVec<u32>,
     odd_links: Vec<(Key, Key)>,
-    /// Plain clicks by user bucket: [id number | user << 40, ts | campaign
-    /// << 31 | alias << 47] (ts in ms from the start of the click window).
+    /// Plain clicks by user bucket: [the bytes of the ID after its `k`, ts |
+    /// campaign << 31 | alias << 47 | place of the user in the bucket << 51]
+    /// (ts in ms from the start of the click window).
     clicks: Parts<[u64; 2], 4>,
     odd_clicks: Vec<OddClick>,
     /// Copies that found their cell taken: [n, w0, w1].
@@ -447,7 +483,8 @@ impl Ring {
 /// One event line (see the rules in README / rules.md: a copy takes part in
 /// the dedup whatever it holds; `ok` says whether it would be a valid event).
 #[inline(always)]
-unsafe fn event_line<'a, S: Fields<'a>>(dx: &Dx, ctx: &Ctx, dc: &mut DateCache, src: &mut S, o: &mut D1, ring: &mut Ring, w: usize) {
+#[allow(clippy::too_many_arguments)]
+unsafe fn event_line<'a, S: Fields<'a>>(dx: &Dx, ctx: &Ctx, dc: &mut DateCache, src: &mut S, o: &mut D1, ring: &mut Ring, w: usize, nmax: &mut u64) {
     let f0 = src.lo();
     if f0.is_empty() {
         return;
@@ -474,7 +511,8 @@ unsafe fn event_line<'a, S: Fields<'a>>(dx: &Dx, ctx: &Ctx, dc: &mut DateCache, 
     let (ingest_s, ingest_ms) = parse_ingest_dc(dc, f3).unwrap_or((i64::MAX / 2000, i64::MAX / 2));
     let ingest = (ingest_s - dx.ing_base).clamp(0, ING_MASK as i64) as u64;
     ok &= ingest_ms - ts <= DAY;
-    let ty = event_type(src.hi());
+    let f4 = src.hi();
+    let ty = if f4.len() == 4 && (f4.as_ptr() as *const u32).read_unaligned() == u32::from_le_bytes(*b"view") { 0 } else { event_type(f4) };
     let f5 = src.hi();
     ok &= !f5.is_empty();
     let f6 = src.hi();
@@ -513,7 +551,7 @@ unsafe fn event_line<'a, S: Fields<'a>>(dx: &Dx, ctx: &Ctx, dc: &mut DateCache, 
                 }
             }
         };
-        o.nmax = o.nmax.max(n + 1);
+        *nmax = (*nmax).max(n);
         ring.push(dx, o, n, w0, w1);
     } else {
         o.odd_ev.push(OddEv { id: key_of(f0), ingest, valid: ok, ev: side(f1) });
@@ -523,10 +561,10 @@ unsafe fn event_line<'a, S: Fields<'a>>(dx: &Dx, ctx: &Ctx, dc: &mut DateCache, 
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn event_slow(dx: &Dx, ctx: &Ctx, buf: &[u8], ls: usize, dc: &mut DateCache, o: &mut D1, ring: &mut Ring, w: usize) -> usize {
+fn event_slow(dx: &Dx, ctx: &Ctx, buf: &[u8], ls: usize, dc: &mut DateCache, o: &mut D1, ring: &mut Ring, w: usize, nmax: &mut u64) -> usize {
     let (end, res) = slow_line::<7>(buf, ls);
     if let Some(f) = res {
-        unsafe { event_line(dx, ctx, dc, &mut ArrFields { f: &f, i: 0 }, o, ring, w) };
+        unsafe { event_line(dx, ctx, dc, &mut ArrFields { f: &f, i: 0 }, o, ring, w, nmax) };
     }
     end + 1
 }
@@ -542,21 +580,24 @@ fn parse_events(dx: &Dx, ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, o: &
     let ptr = buf.as_ptr();
     let mut ls = begin;
     let mut lines = 0u64;
+    // the largest number stored (plus one)
+    let mut nmax = 0u64;
     while ls < limit && ls < n {
         let p = unsafe { ptr.add(ls) };
         prefetch(p.wrapping_add(INPUT_AHEAD));
         lines += 1;
         match unsafe { line_memo::<7, 3>(p, memo) } {
-            LineM::Slow => ls = event_slow(dx, ctx, buf, ls, &mut dc, o, &mut ring, w),
+            LineM::Slow => ls = event_slow(dx, ctx, buf, ls, &mut dc, o, &mut ring, w, &mut nmax),
             LineM::Bad(e) => ls += e + 1,
             LineM::Good(e, r, lo, hi) => {
                 ls += e + 1;
                 let mut f = MemoFields { p, pr: unsafe { p.add(r) }, lo, hi, i: 0, j: 0, _buf: std::marker::PhantomData };
-                unsafe { event_line(dx, ctx, &mut dc, &mut f, o, &mut ring, w) };
+                unsafe { event_line(dx, ctx, &mut dc, &mut f, o, &mut ring, w, &mut nmax) };
             }
         }
     }
     o.lines += lines;
+    o.nmax = o.nmax.max(nmax + (lines != 0) as u64);
     unsafe { ring.flush(dx, o) };
 }
 
@@ -571,19 +612,35 @@ unsafe fn click_line<'a, S: Fields<'a>>(dx: &Dx, ctx: &Ctx, dc: &mut DateCache, 
         return;
     }
     let fc = src.hi();
-    let camp = match ctx.campaigns.get(&key_of(fc)) {
-        Some(c) if !fc.is_empty() => c,
-        _ => return,
+    let camp = match camp_number(fc) {
+        Some(n) => {
+            let c = *dx.camp_direct.get_unchecked(n);
+            if c == 0xFFFF {
+                return;
+            }
+            c as u32
+        }
+        None => match ctx.campaigns.get(&key_of(fc)) {
+            Some(c) if !fc.is_empty() => c,
+            _ => return,
+        },
     };
     let ts = match parse_ts_dc(dc, src.hi()) {
         Some(t) if t >= dx.cws && t < dx.we => (t - dx.cws) as u64,
         _ => return,
     };
-    if let (Some(v), Some(uv)) = (id_number(b'k', f0), id_number(b'u', f1)) {
-        let u = seq_of(uv, dx.ukey);
-        if (u >> 9) < dx.users && (u & 511) < ALIASES {
-            o.clicks.push(bucket_of((u >> 9) as usize), [v | (u >> 9) << 40, ts | (camp as u64) << 31 | (u & 15) << 47]);
-            return;
+    // a plain click: `k` + up to 8 bytes (kept as they are), a plain user
+    let l0 = f0.len();
+    let p0 = f0.as_ptr();
+    if l0.wrapping_sub(2) < 8 && *p0 == b'k' && *p0.add(l0 - 1) != 0 {
+        if let Some(uv) = id_number(b'u', f1) {
+            let u = seq_of(uv, dx.ukey);
+            if (u >> 9) < dx.users && (u & 511) < ALIASES {
+                let text = (p0.add(1) as *const u64).read_unaligned() & (!0u64 >> (8 * (9 - l0)));
+                let (b, local) = bucket_local((u >> 9) as usize);
+                o.clicks.push(b, [text, ts | (camp as u64) << 31 | (u & 15) << 47 | local << 51]);
+                return;
+            }
         }
     }
     o.odd_clicks.push(OddClick { user: key_of(f1), cid: key_of(f0), ts: ts as u32, camp });
@@ -944,6 +1001,19 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
         we,
         cws: ws - WEEK,
         ing_base: ws.div_euclid(1000) - (1 << 28),
+        camp_direct: {
+            let mut t = vec![0xFFFFu16; CAMP_DIRECT];
+            for (i, id) in ctx.camp_ids.iter().enumerate() {
+                let mut b = id.clone();
+                b.resize(id.len() + 16, 0);
+                if let Some(n) = camp_number(&b[..id.len()]) {
+                    if t[n] == 0xFFFF {
+                        t[n] = i as u16;
+                    }
+                }
+            }
+            t
+        },
     };
     let nb = bucket_of(users - 1) + 1;
     let bytes_of = |k: Kind| files.iter().filter(|f| f.kind == k).map(|f| f.len).sum::<u64>() as usize;
@@ -1252,7 +1322,7 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
             if nc > 0 {
                 for o in p1.iter() {
                     for r in o.clicks[b].as_slice() {
-                        cstart[(r[0] >> 40) as usize - ua + 1] += 1;
+                        cstart[(r[1] >> 51) as usize + 1] += 1;
                     }
                 }
                 for k in 0..nu {
@@ -1265,7 +1335,7 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
                 unsafe { ucl.set_len(nc) };
                 for o in p1.iter() {
                     for r in o.clicks[b].as_slice() {
-                        let f = &mut fill[(r[0] >> 40) as usize - ua];
+                        let f = &mut fill[(r[1] >> 51) as usize];
                         ucl[*f as usize] = *r;
                         *f += 1;
                     }
@@ -1455,7 +1525,7 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
                             cls.push((r[1] & TS_MASK) << 32 | i as u64);
                         }
                     }
-                    sort_clicks(&mut cls, |i, j| cmp_key(&b36_key(b'k', ucl[j][0] & M40), &b36_key(b'k', ucl[i][0] & M40)));
+                    sort_clicks(&mut cls, |i, j| ucl[j][0].swap_bytes().cmp(&ucl[i][0].swap_bytes()));
                     let len = person_name(&dx, user, comp0, flat, &texts, known, &mut namebuf);
                     person_cells(&geo, &mut st, &dx, start, end, &cls, &ucl, &namebuf[..len]);
                     continue;
@@ -1495,7 +1565,7 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
                             cidx.push(i as u32);
                         }
                     }
-                    sort_clicks(&mut cls, |i, j| cmp_key(&b36_key(b'k', ucl[cidx[j] as usize][0] & M40), &b36_key(b'k', ucl[cidx[i] as usize][0] & M40)));
+                    sort_clicks(&mut cls, |i, j| ucl[cidx[j] as usize][0].swap_bytes().cmp(&ucl[cidx[i] as usize][0].swap_bytes()));
                     let len = person_name(&dx, user, comp, flat, &texts, known, &mut namebuf);
                     one_person(&geo, &mut st, key_of(&namebuf[..len]), &words, &lpur, &cls, &camps);
                 }
@@ -1506,7 +1576,7 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
                     if cstart[lu + 1] > cstart[lu] && is_complex(ua + lu) {
                         for r in &ucl[cstart[lu] as usize..cstart[lu + 1] as usize] {
                             let person = person_of(&user_key(&dx, ua + lu, r[1] >> 47 & 15));
-                            ccl[hsel(&person, nthreads)].push(CCl { person, cid: b36_key(b'k', r[0] & M40), ts: (r[1] & TS_MASK) as u32, camp: (r[1] >> 31 & 0xFFFF) as u32 });
+                            ccl[hsel(&person, nthreads)].push(CCl { person, cid: text_key(b'k', r[0]), ts: (r[1] & TS_MASK) as u32, camp: (r[1] >> 31 & 0xFFFF) as u32 });
                         }
                     }
                 }

@@ -2215,6 +2215,19 @@ fn seq_of(v: u64, key: u64) -> u64 {
     (unmix(v) ^ key).wrapping_mul(SCR_C1I) & M40
 }
 
+/// For an ID of n digits: the shift that puts its last digit in the top byte,
+/// and '0' in the bytes below its first.
+static B36_SHIFT: [u8; 9] = [0, 56, 48, 40, 32, 24, 16, 8, 0];
+static B36_PAD: [u64; 9] = {
+    let mut t = [0u64; 9];
+    let mut n = 1;
+    while n < 8 {
+        t[n] = 0x3030_3030_3030_3030u64 >> (8 * n);
+        n += 1;
+    }
+    t
+};
+
 /// The number written in `s` as base-36 digits (0-9, a-z) the way the
 /// generator prints one: 1 to 8 digits, no leading zero, below 2^40. Two
 /// accepted strings are equal exactly when their numbers are. `s` needs 8
@@ -2233,7 +2246,7 @@ fn base36_40(s: &[u8]) -> Option<u64> {
     let v = unsafe {
         use std::arch::x86_64::*;
         // the digits moved to the top bytes (the last one in byte 7), '0' below them
-        let y = (x << (64 - 8 * n)) | ((0x3030_3030_3030_3030u64 >> 1) >> (8 * n - 1));
+        let y = (x << B36_SHIFT[n]) | B36_PAD[n];
         let c = _mm_cvtsi64_si128(y as i64);
         let alpha = _mm_cmpgt_epi8(c, _mm_set1_epi8(0x60));
         let d = _mm_sub_epi8(c, _mm_add_epi8(_mm_set1_epi8(0x30), _mm_and_si128(alpha, _mm_set1_epi8(0x27))));
