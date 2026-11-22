@@ -1586,6 +1586,64 @@ unsafe fn line_memo<const N: usize, const K: usize>(p: *const u8, memo: &mut Sha
     LineM::Good(e, r, lo, hi)
 }
 
+/// The masks of `win_masks` for 128 bytes (four loads).
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn win_masks_wide(p: *const u8) -> ([u64; 2], [u64; 2], [u64; 2]) {
+    use std::arch::x86_64::*;
+    let (nl, cm, qt) = (_mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8));
+    let m = |x: __m256i| _mm256_movemask_epi8(x) as u32 as u64;
+    let mut sep = [0u64; 2];
+    let mut nls = [0u64; 2];
+    let mut qts = [0u64; 2];
+    for k in 0..4 {
+        let x = _mm256_loadu_si256(p.add(32 * k) as *const __m256i);
+        let n = _mm256_cmpeq_epi8(x, nl);
+        sep[k / 2] |= m(_mm256_or_si256(n, _mm256_cmpeq_epi8(x, cm))) << (32 * (k & 1));
+        nls[k / 2] |= m(n) << (32 * (k & 1));
+        qts[k / 2] |= m(_mm256_cmpeq_epi8(x, qt)) << (32 * (k & 1));
+    }
+    (sep, nls, qts)
+}
+
+/// `line_memo` over a window of 128 bytes instead of 96 (lines with a long
+/// ID): the same rules.
+/// `line_cursors` with the two sides looked up by their patterns: the same
+/// lines are Slow, Bad and Good, with the same fields. N - K and K at most 4.
+#[cfg(all(target_feature = "avx2", target_feature = "bmi2", target_feature = "sse4.2"))]
+#[inline(always)]
+unsafe fn line_memo_wide<const N: usize, const K: usize>(p: *const u8, memo: &mut ShapeMemo) -> LineM {
+    use std::arch::x86_64::_bzhi_u64;
+    let (sep, nl, qt) = win_masks_wide(p);
+    let e = if nl[0] != 0 { nl[0].trailing_zeros() } else { 64 + nl[1].trailing_zeros() } as usize;
+    let mut s1 = sep[0];
+    for _ in 1..K {
+        s1 &= s1.wrapping_sub(1);
+    }
+    let r = s1.trailing_zeros() as usize + 1;
+    if r > 63 || e.wrapping_sub(r) >= 64 {
+        return LineM::Slow;
+    }
+    // low side: the separators and quotes before byte r
+    let (ka, kb) = (_bzhi_u64(sep[0], r as u32), _bzhi_u64(qt[0], r as u32));
+    let lo = memo.lo.as_mut_ptr().add(memo_slot(ka, kb));
+    if ((*lo).a ^ ka) | ((*lo).b ^ kb) != 0 {
+        half_lo(&mut *lo, ka, kb, K);
+    }
+    // high side: from byte r to the newline
+    let n = (e - r + 1) as u32;
+    let ha = _bzhi_u64((sep[0] >> r) | (sep[1] << (64 - r)), n);
+    let hb = _bzhi_u64((qt[0] >> r) | (qt[1] << (64 - r)), n);
+    let hi = memo.hi.as_mut_ptr().add(memo_slot(ha, hb));
+    if ((*hi).a ^ ha) | ((*hi).b ^ hb) != 0 {
+        half_hi(&mut *hi, ha, hb, N - K);
+    }
+    if (*lo).good & (*hi).good == 0 {
+        return LineM::Bad(e);
+    }
+    LineM::Good(e, r, lo, hi)
+}
+
 /// Fields from the remembered sides of a line.
 struct MemoFields<'a> {
     p: *const u8,
@@ -3188,12 +3246,12 @@ impl<'a, S: Fields<'a>> Fields<'a> for Lead<'a, S> {
 /// (a long ID): the first field is taken off and the rest scanned as a line
 /// of six fields. Returns the next line's start, or None if that does not
 /// work either.
-#[inline(never)]
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn event_long(ctx: &Ctx, ix: &IxCfg, p: *const u8, ls: usize, dc: &mut DateCache, lm: &LinkMap, q: &mut EvQueue, o: &mut P1Work, memo6: &mut ShapeMemo) -> Option<usize> {
     let (f0, off) = first_field(p)?;
     let pt = p.add(off);
-    match line_memo::<6, 2>(pt, memo6) {
+    match line_memo_wide::<6, 2>(pt, memo6) {
         LineM::Slow => None,
         LineM::Bad(e) => Some(ls + off + e + 1),
         LineM::Good(e, r, lo, hi) => {
@@ -3364,6 +3422,7 @@ fn parse_clicks(
     clq: &mut Parts<RecCc, 2>,
     cesc: &mut [PVec<Key>],
     memo: &mut ShapeMemo,
+    memo3: &mut ShapeMemo,
     mapped: bool,
 ) {
     let n = buf.len();
@@ -3381,7 +3440,30 @@ fn parse_clicks(
         // (see scan_lean)
         prefetch(p.wrapping_add(INPUT_AHEAD));
         match unsafe { line_memo::<4, 2>(p, memo) } {
-            LineM::Slow => ls = click_slow(ctx, buf, ls, &mut dc, lm, &mut q, clq, cesc, mapped),
+            LineM::Slow => {
+                // (two long IDs: the first field taken off, as for events)
+                let mut next = None;
+                if let Some((f0, off)) = unsafe { first_field(p) } {
+                    let pt = unsafe { p.add(off) };
+                    match unsafe { line_memo_wide::<3, 1>(pt, memo3) } {
+                        LineM::Slow => {}
+                        LineM::Bad(e) => next = Some(ls + off + e + 1),
+                        LineM::Good(e, r, lo, hi) => {
+                            let mut f = Lead { first: Some(f0), rest: MemoFields { p: pt, pr: unsafe { pt.add(r) }, lo, hi, i: 0, j: 0, _buf: std::marker::PhantomData } };
+                            if unsafe { click_fields(ctx, &mut dc, lm, &mut f, q.slot, mapped) } {
+                                if let Some((base, n)) = q.keep(lm) {
+                                    flush_clicks(base, n, lm, clq, cesc);
+                                }
+                            }
+                            next = Some(ls + off + e + 1);
+                        }
+                    }
+                }
+                ls = match next {
+                    Some(n) => n,
+                    None => click_slow(ctx, buf, ls, &mut dc, lm, &mut q, clq, cesc, mapped),
+                }
+            }
             LineM::Bad(e) => ls += e + 1,
             LineM::Good(e, r, lo, hi) => {
                 ls += e + 1;
@@ -3758,8 +3840,7 @@ impl LocalIds {
             }
         }
     }
-    #[cold]
-    #[inline(never)]
+    #[inline]
     fn intern_long(&mut self, k: Key) -> u32 {
         if let Some(&id) = self.long.get(&k) {
             return id;
@@ -4258,6 +4339,7 @@ fn main() {
         let ctx = ctx_cell.get_or_init(&build_ctx);
         let mut memo_ev = ShapeMemo::new();
         let mut memo_ev6 = ShapeMemo::new();
+        let mut memo_cl3 = ShapeMemo::new();
         let mut memo_cl = ShapeMemo::new();
         let mut o = P1Work {
             ix: Parts::new(ix.parts, res_ix),
@@ -4295,7 +4377,7 @@ fn main() {
             match c.kind {
                 Kind::Event => parse_events(ctx, &ix, bytes, b, l, lm, &mut o, &mut memo_ev, &mut memo_ev6),
                 // (the bytes are the file's mapping itself, or a copy that goes away)
-                Kind::Click => parse_clicks(ctx, bytes, b, l, lm, &mut o.clq, &mut o.cesc, &mut memo_cl, !files[c.file].map.is_null() && bytes.as_ptr() == files[c.file].map),
+                Kind::Click => parse_clicks(ctx, bytes, b, l, lm, &mut o.clq, &mut o.cesc, &mut memo_cl, &mut memo_cl3, !files[c.file].map.is_null() && bytes.as_ptr() == files[c.file].map),
                 Kind::Link => unreachable!(),
             }
             let inf = &files[c.file];
