@@ -30,8 +30,9 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 
 // A cell of the event table: two words, all zero while empty.
-// w0: PRESENT | VALID | PURCH | ODD | ingest seconds (29 bits) << 31 | ts (31
-//     bits, ms from the window start).
+// w0: PRESENT | VALID | PURCH | ODD | LOCK | ingest seconds (28 bits) << 31 |
+//     ts (31 bits, ms from the window start). LOCK is set only while a
+//     thread is writing the cell.
 // w1: the user. A purchase: price << 40 | category << 32 | user << 4 | alias.
 //     Any other event: the bytes of the user ID after its `u` (at most 8,
 //     zero-padded); it is decoded when the table is read, once per stretch of
@@ -41,8 +42,9 @@ const PRESENT: u64 = 1 << 63;
 const VALID: u64 = 1 << 62;
 const PURCH: u64 = 1 << 61;
 const ODD: u64 = 1 << 60;
+const LOCK: u64 = 1 << 59;
 const ING_SHIFT: u32 = 31;
-const ING_MASK: u64 = (1 << 29) - 1;
+const ING_MASK: u64 = (1 << 28) - 1;
 const IDX_BITS: u32 = 23;
 const IDX_MASK: u64 = (1 << IDX_BITS) - 1;
 const TS_MASK: u64 = 0x7FFF_FFFF;
@@ -172,8 +174,8 @@ struct Dx {
     cap: u64,
     users: u64,
     t: *const Cell,
-    /// Copies that lose the race for a cell are kept by `n >> rshift`.
-    rshift: u32,
+    /// The link word of every user (see UL_INIT).
+    ulink: *const AtomicU64,
     ws: i64,
     we: i64,
     /// Start of the click window.
@@ -191,13 +193,14 @@ impl Dx {
         unsafe { &*self.t.add(n) }
     }
     #[inline(always)]
+    fn link(&self, user: usize) -> &AtomicU64 {
+        unsafe { &*self.ulink.add(user) }
+    }
+    #[inline(always)]
     fn fetch(&self, n: usize) {
         prefetch_w(self.t.wrapping_add(n));
     }
 }
-
-struct Shared<T>(*mut T);
-unsafe impl<T> Sync for Shared<T> {}
 
 // --- user buckets: the unit of work of the session phase. The generator's
 // first users are by far the busiest, so the first buckets are small.
@@ -412,16 +415,14 @@ struct CCl {
 }
 
 struct D1 {
-    /// Links inside one user: user << 8 | alias << 4 | alias.
-    edges: PVec<u32>,
     odd_links: Vec<(Key, Key)>,
     /// Plain clicks by user bucket: [the bytes of the ID after its `k`, ts |
     /// campaign << 31 | alias << 47 | place of the user in the bucket << 51]
     /// (ts in ms from the start of the click window).
     clicks: Parts<[u64; 2], 4>,
     odd_clicks: Vec<OddClick>,
-    /// Copies that found their cell taken: [n, w0, w1].
-    dups: Vec<PVec<[u64; 3]>>,
+    /// Copies that found their cell taken.
+    late: u64,
     side: Vec<SideEv>,
     odd_ev: Vec<OddEv>,
     /// One past the largest number stored.
@@ -430,11 +431,10 @@ struct D1 {
 }
 
 struct D1Out {
-    edges: PVec<u32>,
     odd_links: Vec<(Key, Key)>,
     clicks: Vec<PVec<[u64; 2]>>,
     odd_clicks: Vec<OddClick>,
-    dups: Vec<PVec<[u64; 3]>>,
+    late: u64,
     side: Vec<SideEv>,
     odd_ev: Vec<OddEv>,
     nmax: u64,
@@ -448,15 +448,39 @@ struct Ring {
     at: usize,
 }
 
-/// Stores a copy in its cell if the cell is empty; a later copy of the same
-/// event is set aside and settled after the parse (`settle`).
+/// Stores a copy in its cell: the first copy of an event takes the empty
+/// cell; a later one replaces what is there if its ingest time is smaller.
+/// The writer holds the cell (LOCK in w0) while it writes the second word.
 #[inline(always)]
 unsafe fn commit(dx: &Dx, o: &mut D1, n: u64, w0: u64, w1: u64) {
     let cell = dx.cell(n as usize);
-    if cell[0].compare_exchange(0, w0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+    if cell[0].compare_exchange(0, w0 | LOCK, Ordering::Acquire, Ordering::Relaxed).is_ok() {
         cell[1].store(w1, Ordering::Relaxed);
+        cell[0].store(w0, Ordering::Release);
     } else {
-        o.dups.get_unchecked_mut((n >> dx.rshift) as usize).push([n, w0, w1]);
+        o.late += 1;
+        commit_late(cell, w0, w1);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn commit_late(cell: &Cell, w0: u64, w1: u64) {
+    loop {
+        let cur = cell[0].load(Ordering::Acquire);
+        if cur & LOCK != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        // (equal ingest times: the copies are identical, the first stays)
+        if (w0 >> ING_SHIFT & ING_MASK) >= (cur >> ING_SHIFT & ING_MASK) {
+            return;
+        }
+        if cell[0].compare_exchange(cur, w0 | LOCK, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            cell[1].store(w1, Ordering::Relaxed);
+            cell[0].store(w0, Ordering::Release);
+            return;
+        }
     }
 }
 
@@ -750,7 +774,19 @@ fn parse_links(dx: &Dx, buf: &[u8], begin: usize, limit: usize, o: &mut D1) {
             // the same user and both aliases below 16
             if (ua ^ ub) < ALIASES && (ua & 511) < ALIASES && (ua >> 9) < dx.users {
                 if ua != ub {
-                    o.edges.push(((ua >> 9) as u32) << 8 | ((ua & 15) as u32) << 4 | (ub & 15) as u32);
+                    // (the word is shared by the threads: unions commute)
+                    let word = dx.link((ua >> 9) as usize);
+                    let mut old = word.load(Ordering::Relaxed);
+                    loop {
+                        let new = ul_union(old ^ UL_INIT, ua & 15, ub & 15) ^ UL_INIT;
+                        if new == old {
+                            break;
+                        }
+                        match word.compare_exchange_weak(old, new, Ordering::Relaxed, Ordering::Relaxed) {
+                            Ok(_) => break,
+                            Err(x) => old = x,
+                        }
+                    }
                 }
                 return;
             }
@@ -1051,19 +1087,18 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
     let cap = keys.cap;
     let users = keys.users;
     let table: &'static mut [[u64; 2]] = zeroed_slice(cap);
-    let rshift = (64 - ((cap as u64 - 1) / 32).leading_zeros()).max(1);
-    let nrb = ((cap - 1) >> rshift) + 1;
+    let ulink: &'static mut [u64] = zeroed_slice(users);
     let dx = Dx {
         ekey: keys.ekey,
         ukey: keys.ukey,
         cap: cap as u64,
         users: users as u64,
         t: table.as_ptr() as *const Cell,
-        rshift,
+        ulink: ulink.as_ptr() as *const AtomicU64,
         ws,
         we,
         cws: ws - WEEK,
-        ing_base: ws.div_euclid(1000) - (1 << 28),
+        ing_base: ws.div_euclid(1000) - (1 << 27),
         camp_direct: {
             let mut t = vec![0xFFFFu16; CAMP_DIRECT];
             for (i, id) in ctx.camp_ids.iter().enumerate() {
@@ -1081,7 +1116,6 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
     let nb = bucket_of(users - 1) + 1;
     let bytes_of = |k: Kind| files.iter().filter(|f| f.kind == k).map(|f| f.len).sum::<u64>() as usize;
     let est_clicks = bytes_of(Kind::Click) / 40;
-    let est_links = bytes_of(Kind::Link) / 16;
     // click buffers: the head buckets hold far more than their share
     let click_res = est_clicks * 3 / nb / nthreads + 64;
 
@@ -1090,11 +1124,10 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
     let p1: Vec<D1Out> = run_workers(nthreads, |w| {
         let mut buf = Vec::new();
         let mut o = D1 {
-            edges: PVec::with_capacity(est_links / nthreads + 1024),
             odd_links: Vec::new(),
             clicks: Parts::new_by(nb, |q| if q < 40 { click_res * 16 } else { click_res }),
             odd_clicks: Vec::new(),
-            dups: (0..nrb).map(|_| PVec::with_capacity(cap / nrb / nthreads / 16 + 64)).collect(),
+            late: 0,
             side: Vec::new(),
             odd_ev: Vec::new(),
             nmax: 0,
@@ -1120,11 +1153,10 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
             }
         }
         D1Out {
-            edges: o.edges,
             odd_links: o.odd_links,
             clicks: o.clicks.finish(),
             odd_clicks: o.odd_clicks,
-            dups: o.dups,
+            late: o.late,
             side: o.side,
             odd_ev: o.odd_ev,
             nmax: o.nmax,
@@ -1150,9 +1182,6 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
         for (a, b) in &o.odd_links {
             mark(a);
             mark(b);
-        }
-        for s in &o.side {
-            mark(&s.user);
         }
         for c in &o.odd_clicks {
             mark(&c.user);
@@ -1184,10 +1213,20 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
     let mut pairs: Vec<(Key, Key)> = Vec::new();
     for o in &p1 {
         pairs.extend_from_slice(&o.odd_links);
-        for &e in o.edges.as_slice() {
-            let user = (e >> 8) as usize;
-            if is_complex(user) {
-                pairs.push((user_key(&dx, user, (e >> 4 & 15) as u64), user_key(&dx, user, (e & 15) as u64)));
+    }
+    let ulink: &[u64] = ulink;
+    for (wi, &word) in complex.iter().enumerate() {
+        let mut word = word;
+        while word != 0 {
+            let user = wi * 64 + word.trailing_zeros() as usize;
+            word &= word - 1;
+            // every alias with the one it points at
+            let x = ulink[user] ^ UL_INIT;
+            for a in 1..16u64 {
+                let p = (x >> (4 * a)) & 15;
+                if p != a {
+                    pairs.push((user_key(&dx, user, a), user_key(&dx, user, p)));
+                }
             }
         }
     }
@@ -1240,7 +1279,7 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
     }
     if verbose {
         let lines: u64 = p1.iter().map(|o| o.lines).sum();
-        let dups: usize = p1.iter().map(|o| o.dups.iter().map(|d| d.len()).sum::<usize>()).sum();
+        let dups: u64 = p1.iter().map(|o| o.late).sum();
         let nc = complex.iter().map(|w| w.count_ones() as usize).sum::<usize>();
         eprintln!(
             "  dense: {lines} event lines, top number {nmax}, {dups} late copies, {} side rows, {} rows without a cell, {} odd clicks, {} links by text, {nc} complex users",
@@ -1251,49 +1290,6 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
         );
     }
     lap("identities by text");
-
-    // --- in parallel: the link words of the users, and the late copies
-    let ulink: &'static mut [u64] = zeroed_slice(users);
-    let ul = Shared(ulink.as_mut_ptr());
-    let next_rb = AtomicUsize::new(0);
-    run_workers(nthreads, |w| {
-        let ul = &ul;
-        // links: the users of this worker's range
-        let (lo, hi) = ((users * w / nthreads) as u32, (users * (w + 1) / nthreads) as u32);
-        for o in &p1 {
-            for &e in o.edges.as_slice() {
-                let user = e >> 8;
-                if user >= lo && user < hi {
-                    unsafe {
-                        let p = ul.0.add(user as usize);
-                        *p = ul_union(*p ^ UL_INIT, (e >> 4 & 15) as u64, (e & 15) as u64) ^ UL_INIT;
-                    }
-                }
-            }
-        }
-        // late copies: the smallest ingest time keeps the cell
-        loop {
-            let rb = next_rb.fetch_add(1, Ordering::Relaxed);
-            if rb >= nrb {
-                break;
-            }
-            for o in &p1 {
-                let d = o.dups[rb].as_slice();
-                for (i, r) in d.iter().enumerate() {
-                    if let Some(a) = d.get(i + 8) {
-                        dx.fetch(a[0] as usize);
-                    }
-                    let cell = dx.cell(r[0] as usize);
-                    if r[1] >> ING_SHIFT & ING_MASK < cell[0].load(Ordering::Relaxed) >> ING_SHIFT & ING_MASK {
-                        cell[0].store(r[1], Ordering::Relaxed);
-                        cell[1].store(r[2], Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-    });
-    let ulink: &[u64] = ulink;
-    lap("links and late copies");
 
     // --- phase 2: sessions, a bucket of users at a time
     let day0 = ws.div_euclid(DAY);
