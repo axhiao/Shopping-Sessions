@@ -667,6 +667,198 @@ fn one_person(geo: &Geo, st: &mut P3, name: Key, words: &[u32], lpur: &[(u32, u3
     }
 }
 
+/// `letter` + base 36 of v, as the generator prints it, into buf; the length.
+#[inline(always)]
+fn id_text(letter: u8, v: u64, buf: &mut [u8; 16]) -> usize {
+    // the digits end at tmp[16]; the bytes after them stay zero
+    let mut tmp = [0u8; 24];
+    let mut at = 16;
+    let mut r = v & M40;
+    loop {
+        at -= 1;
+        let q = r / 36;
+        let d = (r - q * 36) as u8;
+        tmp[at] = if d < 10 { b'0' + d } else { b'a' - 10 + d };
+        r = q;
+        if r == 0 {
+            break;
+        }
+    }
+    // (a number below 2^40 has at most 8 digits)
+    buf[0] = letter;
+    let w = u64::from_le_bytes(tmp[at..at + 8].try_into().unwrap());
+    buf[1..9].copy_from_slice(&w.to_le_bytes());
+    17 - at
+}
+
+/// The name of the person made of the aliases of `user` linked with alias
+/// `comp` (the smallest of them): the smallest of their IDs.
+#[inline(always)]
+fn person_name(dx: &Dx, user: usize, comp: u64, flat: u64, buf: &mut [u8; 16]) -> usize {
+    let mut len = id_text(b'u', scramble((user as u64) << 9 | comp, dx.ukey), buf);
+    if flat != UL_INIT {
+        let mut other = [0u8; 16];
+        for a in comp + 1..16 {
+            if (flat >> (4 * a)) & 15 == comp {
+                let l = id_text(b'u', scramble((user as u64) << 9 | a, dx.ukey), &mut other);
+                if other[..l] < buf[..len] {
+                    *buf = other;
+                    len = l;
+                }
+            }
+        }
+    }
+    len
+}
+
+/// The sessions of the person whose events are the plain cells of
+/// table[start..end), in time order (checked by the caller). `cls`: the
+/// person's clicks as ts << 32 | index into `ucl`, in time order, equal times
+/// by click ID descending. The same bookkeeping as `person_finish`.
+#[inline(always)]
+fn person_cells(g: &Geo, st: &mut P3, dx: &Dx, start: usize, end: usize, cls: &[u64], ucl: &[[u64; 2]], name: &[u8]) {
+    let camp_of = |e: u64| unsafe { (ucl.get_unchecked(e as u32 as usize)[1] >> 31 & 0xFFFF) as usize };
+    let mut lo = 0usize;
+    let mut hi = 0usize;
+    let mut cur_day: i64 = i64::MIN;
+    let mut d_sessions = 0u32;
+    let mut d_events = 0u32;
+    let mut d_rev = 0u64;
+    let mut s_start: i64 = -1;
+    let mut s_didx = 0usize;
+    let mut s_rev = 0u64;
+    let mut s_purch = false;
+    let mut prev_t: i64 = 0;
+    let stride = g.organic as usize + 1;
+    macro_rules! flush_assists {
+        () => {{
+            for &d in &st.pend_days {
+                let n = st.pend[d as usize];
+                st.pend[d as usize] = 0;
+                let row = d as usize * stride;
+                for &c in &st.active {
+                    unsafe { *st.assist.get_unchecked_mut(row + c as usize) += n };
+                }
+            }
+            st.pend_days.clear();
+        }};
+    }
+    macro_rules! finish_session {
+        () => {{
+            let sc = s_start + WEEK;
+            if !cls.is_empty() {
+                while hi < cls.len() && ((cls[hi] >> 32) as i64) <= sc {
+                    let c = camp_of(cls[hi]);
+                    if st.cnt[c] == 0 {
+                        flush_assists!();
+                        st.pos[c] = st.active.len() as u32;
+                        st.active.push(c as u32);
+                    }
+                    st.cnt[c] += 1;
+                    hi += 1;
+                }
+                while lo < hi && ((cls[lo] >> 32) as i64) < sc - WEEK {
+                    let c = camp_of(cls[lo]);
+                    st.cnt[c] -= 1;
+                    if st.cnt[c] == 0 {
+                        flush_assists!();
+                        let p = st.pos[c] as usize;
+                        let last = st.active.pop().unwrap();
+                        if p < st.active.len() {
+                            st.active[p] = last;
+                            st.pos[last as usize] = p as u32;
+                        }
+                    }
+                    lo += 1;
+                }
+            }
+            let credit = if lo < hi { camp_of(cls[hi - 1]) } else { g.organic as usize };
+            let cell = s_didx * stride + credit;
+            unsafe { *st.sess.get_unchecked_mut(cell) += 1 };
+            if s_purch {
+                let a = unsafe { st.agg.get_unchecked_mut(cell) };
+                a[1] += 1;
+                a[2] += s_rev;
+            }
+            if !st.active.is_empty() {
+                if st.pend[s_didx] == 0 {
+                    st.pend_days.push(s_didx as u32);
+                }
+                st.pend[s_didx] += 1;
+            }
+        }};
+    }
+    macro_rules! flush_day {
+        () => {{
+            let mut top = -1i32;
+            if d_rev != 0 {
+                let mut best = 0u64;
+                for &c in &st.touched {
+                    let v = st.catsum[c as usize];
+                    if v > best || (v == best && (c as i32) < top) {
+                        best = v;
+                        top = c as i32;
+                    }
+                    st.catsum[c as usize] = 0;
+                }
+                st.touched.clear();
+            }
+            st.uw.row((cur_day - g.day0) as usize, d_sessions, d_events, d_rev, top);
+        }};
+    }
+    for n in start..end {
+        let c = dx.cell(n);
+        let w0 = c[0].load(Ordering::Relaxed);
+        if w0 & (VALID | ODD) != VALID {
+            continue;
+        }
+        let t = (w0 & TS_MASK) as i64;
+        if s_start < 0 || t - prev_t > GAP {
+            if s_start >= 0 {
+                finish_session!();
+            }
+            s_start = t;
+            s_rev = 0;
+            s_purch = false;
+            let day = (g.ws + t).div_euclid(DAY);
+            s_didx = (day - g.day0) as usize;
+            if day != cur_day {
+                if cur_day != i64::MIN {
+                    flush_day!();
+                    d_sessions = 0;
+                    d_events = 0;
+                    d_rev = 0;
+                }
+                cur_day = day;
+            }
+            d_sessions += 1;
+        }
+        prev_t = t;
+        d_events += 1;
+        if w0 & PURCH != 0 {
+            let w1 = c[1].load(Ordering::Relaxed);
+            let (p, cat) = (w1 >> 8 & 0xFF_FFFF, (w1 & 0xFF) as usize);
+            s_rev += p;
+            s_purch = true;
+            d_rev += p;
+            if st.catsum[cat] == 0 {
+                st.touched.push(cat as u32);
+            }
+            st.catsum[cat] += p;
+        }
+    }
+    if s_start >= 0 {
+        finish_session!();
+        flush_day!();
+        st.uw.end_person(name);
+    }
+    flush_assists!();
+    for &c in &st.active {
+        st.cnt[c as usize] = 0;
+    }
+    st.active.clear();
+}
+
 #[inline(always)]
 fn hsel(k: &Key, n: usize) -> usize {
     ((hk(k) >> 32) as usize) % n
@@ -987,16 +1179,18 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
         let mut st = p3_new(out, w, ctx, day0, ndays, nbuckets);
         let mut cev: Vec<Vec<CEv>> = vec![Vec::new(); nthreads];
         let mut ccl: Vec<Vec<CCl>> = vec![Vec::new(); nthreads];
-        // the clicks of a bucket, and their indices grouped by user
-        let (mut c_user, mut c_ts, mut camps): (Vec<u32>, Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut c_alias, mut c_v): (Vec<u8>, Vec<u64>) = (Vec::new(), Vec::new());
-        let (mut cstart, mut corder, mut fill): (Vec<u32>, Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new(), Vec::new());
+        // the clicks of a bucket grouped by user (`cstart`), and one person's
+        // clicks as ts << 32 | index, in time order
+        let mut ucl: Vec<[u64; 2]> = Vec::new();
+        let (mut cstart, mut fill): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
         let mut cls: Vec<u64> = Vec::new();
-        // the events of the user being read
-        let (mut words, mut sub_words): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
-        let (mut lpur, mut sub_lpur): (Vec<(u32, u32)>, Vec<(u32, u32)>) = (Vec::new(), Vec::new());
-        let mut comps: Vec<u8> = Vec::new();
-        let mut seen = [0u64; 16];
+        // (the rare ways) a person's events and purchases, the campaigns and
+        // places of the person's clicks
+        let mut words: Vec<u32> = Vec::new();
+        let mut lpur: Vec<(u32, u32)> = Vec::new();
+        let (mut camps, mut cidx): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+        let mut seen;
+        let mut namebuf = [0u8; 16];
         'units: loop {
             let b = next.fetch_add(1, Ordering::Relaxed);
             if b >= nb || bad.load(Ordering::Relaxed) {
@@ -1004,171 +1198,178 @@ pub(crate) fn run(keys: &Keys, ctx: &Ctx, files: &[InFile], chunks: &[Chunk], ou
             }
             let (ua, ub) = (bucket_start(b), bucket_start(b + 1).min(users));
             let nu = ub - ua;
-            // --- the bucket's clicks
-            c_user.clear();
-            c_ts.clear();
-            camps.clear();
-            c_alias.clear();
-            c_v.clear();
-            for o in p1.iter() {
-                for r in o.clicks[b].as_slice() {
-                    c_v.push(r[0] & M40);
-                    c_user.push(((r[0] >> 40) as usize - ua) as u32);
-                    c_ts.push((r[1] & TS_MASK) as u32);
-                    camps.push((r[1] >> 31 & 0xFFFF) as u32);
-                    c_alias.push((r[1] >> 47 & 15) as u8);
-                }
-            }
-            let nc = c_v.len();
+            // --- the bucket's clicks, grouped by user
             cstart.clear();
             cstart.resize(nu + 1, 0);
+            let nc: usize = p1.iter().map(|o| o.clicks[b].len()).sum();
             if nc > 0 {
-                for &u in &c_user {
-                    cstart[u as usize + 1] += 1;
+                for o in p1.iter() {
+                    for r in o.clicks[b].as_slice() {
+                        cstart[(r[0] >> 40) as usize - ua + 1] += 1;
+                    }
                 }
                 for k in 0..nu {
                     cstart[k + 1] += cstart[k];
                 }
-                corder.clear();
-                corder.resize(nc, 0);
                 fill.clear();
                 fill.extend_from_slice(&cstart[..nu]);
-                for (i, &u) in c_user.iter().enumerate() {
-                    let f = &mut fill[u as usize];
-                    corder[*f as usize] = i as u32;
-                    *f += 1;
+                ucl.clear();
+                ucl.reserve(nc);
+                unsafe { ucl.set_len(nc) };
+                for o in p1.iter() {
+                    for r in o.clicks[b].as_slice() {
+                        let f = &mut fill[(r[0] >> 40) as usize - ua];
+                        ucl[*f as usize] = *r;
+                        *f += 1;
+                    }
                 }
             }
             // --- the bucket's events, user by user
             let (lo, hi) = (bound_of(b), bound_of(b + 1));
-            seen = [0; 16];
-            let mut cur = usize::MAX;
-            let mut cur_complex = false;
-            let mut cur_flat = UL_INIT;
-            let mut first_comp = 0u64;
-            let mut multi = false;
-            let mut ckey: [Option<Key>; 16] = [None; 16];
-            // Ends the user being read: one person, or one per group of
-            // linked aliases that has events.
-            macro_rules! finish_user {
-                () => {
-                    if !words.is_empty() {
-                        let lu = cur - ua;
-                        let mine = &corder[..nc][cstart[lu] as usize..cstart[lu + 1] as usize];
-                        let mut todo: u32 = if multi { comps.iter().fold(0u32, |m, &c| m | 1 << c) } else { 1 << first_comp };
-                        while todo != 0 {
-                            let comp = todo.trailing_zeros() as u64;
-                            todo &= todo - 1;
-                            cls.clear();
-                            for &i in mine {
-                                let i = i as usize;
-                                if (cur_flat >> (4 * c_alias[i])) & 15 == comp {
-                                    cls.push((c_ts[i] as u64) << 32 | i as u64);
-                                }
+            seen = [0u64; 16];
+            let mut n = lo;
+            // Moves n to the next plain event (w0 returned; 0 at the end of the
+            // bucket); the rows by text on the way go to their persons.
+            macro_rules! next_plain {
+                () => {{
+                    let mut found = 0u64;
+                    while n < hi {
+                        let w0 = cell(n)[0].load(Ordering::Relaxed);
+                        if w0 & VALID != 0 {
+                            if w0 & ODD == 0 {
+                                found = w0;
+                                break;
                             }
-                            sort_clicks(&mut cls, |i, j| cmp_key(&b36_key(b'k', c_v[j]), &b36_key(b'k', c_v[i])));
-                            // the person's name: the smallest ID of the group
-                            let mut name = user_key(&dx, cur, comp);
-                            if cur_flat != UL_INIT {
-                                for a in comp + 1..16 {
-                                    if (cur_flat >> (4 * a)) & 15 == comp {
-                                        let k = user_key(&dx, cur, a);
-                                        if cmp_key(&k, &name) == std::cmp::Ordering::Less {
-                                            name = k;
-                                        }
-                                    }
-                                }
-                            }
-                            if !multi {
-                                one_person(&geo, &mut st, name, &words, &lpur, &cls, &camps);
-                            } else {
-                                sub_words.clear();
-                                sub_lpur.clear();
-                                let mut k = 0;
-                                for (j, &wd) in words.iter().enumerate() {
-                                    let p = wd & PURCHASE != 0;
-                                    if comps[j] as u64 == comp {
-                                        sub_words.push(wd);
-                                        if p {
-                                            sub_lpur.push(lpur[k]);
-                                        }
-                                    }
-                                    k += p as usize;
-                                }
-                                one_person(&geo, &mut st, name, &sub_words, &sub_lpur, &cls, &camps);
-                            }
+                            let s = &p1[(w0 >> 27 & 31) as usize].side[(w0 & 0x7FF_FFFF) as usize];
+                            let person = person_of(&s.user);
+                            cev[hsel(&person, nthreads)].push(CEv { person, ts: s.ts, purchase: s.purchase, price: s.price, cat: s.cat });
                         }
-                        words.clear();
-                        comps.clear();
-                        lpur.clear();
+                        n += 1;
                     }
-                };
+                    found
+                }};
             }
-            for n in lo..hi {
-                let c = cell(n);
-                let w0 = c[0].load(Ordering::Relaxed);
-                if w0 & VALID == 0 {
-                    continue;
-                }
-                if w0 & ODD != 0 {
-                    let s = &p1[(w0 >> 27 & 31) as usize].side[(w0 & 0x7FF_FFFF) as usize];
-                    let person = person_of(&s.user);
-                    cev[hsel(&person, nthreads)].push(CEv { person, ts: s.ts, purchase: s.purchase, price: s.price, cat: s.cat });
-                    continue;
-                }
+            let mut w0 = next_plain!();
+            while w0 != 0 {
                 let user = ((w0 >> IDX_SHIFT) & IDX_MASK) as usize;
-                if user != cur {
-                    finish_user!();
-                    // every user in one stretch of the table, inside its bucket
-                    if user < ua || user >= ub || seen[(user - ua) >> 6] >> ((user - ua) & 63) & 1 != 0 {
-                        bad.store(true, Ordering::Relaxed);
-                        break 'units;
-                    }
-                    seen[(user - ua) >> 6] |= 1 << ((user - ua) & 63);
-                    cur = user;
-                    cur_complex = is_complex(user);
-                    cur_flat = ul_flat(ulink[user] ^ UL_INIT);
-                    multi = false;
-                    first_comp = 16;
-                    ckey = [None; 16];
+                // every user in one stretch of the table, inside its bucket
+                let lu = user.wrapping_sub(ua);
+                if lu >= nu || seen[lu >> 6] >> (lu & 63) & 1 != 0 {
+                    bad.store(true, Ordering::Relaxed);
+                    break 'units;
                 }
-                let alias = (w0 >> ALIAS_SHIFT) & 15;
-                let ts = (w0 & TS_MASK) as u32;
-                let purchase = w0 & PURCH != 0;
-                if cur_complex {
-                    let person = match ckey[alias as usize] {
-                        Some(k) => k,
-                        None => {
-                            let k = person_of(&user_key(&dx, user, alias));
-                            ckey[alias as usize] = Some(k);
-                            k
+                seen[lu >> 6] |= 1 << (lu & 63);
+                let flat = ul_flat(ulink[user] ^ UL_INIT);
+                let comp_of = |w0: u64| (flat >> (4 * ((w0 >> ALIAS_SHIFT) & 15))) & 15;
+                let comp0 = comp_of(w0);
+                // the stretch: is it one person, in time order?
+                let start = n;
+                let (mut in_order, mut multi, mut prev) = (true, false, 0u64);
+                loop {
+                    let t = w0 & TS_MASK;
+                    in_order &= t >= prev;
+                    prev = t;
+                    multi |= comp_of(w0) != comp0;
+                    n += 1;
+                    w0 = next_plain!();
+                    if w0 == 0 || ((w0 >> IDX_SHIFT) & IDX_MASK) as usize != user {
+                        break;
+                    }
+                }
+                let end = n;
+                let plain = |m: usize| {
+                    let c = cell(m);
+                    let w = c[0].load(Ordering::Relaxed);
+                    (w & (VALID | ODD) == VALID).then_some((w, c))
+                };
+                if is_complex(user) {
+                    let mut ckey: [Option<Key>; 16] = [None; 16];
+                    for m in start..end {
+                        if let Some((w, c)) = plain(m) {
+                            let alias = (w >> ALIAS_SHIFT) & 15;
+                            let person = match ckey[alias as usize] {
+                                Some(k) => k,
+                                None => {
+                                    let k = person_of(&user_key(&dx, user, alias));
+                                    ckey[alias as usize] = Some(k);
+                                    k
+                                }
+                            };
+                            let purchase = w & PURCH != 0;
+                            let w1 = if purchase { c[1].load(Ordering::Relaxed) } else { 0 };
+                            cev[hsel(&person, nthreads)].push(CEv {
+                                person,
+                                ts: (w & TS_MASK) as u32,
+                                purchase: purchase as u32,
+                                price: (w1 >> 8 & 0xFF_FFFF) as u32,
+                                cat: (w1 & 0xFF) as u32,
+                            });
                         }
-                    };
-                    let w1 = if purchase { c[1].load(Ordering::Relaxed) } else { 0 };
-                    cev[hsel(&person, nthreads)].push(CEv { person, ts, purchase: purchase as u32, price: (w1 >> 8 & 0xFF_FFFF) as u32, cat: (w1 & 0xFF) as u32 });
+                    }
                     continue;
                 }
-                let comp = (cur_flat >> (4 * alias)) & 15;
-                if first_comp == 16 {
-                    first_comp = comp;
+                let mine = cstart[lu] as usize..cstart[lu + 1] as usize;
+                if !multi && in_order {
+                    cls.clear();
+                    for i in mine {
+                        let r = unsafe { ucl.get_unchecked(i) };
+                        if (flat >> (4 * (r[1] >> 47 & 15))) & 15 == comp0 {
+                            cls.push((r[1] & TS_MASK) << 32 | i as u64);
+                        }
+                    }
+                    sort_clicks(&mut cls, |i, j| cmp_key(&b36_key(b'k', ucl[j][0] & M40), &b36_key(b'k', ucl[i][0] & M40)));
+                    let len = person_name(&dx, user, comp0, flat, &mut namebuf);
+                    person_cells(&geo, &mut st, &dx, start, end, &cls, &ucl, &namebuf[..len]);
+                    continue;
                 }
-                multi |= comp != first_comp;
-                words.push(ts | (purchase as u32) << 31);
-                comps.push(comp as u8);
-                if purchase {
-                    let w1 = c[1].load(Ordering::Relaxed);
-                    lpur.push(((w1 >> 8 & 0xFF_FFFF) as u32, (w1 & 0xFF) as u32));
+                // Some alias with events is not linked to the others, or the
+                // events are not in time order: a person at a time, sorted.
+                let mut todo = 0u32;
+                for m in start..end {
+                    if let Some((w, _)) = plain(m) {
+                        todo |= 1 << comp_of(w);
+                    }
+                }
+                while todo != 0 {
+                    let comp = todo.trailing_zeros() as u64;
+                    todo &= todo - 1;
+                    words.clear();
+                    lpur.clear();
+                    for m in start..end {
+                        if let Some((w, c)) = plain(m) {
+                            if comp_of(w) == comp {
+                                let purchase = w & PURCH != 0;
+                                words.push((w & TS_MASK) as u32 | (purchase as u32) << 31);
+                                if purchase {
+                                    let w1 = c[1].load(Ordering::Relaxed);
+                                    lpur.push(((w1 >> 8 & 0xFF_FFFF) as u32, (w1 & 0xFF) as u32));
+                                }
+                            }
+                        }
+                    }
+                    cls.clear();
+                    camps.clear();
+                    cidx.clear();
+                    for i in mine.clone() {
+                        let r = &ucl[i];
+                        if (flat >> (4 * (r[1] >> 47 & 15))) & 15 == comp {
+                            cls.push((r[1] & TS_MASK) << 32 | camps.len() as u64);
+                            camps.push((r[1] >> 31 & 0xFFFF) as u32);
+                            cidx.push(i as u32);
+                        }
+                    }
+                    sort_clicks(&mut cls, |i, j| cmp_key(&b36_key(b'k', ucl[cidx[j] as usize][0] & M40), &b36_key(b'k', ucl[cidx[i] as usize][0] & M40)));
+                    let len = person_name(&dx, user, comp, flat, &mut namebuf);
+                    one_person(&geo, &mut st, key_of(&namebuf[..len]), &words, &lpur, &cls, &camps);
                 }
             }
-            finish_user!();
             // the clicks of the bucket's complex users
             if nc > 0 {
                 for lu in 0..nu {
                     if cstart[lu + 1] > cstart[lu] && is_complex(ua + lu) {
-                        for &i in &corder[cstart[lu] as usize..cstart[lu + 1] as usize] {
-                            let i = i as usize;
-                            let person = person_of(&user_key(&dx, ua + lu, c_alias[i] as u64));
-                            ccl[hsel(&person, nthreads)].push(CCl { person, cid: b36_key(b'k', c_v[i]), ts: c_ts[i], camp: camps[i] });
+                        for r in &ucl[cstart[lu] as usize..cstart[lu + 1] as usize] {
+                            let person = person_of(&user_key(&dx, ua + lu, r[1] >> 47 & 15));
+                            ccl[hsel(&person, nthreads)].push(CCl { person, cid: b36_key(b'k', r[0] & M40), ts: (r[1] & TS_MASK) as u32, camp: (r[1] >> 31 & 0xFFFF) as u32 });
                         }
                     }
                 }
