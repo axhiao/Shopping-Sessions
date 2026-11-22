@@ -48,6 +48,18 @@ const ING_MASK: u64 = (1 << 28) - 1;
 const IDX_BITS: u32 = 23;
 const IDX_MASK: u64 = (1 << IDX_BITS) - 1;
 const TS_MASK: u64 = 0x7FFF_FFFF;
+/// The bytes of an ID of l bytes (2 to 9) after its first: a mask for the
+/// eight bytes loaded there.
+static TEXT_MASK: [u64; 10] = {
+    let mut t = [0u64; 10];
+    let mut l = 2;
+    while l < 10 {
+        t[l] = !0u64 >> (8 * (9 - l));
+        l += 1;
+    }
+    t
+};
+
 /// Aliases of a user that the plain path knows (4 bits each in the user's
 /// link word); a row or link with a higher alias is handled by text.
 const ALIASES: u64 = 16;
@@ -561,7 +573,7 @@ unsafe fn event_line<'a, S: Fields<'a>>(dx: &Dx, ctx: &Ctx, dc: &mut DateCache, 
             let p1 = f1.as_ptr();
             if purchase == 0 && l1.wrapping_sub(2) < 8 && *p1 == b'u' && *p1.add(l1 - 1) != 0 {
                 // the ID's bytes as they are (decoded when the table is read)
-                (head | VALID | ts_rel, (p1.add(1) as *const u64).read_unaligned() & (!0u64 >> (8 * (9 - l1))))
+                (head | VALID | ts_rel, (p1.add(1) as *const u64).read_unaligned() & *TEXT_MASK.get_unchecked(l1))
             } else {
                 let u = match id_number(b'u', f1) {
                     Some(v) => seq_of(v, dx.ukey),
@@ -606,7 +618,7 @@ unsafe fn event_fast(dx: &Dx, dc: &mut DateCache, p: *const u8, pr: *const u8, l
     let mut ok = true;
     let mut text = 0u64;
     if l1.wrapping_sub(2) < 8 && *p1 == b'u' && *p1.add(l1 - 1) != 0 {
-        text = (p1.add(1) as *const u64).read_unaligned() & (!0u64 >> (8 * (9 - l1)));
+        text = (p1.add(1) as *const u64).read_unaligned() & *TEXT_MASK.get_unchecked(l1);
     } else if l1 == 0 {
         ok = false;
     } else {
@@ -723,7 +735,7 @@ unsafe fn click_line<'a, S: Fields<'a>>(dx: &Dx, ctx: &Ctx, dc: &mut DateCache, 
         if let Some(uv) = id_number(b'u', f1) {
             let u = seq_of(uv, dx.ukey);
             if (u >> 9) < dx.users && (u & 511) < ALIASES {
-                let text = (p0.add(1) as *const u64).read_unaligned() & (!0u64 >> (8 * (9 - l0)));
+                let text = (p0.add(1) as *const u64).read_unaligned() & *TEXT_MASK.get_unchecked(l0);
                 let (b, local) = bucket_local((u >> 9) as usize);
                 o.clicks.push(b, [text, ts | (camp as u64) << 31 | (u & 15) << 47 | local << 51]);
                 return;
