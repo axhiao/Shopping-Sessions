@@ -1,8 +1,8 @@
 # Shopping Sessions
 
-A single static Rust binary (no dependencies, 1.6 MB `FROM scratch` image) for the
-Databricks *Shopping Sessions* buildathon track: it turns the click-stream CSVs in
-`$DATA_DIR` into the two Parquet tables in `$OUTPUT_DIR` exactly as `rules.md` specifies.
+A single static Rust binary (no dependencies, `FROM scratch` image) for the Databricks
+*Shopping Sessions* buildathon track: it turns the click-stream CSVs in `$DATA_DIR` into
+the two Parquet tables in `$OUTPUT_DIR` exactly as `rules.md` specifies.
 
 | Dataset (generator) | Local, bare | Local, Docker with scorer flags pinned to 4 cores / 8 threads |
 | --- | --- | --- |
@@ -12,7 +12,67 @@ Databricks *Shopping Sessions* buildathon track: it turns the click-stream CSVs 
 
 (AMD Threadripper PRO 5955WX; the scorer's Xeons will differ.)
 
-## Pipeline
+## Two engines
+
+`src/dense.rs` runs first. It takes inputs whose IDs have the shape the published
+generator writes; anything else, and anything it finds out of place, goes through the
+general pipeline in `src/main.rs` (described further down), which implements the rules
+for any IDs. Both write the same tables. `SS_NO_DENSE=1` skips the dense engine.
+
+### The dense engine
+
+The generator writes an event ID as `e` plus the base-36 digits of `scramble(n, key)` and
+a user ID as `u` plus the digits of `scramble(user * 512 + alias, key)`: `n` counts the
+events, `user` the users (each has a few alias IDs), and `scramble` is a fixed bijection
+on 40-bit numbers with a key per kind of ID and dataset. The program reads both keys off
+a sample of the input (a short search: the keys under which the sampled numbers are all
+small), and then:
+
+1. **Parse (all threads, every line once).** Files are memory-mapped and cut into 4 MB
+   chunks; an AVX2 scanner finds `,` `\n` `"` of a line and checks the CSV dialect; the
+   two sides of a line (its first fields, the others) are looked up by their pattern of
+   separators and quotes, so the layout is worked out once per pattern.
+   - An event copy is stored straight into a table indexed by the event's number (16
+     bytes: flags, `ingest_ts`, `ts`, the user): the first copy takes the cell with one
+     compare-and-swap, later copies are set aside and settled after the parse (the
+     smallest `ingest_ts` keeps the cell). Dedup is an array store; no partitions, no
+     hash table. A copy that is not a valid event still takes its cell, so a later valid
+     copy cannot rescue it.
+   - The user ID of a row goes into the cell as its bytes; it is decoded when the table
+     is read, once per stretch of equal IDs.
+   - A click keeps its ID's bytes and goes to its user's bucket. Copies of a click are
+     identical by the rules and the session code only asks for the latest click and the
+     set of campaigns, so clicks need no dedup.
+   - A link between two aliases of one user is four bytes; per user a 64-bit word says
+     which of its aliases are linked.
+2. **Sessions (all threads, a bucket of users at a time).** The generator numbers events
+   user by user in time order, so reading the table in order meets each user's events
+   together and already sorted: one pass checks that (order, and that the aliases met
+   belong to one person), a second cuts the sessions, credits them with a sliding 7-day
+   window over the user's clicks and writes the `user_daily` rows.
+3. **Output**: as in the general pipeline.
+
+Nothing is taken on trust:
+
+- Decoding is exact whatever the keys are (a bijection), so copies of an event always
+  meet in one cell and different IDs never do. An ID that does not decode, or whose
+  number is out of range, is handled by its text.
+- Persons always come from the links. A user whose links leave its own first 16 aliases
+  (shared devices, long chains, upper-cased IDs), and every row that depends on an ID
+  that is not a plain one, goes through a small general union-find and a sort.
+- Time order inside a user is checked; a user whose events are out of order, or whose
+  aliases are not all linked, is handled a person at a time with sorting.
+- If the table turns out not to be laid out user by user, the engine stops before
+  anything is kept and the general pipeline runs instead.
+
+The idea of this arrangement (decode the generated IDs to counters, dedup by direct
+index, identity by arithmetic on the user number) is not ours alone: several teams'
+public READMEs describe it and name Team 67's public design as its origin. We had the
+event-number decoding on our own (the sequence-number path below, 21 November) and
+rebuilt the rest around it after reading those descriptions. We read descriptions, not
+code; everything in this repository was written for it.
+
+## The general pipeline
 
 1. **Small inputs**: manifest, `products.csv` (category ids sorted byte-wise, `unknown`
    included, so comparing ids compares names), `campaigns.csv`.

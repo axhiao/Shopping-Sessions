@@ -558,6 +558,64 @@ unsafe fn event_line<'a, S: Fields<'a>>(dx: &Dx, ctx: &Ctx, dc: &mut DateCache, 
     }
 }
 
+/// The usual event line, a view or a cart of a user whose ID is `u` + up to 8
+/// bytes with a generated event ID: the same cell as `event_line` writes, with
+/// nothing kept for the rare cases. False: not such a line (nothing done).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn event_fast(dx: &Dx, dc: &mut DateCache, p: *const u8, pr: *const u8, lo: *const Half, hi: *const Half, o: &mut D1, ring: &mut Ring, nmax: &mut u64) -> bool {
+    let (lo, hi) = (&*lo, &*hi);
+    let n = match id_number(b'e', std::slice::from_raw_parts(p.add(lo.s[0] as usize), lo.l[0] as usize)) {
+        Some(v) => seq_of(v, dx.ekey),
+        None => return false,
+    };
+    if n >= dx.cap {
+        return false;
+    }
+    dx.fetch(n as usize);
+    let ty = (pr.add(hi.s[1] as usize) as *const u32).read_unaligned();
+    if hi.l[1] != 4 || (ty != u32::from_le_bytes(*b"view") && ty != u32::from_le_bytes(*b"cart")) {
+        return false;
+    }
+    let l1 = lo.l[1] as usize;
+    let p1 = p.add(lo.s[1] as usize);
+    let mut ok = true;
+    let mut text = 0u64;
+    if l1.wrapping_sub(2) < 8 && *p1 == b'u' && *p1.add(l1 - 1) != 0 {
+        text = (p1.add(1) as *const u64).read_unaligned() & (!0u64 >> (8 * (9 - l1)));
+    } else if l1 == 0 {
+        ok = false;
+    } else {
+        return false;
+    }
+    let ts = match parse_ts_dc(dc, std::slice::from_raw_parts(p.add(lo.s[2] as usize), lo.l[2] as usize)) {
+        Some(t) if t >= dx.ws && t < dx.we => t,
+        _ => {
+            ok = false;
+            dx.ws
+        }
+    };
+    let (ingest_s, ingest_ms) =
+        parse_ingest_dc(dc, std::slice::from_raw_parts(pr.add(hi.s[0] as usize), hi.l[0] as usize)).unwrap_or((i64::MAX / 2000, i64::MAX / 2));
+    let ingest = (ingest_s - dx.ing_base).clamp(0, ING_MASK as i64) as u64;
+    ok &= ingest_ms - ts <= DAY;
+    ok &= hi.l[2] != 0;
+    let head = PRESENT | ingest << ING_SHIFT;
+    let (w0, w1) = if ok { (head | VALID | (ts - dx.ws) as u64, text) } else { (head, 0) };
+    *nmax = (*nmax).max(n);
+    ring.push(dx, o, n, w0, w1);
+    true
+}
+
+/// Any other well-formed event line.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn event_rare(dx: &Dx, ctx: &Ctx, dc: &mut DateCache, p: *const u8, pr: *const u8, lo: *const Half, hi: *const Half, o: &mut D1, ring: &mut Ring, w: usize, nmax: &mut u64) {
+    let mut f = MemoFields { p, pr, lo, hi, i: 0, j: 0, _buf: std::marker::PhantomData };
+    event_line(dx, ctx, dc, &mut f, o, ring, w, nmax);
+}
+
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
@@ -592,8 +650,12 @@ fn parse_events(dx: &Dx, ctx: &Ctx, buf: &[u8], begin: usize, limit: usize, o: &
             LineM::Bad(e) => ls += e + 1,
             LineM::Good(e, r, lo, hi) => {
                 ls += e + 1;
-                let mut f = MemoFields { p, pr: unsafe { p.add(r) }, lo, hi, i: 0, j: 0, _buf: std::marker::PhantomData };
-                unsafe { event_line(dx, ctx, &mut dc, &mut f, o, &mut ring, w, &mut nmax) };
+                unsafe {
+                    let pr = p.add(r);
+                    if !event_fast(dx, &mut dc, p, pr, lo, hi, o, &mut ring, &mut nmax) {
+                        event_rare(dx, ctx, &mut dc, p, pr, lo, hi, o, &mut ring, w, &mut nmax);
+                    }
+                }
             }
         }
     }
