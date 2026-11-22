@@ -515,6 +515,13 @@ fn long_find(k: &Key) -> Option<&'static LongSlot> {
     None
 }
 
+/// Fetches the slot where `k` is looked for first.
+#[inline(always)]
+fn long_prefetch(k: &Key) {
+    let t = long_table();
+    prefetch(&t[(k[0] >> 20) as usize & (t.len() - 1)]);
+}
+
 /// Remembers the text of a long string under its key.
 fn long_register(k: &Key, s: &[u8]) {
     let t = long_table();
@@ -2829,11 +2836,15 @@ struct EvSlot {
     /// Hash of the user key.
     h: u64,
     dd: RecD,
-    /// Event time, ms from the window start.
-    ts: u32,
-    purchase: u32,
     /// (price, category) of a purchase.
     pc: (u32, u32),
+    /// Where the user ID is if it is a long one (`ulen` its length, else 0):
+    /// the text of a long ID that names its person is remembered when the
+    /// batch is flushed, by which time its slot in the table has been fetched.
+    uptr: *const u8,
+    /// Event time, ms from the window start; bit 31: a purchase.
+    ts: u32,
+    ulen: u16,
     linked: bool,
 }
 
@@ -2922,11 +2933,15 @@ fn flush_batch(base: *const EvSlot, n: usize, lm: &LinkMap, o: &mut P1Work) {
             person = lm.person(&person, ph);
             ph = hk(&person);
         }
+        // (a linked ID's person is named by an ID of the links, remembered there)
+        if e.ulen != 0 && person == e.person {
+            long_register(&person, unsafe { std::slice::from_raw_parts(e.uptr, e.ulen as usize) });
+        }
         let q = (ph >> pc_shift) as usize;
-        if e.purchase != 0 {
+        if e.ts >> 31 != 0 {
             unsafe { o.pur.get_unchecked_mut(q) }.push(e.pc);
         }
-        let rec = RecP { p: compact(&person, unsafe { o.pesc.get_unchecked_mut(q) }), t: e.ts | (e.purchase << 31) };
+        let rec = RecP { p: compact(&person, unsafe { o.pesc.get_unchecked_mut(q) }), t: e.ts };
         let mut d = e.dd;
         let idx = o.pay.push(q, rec) as u64;
         if idx >= 1 << IDX_BITS {
@@ -2953,7 +2968,17 @@ unsafe fn event_tail<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &Link
     let f1 = src.lo();
     let mut ok = !f1.is_empty();
     // (the key of an empty string is ZERO)
-    let user = key_of(f1);
+    // (a long ID is hashed here and remembered at the flush, see EvSlot)
+    let user = if f1.len().wrapping_sub(16) < 65_520 {
+        let k = long_hash(f1);
+        long_prefetch(&k);
+        (*slot).uptr = f1.as_ptr();
+        (*slot).ulen = f1.len() as u16;
+        k
+    } else {
+        (*slot).ulen = 0;
+        key_of(f1)
+    };
     (*slot).person[0] = user[0];
     (*slot).person[1] = user[1];
     let h = hk(&user);
@@ -2989,7 +3014,7 @@ unsafe fn event_tail<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &Link
     } else {
         ok &= ty < T_PURCHASE;
     }
-    (*slot).purchase = (ty == T_PURCHASE) as u32;
+    (*slot).ts |= ((ty == T_PURCHASE) as u32) << 31;
     (*slot).pc = pc;
     if ok {
         EV_VALID
@@ -3082,7 +3107,8 @@ unsafe fn event_line<'a, S: Fields<'a>>(
 
 type EvQueue = BatchQueue<EvSlot>;
 
-const EV_EMPTY: EvSlot = EvSlot { person: ZERO, h: 0, dd: RecD { fp: 0, b: 0 }, ts: 0, purchase: 0, pc: (0, 0), linked: false };
+const EV_EMPTY: EvSlot = EvSlot { person: ZERO, h: 0, dd: RecD { fp: 0, b: 0 }, pc: (0, 0), uptr: std::ptr::null(), ts: 0, ulen: 0, linked: false };
+const _: () = assert!(std::mem::size_of::<EvSlot>() == 64);
 
 /// Takes what `event_fields` left in the queue's slot.
 #[inline(always)]
@@ -3258,7 +3284,8 @@ unsafe fn click_fields<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &Li
     let cid = if f0.len() > 15 && mapped { key_ref(f0) } else { key_of(f0) };
     (*slot).cid[0] = cid[0];
     (*slot).cid[1] = cid[1];
-    let user = key_of(f1);
+    // (only hashed if long: a person is named through its events or its links)
+    let user = key_of_id(f1);
     (*slot).user[0] = user[0];
     (*slot).user[1] = user[1];
     let h = hk(&user);
