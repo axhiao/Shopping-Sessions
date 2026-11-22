@@ -692,3 +692,51 @@ fn memo_scanner_matches() {
     }
     assert!(good[0] > 20_000 && good[1] > 20_000, "{good:?}");
 }
+
+/// Keys of long strings kept by reference carry their first seven bytes:
+/// every comparison must still be the byte-wise order of the strings.
+#[test]
+fn reference_keys_order_like_bytes() {
+    let mut x = 0x1234_5678_9ABC_DEF1u64;
+    // a small alphabet (with the zero byte) and shared prefixes, so that
+    // prefixes of each other and equal first bytes are common
+    let alphabet = [0u8, b'0', b'a', b'k', 0xFF];
+    let stems: Vec<Vec<u8>> = (0..6)
+        .map(|_| {
+            let n = (rng(&mut x) % 12) as usize;
+            (0..n).map(|_| alphabet[(rng(&mut x) % 5) as usize]).collect()
+        })
+        .collect();
+    let mut texts: Vec<&'static [u8]> = Vec::new();
+    for _ in 0..600 {
+        let mut s = if rng(&mut x) % 3 == 0 { Vec::new() } else { stems[(rng(&mut x) % 6) as usize].clone() };
+        let more = (rng(&mut x) % 30) as usize;
+        for _ in 0..more {
+            s.push(alphabet[(rng(&mut x) % 5) as usize]);
+        }
+        // (keys read 16 bytes from the start of a string)
+        let text: &'static [u8] = Box::leak(padded(&s).into_boxed_slice());
+        texts.push(&text[..s.len()]);
+    }
+    let keys: Vec<Key> = texts
+        .iter()
+        .map(|s| {
+            if s.len() > 15 {
+                assert!(ref_ok(s));
+                let k = key_ref(s);
+                assert_eq!(long_slice(&k), Some(*s));
+                k
+            } else {
+                key_of(s)
+            }
+        })
+        .collect();
+    let mut by_ref = 0;
+    for i in 0..texts.len() {
+        for j in 0..texts.len() {
+            by_ref += (is_ref(&keys[i]) || is_ref(&keys[j])) as usize;
+            assert_eq!(cmp_key(&keys[i], &keys[j]), texts[i].cmp(texts[j]), "{:?} against {:?}", texts[i], texts[j]);
+        }
+    }
+    assert!(by_ref > 10_000);
+}

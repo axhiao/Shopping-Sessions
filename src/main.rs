@@ -569,18 +569,61 @@ fn long_key(s: &[u8]) -> Key {
 /// The key of a long string that is only ever compared by its bytes, never
 /// for equality (a click ID: copies of a click need no dedup, and only clicks
 /// at the same instant are ordered by ID): the place of its bytes, 0xFE in
-/// the last byte. `s` must stay where it is until the end (a mapped file).
+/// the last byte. `s` must stay where it is until the end (a mapped file) and
+/// pass `ref_ok`.
+///
+/// The key also carries the string's first seven bytes, which settle nearly
+/// every comparison: the bytes themselves are in pages that were given back
+/// after parsing, and reading them again costs a page fault.
+/// Layout: k[0] = address (48 bits) | bytes 0..2 << 48;
+/// k[1] = bytes 2..7 << 24 | length (16 bits) << 8 | 0xFE.
 #[inline(always)]
 fn key_ref(s: &[u8]) -> Key {
-    [s.as_ptr() as u64, (s.len() as u64) << 8 | 0xFE]
+    debug_assert!(ref_ok(s));
+    let w = unsafe { (s.as_ptr() as *const u64).read_unaligned() }.swap_bytes();
+    [s.as_ptr() as u64 | (w >> 48) << 48, ((w >> 8) & 0xFF_FFFF_FFFF) << 24 | (s.len() as u64) << 8 | 0xFE]
+}
+
+/// Whether `s` (longer than 15 bytes) can be kept by reference: its address
+/// and its length must fit their bits of the key.
+#[inline(always)]
+fn ref_ok(s: &[u8]) -> bool {
+    (s.as_ptr() as u64) >> 48 == 0 && s.len() <= 0xFFFF
+}
+
+#[inline(always)]
+fn is_ref(k: &Key) -> bool {
+    k[1] & 0xFF == 0xFE
+}
+
+/// The first seven bytes of the string behind a by-reference key, big-endian.
+#[inline(always)]
+fn ref_prefix(k: &Key) -> u64 {
+    (k[0] >> 48) << 40 | k[1] >> 24
+}
+
+/// How the long string whose first seven bytes are `p` compares to the short
+/// key `s`, if those bytes settle it.
+#[inline(always)]
+fn cmp_prefix_short(p: u64, s: &Key) -> Option<std::cmp::Ordering> {
+    let n = (s[1] & 0xFF) as u32;
+    let s7 = s[0] >> 8;
+    if n >= 7 {
+        return if p != s7 { Some(p.cmp(&s7)) } else { None };
+    }
+    // the short string's n bytes against the same bytes of the long one; if
+    // they are equal the short one is a prefix of the long one
+    let sh = 8 * (7 - n);
+    let (pn, sn) = (p >> sh, s7 >> sh);
+    Some(if pn != sn { pn.cmp(&sn) } else { std::cmp::Ordering::Greater })
 }
 
 /// The bytes of a key that is not short, if they are at hand without a lock.
 #[inline]
 fn long_slice(k: &Key) -> Option<&'static [u8]> {
     unsafe {
-        if k[1] & 0xFF == 0xFE {
-            return Some(std::slice::from_raw_parts(k[0] as *const u8, (k[1] >> 8) as usize));
+        if is_ref(k) {
+            return Some(std::slice::from_raw_parts((k[0] & 0xFFFF_FFFF_FFFF) as *const u8, ((k[1] >> 8) & 0xFFFF) as usize));
         }
         long_find(k).map(|sl| std::slice::from_raw_parts(sl.ptr.load(Ordering::Relaxed) as *const u8, sl.len.load(Ordering::Relaxed)))
     }
@@ -653,6 +696,26 @@ fn cmp_key(a: &Key, b: &Key) -> std::cmp::Ordering {
 
 #[cold]
 fn cmp_key_slow(a: &Key, b: &Key) -> std::cmp::Ordering {
+    // (strings kept by reference: their first bytes are in the keys)
+    match (is_ref(a), is_ref(b)) {
+        (true, true) => {
+            let (pa, pb) = (ref_prefix(a), ref_prefix(b));
+            if pa != pb {
+                return pa.cmp(&pb);
+            }
+        }
+        (true, false) if is_short(b) => {
+            if let Some(o) = cmp_prefix_short(ref_prefix(a), b) {
+                return o;
+            }
+        }
+        (false, true) if is_short(a) => {
+            if let Some(o) = cmp_prefix_short(ref_prefix(b), a) {
+                return o.reverse();
+            }
+        }
+        _ => {}
+    }
     // (the usual case: both texts at hand without copying)
     let short = |k: &Key, buf: &mut [u8; 16]| {
         buf[..8].copy_from_slice(&k[0].to_be_bytes());
@@ -3342,7 +3405,7 @@ unsafe fn click_fields<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &Li
         return false;
     }
     // (a long click ID in a mapped file is kept by reference)
-    let cid = if f0.len() > 15 && mapped { key_ref(f0) } else { key_of(f0) };
+    let cid = if f0.len() > 15 && mapped && ref_ok(f0) { key_ref(f0) } else { key_of(f0) };
     (*slot).cid[0] = cid[0];
     (*slot).cid[1] = cid[1];
     // (only hashed if long: a person is named through its events or its links)
@@ -4136,11 +4199,12 @@ fn main() {
     let ctx_cell: OnceLock<Ctx> = OnceLock::new();
     lap("small inputs");
 
-    // The products and campaigns are read on a thread of their own while the
-    // input files are listed and mapped. Then the dense engine takes the data
-    // if its IDs have the generated shape; anything it declines goes through
-    // the general pipeline below.
-    let (files, chunks, dense_done) = std::thread::scope(|sc| {
+    // The input files are listed and mapped. (The products and campaigns are
+    // read later, on a thread of their own next to the link phases: nothing
+    // here waits for them.) The dense engine, when it is switched on, takes
+    // the data if its IDs have the old generated shape; anything it declines
+    // goes through the general pipeline below.
+    let (files, chunks, dense_done) = {
         // --- files and chunks: links first, then clicks (they do not need the
         // link map), then events.
         let use_mmap = std::env::var_os("SS_NO_MMAP").is_none();
@@ -4159,9 +4223,6 @@ fn main() {
         // generator writes one ID in eight long; only user IDs are remembered)
         let lines = files.iter().map(|f| f.len).sum::<u64>() / 70;
         LONG_SLOTS.store(((lines / 40) as usize).max(1 << 16).next_power_of_two(), Ordering::Relaxed);
-        let small = sc.spawn(|| {
-            ctx_cell.get_or_init(&build_ctx);
-        });
         let mut chunks: Vec<Chunk> = Vec::new();
         for (fi, f) in files.iter().enumerate() {
             let mut s = 0;
@@ -4174,14 +4235,11 @@ fn main() {
             }
         }
         let done = match dense::detect(&files, nthreads, verbose) {
-            Some(keys) => {
-                let _ = small.join();
-                dense::run(&keys, ctx_cell.get().unwrap(), &files, &chunks, &out, nthreads, verbose, t0)
-            }
+            Some(keys) => dense::run(&keys, ctx_cell.get_or_init(&build_ctx), &files, &chunks, &out, nthreads, verbose, t0),
             None => false,
         };
         (files, chunks, done)
-    });
+    };
     if dense_done {
         lap("done");
         if let Some(p) = &prof_path {
@@ -4975,7 +5033,12 @@ fn main() {
                 let cl = unsafe { csorted.get_unchecked_mut(*cstart.get_unchecked(p) as usize..*cstart.get_unchecked(p + 1) as usize) };
                 if cl.len() > 1 {
                     cl.sort_unstable();
-                    // equal timestamps: order by click id, descending
+                    // equal timestamps: order by click id, descending. Only
+                    // the campaign of the last of them is ever looked at, so
+                    // clicks of one campaign (the copies of a click, above
+                    // all) are left as they are: comparing their IDs would
+                    // read the click files again, long after their pages
+                    // were given back.
                     let mut a = 0;
                     while a < cl.len() {
                         let mut b = a + 1;
@@ -4983,7 +5046,10 @@ fn main() {
                             b += 1;
                         }
                         if b - a > 1 {
-                            cl[a..b].sort_unstable_by(|x, y| cmp_key(&ccid[*y as u32 as usize], &ccid[*x as u32 as usize]));
+                            let c0 = ccamp[cl[a] as u32 as usize];
+                            if cl[a + 1..b].iter().any(|x| ccamp[*x as u32 as usize] != c0) {
+                                cl[a..b].sort_unstable_by(|x, y| cmp_key(&ccid[*y as u32 as usize], &ccid[*x as u32 as usize]));
+                            }
                         }
                         a = b;
                     }

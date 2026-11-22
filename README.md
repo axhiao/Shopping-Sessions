@@ -31,8 +31,10 @@ a longer one is a 120-bit hash. The text of a long ID is only needed for the nam
 person in the output and for ordering, so it is kept in a lock-free table (one entry per
 distinct long user ID that names its person), filled when a batch of parsed lines is
 flushed. A long click ID is never hashed at all: its key is the place of its bytes in
-the mapped file, since clicks are only ever ordered by ID. A line with a long first ID
-is parsed with the same layout memo as any other line, after taking the first field off.
+the mapped file together with its first seven bytes, since clicks are only ever ordered
+by ID (at equal times) and those bytes nearly always settle the order without reading
+the file again. A line with a long first ID is parsed with the same layout memo as any
+other line, after taking the first field off.
 
 ### The dense engine (off; old ID format only)
 
