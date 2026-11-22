@@ -218,7 +218,11 @@ impl<T: Copy> PVec<T> {
     #[cold]
     #[inline(never)]
     fn grow(&mut self) {
-        let nc = self.cap * 2;
+        self.grow_to(self.cap * 2);
+    }
+    /// Moves to a buffer with room for `nc` records (more than now).
+    fn grow_to(&mut self, nc: usize) {
+        debug_assert!(nc > self.cap);
         let np = arena_alloc(nc * std::mem::size_of::<T>()) as *mut T;
         unsafe { std::ptr::copy_nonoverlapping(self.ptr, np, self.len) };
         if thp_mask() & 1 == 0 {
@@ -246,6 +250,36 @@ impl<T: Copy> PVec<T> {
     }
 }
 
+/// How far ahead a buffer that fills unusually fast is sized (see `presize`).
+const PRESIZE_SPARE: f64 = 1.25;
+/// A partition is looked at once it holds this many records (far more than
+/// an even share of the first chunk of a thread).
+const PRESIZE_MIN: usize = 256;
+
+/// The capacity a buffer holding `n` records should get when `factor` times
+/// as much input is expected in all, if that is more than twice what it has.
+#[inline(always)]
+fn presize_want(n: usize, cap: usize, factor: f64) -> Option<usize> {
+    if n < PRESIZE_MIN {
+        return None;
+    }
+    let want = (n as f64 * factor * PRESIZE_SPARE) as usize;
+    if want > cap * 2 {
+        Some(want)
+    } else {
+        None
+    }
+}
+
+/// See `Parts::presize`: the same for plain per-partition lists.
+fn presize_lists<T: Copy>(lists: &mut [PVec<T>], factor: f64) {
+    for o in lists {
+        if let Some(want) = presize_want(o.len, o.cap, factor) {
+            o.grow_to(want);
+        }
+    }
+}
+
 /// Partitioned output with software write-combining: records are staged in
 /// small per-partition buffers and written out K at a time with streaming
 /// stores (K * size_of::<T>() is a multiple of 64 bytes).
@@ -270,6 +304,19 @@ impl<T: Copy, const K: usize> Parts<T, K> {
             std::ptr::write_bytes(buf.as_mut_ptr(), 0, parts);
         }
         Parts { out: (0..parts).map(|q| PVec::with_capacity(reserve(q).div_ceil(K) * K)).collect(), buf, cnt: vec![0; parts] }
+    }
+    /// Called by a thread once its first chunk of a kind has gone through:
+    /// `factor` times as much is expected for it in all. The reserves assume
+    /// that records spread evenly over the partitions, but a person with a
+    /// great many events fills its partition many times faster; such a
+    /// buffer would be outgrown again and again, each time leaving behind a
+    /// buffer that was zeroed and copied for nothing. It gets its room now.
+    fn presize(&mut self, factor: f64) {
+        for q in 0..self.out.len() {
+            if let Some(want) = presize_want(self.cnt[q] as usize, self.out[q].cap, factor) {
+                self.out[q].grow_to(want.div_ceil(K) * K);
+            }
+        }
     }
     /// Appends `v` to partition q; returns the index it got there.
     #[inline(always)]
@@ -4341,6 +4388,7 @@ fn main() {
     // with sequence numbers the general path is for the odd rows only
     let (res_dd, res_pay1) = if ix.on { (res_dd / 8 + 64, res_pay / 8 + 64) } else { (res_dd, res_pay) };
     lap("chunks");
+    let presize_on = std::env::var_os("SS_NO_PRESIZE").is_none();
 
     // --- phase 1: links (all threads build the link map together), then
     // clicks and events.
@@ -4464,6 +4512,9 @@ fn main() {
             (first, last)
         };
 
+        // (see Parts::presize)
+        let (mut ev_seen, mut cl_seen) = (false, false);
+        let ahead = |kind: Kind, c: &Chunk| bytes_of(kind) as f64 / nthreads as f64 / (c.end - c.start).max(1) as f64;
         loop {
             let i = counters[4].fetch_add(1, Ordering::Relaxed);
             if i >= data_chunks.len() {
@@ -4476,6 +4527,22 @@ fn main() {
                 // (the bytes are the file's mapping itself, or a copy that goes away)
                 Kind::Click => parse_clicks(ctx, bytes, b, l, lm, &mut o.clq, &mut o.cesc, &mut memo_cl, &mut memo_cl3, !files[c.file].map.is_null() && bytes.as_ptr() == files[c.file].map),
                 Kind::Link => unreachable!(),
+            }
+            if c.kind == Kind::Event && !ev_seen {
+                ev_seen = true;
+                let f = ahead(Kind::Event, c);
+                if f > 1.5 && presize_on {
+                    o.pay.presize(f);
+                    presize_lists(&mut o.pesc, f);
+                    presize_lists(&mut o.pur, f);
+                }
+            } else if c.kind == Kind::Click && !cl_seen {
+                cl_seen = true;
+                let f = ahead(Kind::Click, c);
+                if f > 1.5 && presize_on {
+                    o.clq.presize(f);
+                    presize_lists(&mut o.cesc, f);
+                }
             }
             let inf = &files[c.file];
             if !inf.map.is_null() {
