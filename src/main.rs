@@ -462,6 +462,23 @@ fn fm(a: u64, b: u64) -> u64 {
 fn long_hash(s: &[u8]) -> Key {
     let mut h1: u64 = 0x243F_6A88_85A3_08D3 ^ s.len() as u64;
     let mut h2: u64 = 0x1319_8A2E_0370_7344;
+    // Eight bytes at a time; the last word is read whole and masked (every
+    // buffer of the pipeline has slack past its end; tests copy instead).
+    #[cfg(not(test))]
+    {
+        let (n, p) = (s.len(), s.as_ptr());
+        let mut i = 0;
+        while i < n {
+            let mut x = unsafe { (p.add(i) as *const u64).read_unaligned() };
+            if n - i < 8 {
+                x &= !0u64 >> (8 * (8 - (n - i)));
+            }
+            h1 = fm(h1 ^ x, 0x9E37_79B9_7F4A_7C15);
+            h2 = fm(h2 ^ x, 0xC2B2_AE3D_27D4_EB4F) ^ h1;
+            i += 8;
+        }
+    }
+    #[cfg(test)]
     for c in s.chunks(8) {
         let mut w = [0u8; 8];
         w[..c.len()].copy_from_slice(c);
@@ -542,6 +559,26 @@ fn long_key(s: &[u8]) -> Key {
     k
 }
 
+/// The key of a long string that is only ever compared by its bytes, never
+/// for equality (a click ID: copies of a click need no dedup, and only clicks
+/// at the same instant are ordered by ID): the place of its bytes, 0xFE in
+/// the last byte. `s` must stay where it is until the end (a mapped file).
+#[inline(always)]
+fn key_ref(s: &[u8]) -> Key {
+    [s.as_ptr() as u64, (s.len() as u64) << 8 | 0xFE]
+}
+
+/// The bytes of a key that is not short, if they are at hand without a lock.
+#[inline]
+fn long_slice(k: &Key) -> Option<&'static [u8]> {
+    unsafe {
+        if k[1] & 0xFF == 0xFE {
+            return Some(std::slice::from_raw_parts(k[0] as *const u8, (k[1] >> 8) as usize));
+        }
+        long_find(k).map(|sl| std::slice::from_raw_parts(sl.ptr.load(Ordering::Relaxed) as *const u8, sl.len.load(Ordering::Relaxed)))
+    }
+}
+
 /// The key of a string whose text is never asked for again (an event ID is
 /// only ever compared for equality): a long one is hashed and not remembered.
 #[inline(always)]
@@ -590,8 +627,8 @@ fn key_bytes(k: &Key, out: &mut Vec<u8>) {
         b[..8].copy_from_slice(&k[0].to_be_bytes());
         b[8..].copy_from_slice(&k[1].to_be_bytes());
         out.extend_from_slice(&b[..n]);
-    } else if let Some(sl) = long_find(k) {
-        out.extend_from_slice(unsafe { std::slice::from_raw_parts(sl.ptr.load(Ordering::Relaxed) as *const u8, sl.len.load(Ordering::Relaxed)) });
+    } else if let Some(b) = long_slice(k) {
+        out.extend_from_slice(b);
     } else {
         out.extend_from_slice(&long_shard(k).lock().unwrap()[k]);
     }
@@ -609,6 +646,28 @@ fn cmp_key(a: &Key, b: &Key) -> std::cmp::Ordering {
 
 #[cold]
 fn cmp_key_slow(a: &Key, b: &Key) -> std::cmp::Ordering {
+    // (the usual case: both texts at hand without copying)
+    let short = |k: &Key, buf: &mut [u8; 16]| {
+        buf[..8].copy_from_slice(&k[0].to_be_bytes());
+        buf[8..].copy_from_slice(&k[1].to_be_bytes());
+        (k[1] & 0xFF) as usize
+    };
+    let (mut ba, mut bb) = ([0u8; 16], [0u8; 16]);
+    let sa: Option<&[u8]> = if is_short(a) {
+        let n = short(a, &mut ba);
+        Some(&ba[..n])
+    } else {
+        long_slice(a)
+    };
+    let sb: Option<&[u8]> = if is_short(b) {
+        let n = short(b, &mut bb);
+        Some(&bb[..n])
+    } else {
+        long_slice(b)
+    };
+    if let (Some(x), Some(y)) = (sa, sb) {
+        return x.cmp(y);
+    }
     let mut x = Vec::new();
     let mut y = Vec::new();
     key_bytes(a, &mut x);
@@ -3188,14 +3247,15 @@ const CL_EMPTY: ClSlot = ClSlot { user: ZERO, cid: ZERO, h: 0, ts: 0, camp: 0, l
 /// Parses the four fields of a click line, in order, into `slot`; false if
 /// the click is to be ignored.
 #[inline(always)]
-unsafe fn click_fields<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &LinkMap, src: &mut S, slot: *mut ClSlot) -> bool {
+unsafe fn click_fields<'a, S: Fields<'a>>(ctx: &Ctx, dc: &mut DateCache, lm: &LinkMap, src: &mut S, slot: *mut ClSlot, mapped: bool) -> bool {
     // click_id, user_id
     let f0 = src.lo();
     let f1 = src.lo();
     if f0.is_empty() || f1.is_empty() {
         return false;
     }
-    let cid = key_of(f0);
+    // (a long click ID in a mapped file is kept by reference)
+    let cid = if f0.len() > 15 && mapped { key_ref(f0) } else { key_of(f0) };
     (*slot).cid[0] = cid[0];
     (*slot).cid[1] = cid[1];
     let user = key_of(f1);
@@ -3254,10 +3314,11 @@ fn click_slow(
     q: &mut ClQueue,
     clq: &mut Parts<RecCc, 2>,
     cesc: &mut [PVec<Key>],
+    mapped: bool,
 ) -> usize {
     let (end, res) = slow_line::<4>(buf, ls);
     if let Some(f) = res {
-        if unsafe { click_fields(ctx, dc, lm, &mut ArrFields { f: &f, i: 0 }, q.slot) } {
+        if unsafe { click_fields(ctx, dc, lm, &mut ArrFields { f: &f, i: 0 }, q.slot, mapped) } {
             if let Some((base, n)) = q.keep(lm) {
                 flush_clicks(base, n, lm, clq, cesc);
             }
@@ -3276,6 +3337,7 @@ fn parse_clicks(
     clq: &mut Parts<RecCc, 2>,
     cesc: &mut [PVec<Key>],
     memo: &mut ShapeMemo,
+    mapped: bool,
 ) {
     let n = buf.len();
     if begin >= n {
@@ -3292,12 +3354,12 @@ fn parse_clicks(
         // (see scan_lean)
         prefetch(p.wrapping_add(INPUT_AHEAD));
         match unsafe { line_memo::<4, 2>(p, memo) } {
-            LineM::Slow => ls = click_slow(ctx, buf, ls, &mut dc, lm, &mut q, clq, cesc),
+            LineM::Slow => ls = click_slow(ctx, buf, ls, &mut dc, lm, &mut q, clq, cesc, mapped),
             LineM::Bad(e) => ls += e + 1,
             LineM::Good(e, r, lo, hi) => {
                 ls += e + 1;
                 let mut f = MemoFields { p, pr: unsafe { p.add(r) }, lo, hi, i: 0, j: 0, _buf: std::marker::PhantomData };
-                if unsafe { click_fields(ctx, &mut dc, lm, &mut f, q.slot) } {
+                if unsafe { click_fields(ctx, &mut dc, lm, &mut f, q.slot, mapped) } {
                     if let Some((base, n)) = q.keep(lm) {
                         flush_clicks(base, n, lm, clq, cesc);
                     }
@@ -3576,11 +3638,40 @@ fn person_finish(g: &Geo, st: &mut P3, person: Key, pur: &[(u32, u32)], cls: &[u
 /// up by the 12-byte compact key as it sits in the records (no expansion, one
 /// multiplication); the few keys that do not fit the compact form go through
 /// a map of full keys.
+/// A cheap hasher for keys (they are hashes or packed bytes already).
+#[derive(Default, Clone, Copy)]
+struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        for c in bytes.chunks(8) {
+            let mut w = [0u8; 8];
+            w[..c.len()].copy_from_slice(c);
+            self.write_u64(u64::from_le_bytes(w));
+        }
+    }
+    #[inline(always)]
+    fn write_u64(&mut self, v: u64) {
+        self.0 = fm(self.0 ^ v, 0x9E37_79B9_7F4A_7C15);
+    }
+    #[inline(always)]
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64);
+    }
+}
+
+type KeyBuild = std::hash::BuildHasherDefault<KeyHasher>;
+
 struct LocalIds {
     slots: Vec<LSlot>,
     mask: usize,
     persons: Vec<Key>,
-    long: std::collections::HashMap<Key, u32>,
+    long: std::collections::HashMap<Key, u32, KeyBuild>,
 }
 
 /// `a`, `b`: the compact key; `idp`: person id + 1 (0 = empty).
@@ -3602,7 +3693,7 @@ fn ck_words(c: &Ck) -> (u64, u32) {
 
 impl LocalIds {
     fn new() -> LocalIds {
-        LocalIds { slots: Vec::new(), mask: 0, persons: Vec::new(), long: std::collections::HashMap::new() }
+        LocalIds { slots: Vec::new(), mask: 0, persons: Vec::new(), long: std::collections::HashMap::default() }
     }
     /// Starts a new partition expecting about `n` persons.
     fn reset(&mut self, n: usize) {
@@ -3930,10 +4021,10 @@ fn main() {
                 files.push(InFile { kind, path: p, len, map, ends_nl });
             }
         }
-        // long IDs get a table with a slot for about every twelfth line (the
-        // generator writes one ID in eight long; only users and clicks are kept)
+        // long IDs get a table with a slot for about every fortieth line (the
+        // generator writes one ID in eight long; only user IDs are remembered)
         let lines = files.iter().map(|f| f.len).sum::<u64>() / 70;
-        LONG_SLOTS.store(((lines / 12) as usize).max(1 << 16).next_power_of_two(), Ordering::Relaxed);
+        LONG_SLOTS.store(((lines / 40) as usize).max(1 << 16).next_power_of_two(), Ordering::Relaxed);
         let small = sc.spawn(|| {
             ctx_cell.get_or_init(&build_ctx);
         });
@@ -3966,8 +4057,23 @@ fn main() {
     }
     // estimate line counts to pre-size the partition buffers
     let bytes_of = |k: Kind| files.iter().filter(|f| f.kind == k).map(|f| f.len).sum::<u64>();
-    let est_events = (bytes_of(Kind::Event) / 70) as usize;
-    let est_clicks = (bytes_of(Kind::Click) / 40) as usize;
+    // (bytes per line from the head of the kind's biggest file)
+    let line_len = |k: Kind, usual: u64| -> u64 {
+        match files.iter().filter(|f| f.kind == k && !f.map.is_null()).max_by_key(|f| f.len) {
+            Some(f) => {
+                let n = (f.len as usize).min(64 << 10);
+                let lines = unsafe { std::slice::from_raw_parts(f.map, n) }.iter().filter(|&&b| b == b'\n').count() as u64;
+                if lines >= 64 {
+                    (n as u64 / lines).max(8)
+                } else {
+                    usual
+                }
+            }
+            None => usual,
+        }
+    };
+    let est_events = (bytes_of(Kind::Event) / line_len(Kind::Event, 70)) as usize * 33 / 32;
+    let est_clicks = (bytes_of(Kind::Click) / line_len(Kind::Click, 40)) as usize * 33 / 32;
     let per = |n: usize, parts: usize| n / parts / nthreads + n / parts / nthreads / 3 + 64;
     // about 40k events per partition, between 256 and 1024 partitions
     let bits = ((est_events / 40_000).max(1) as f64).log2().round().clamp(8.0, MAX_PC_BITS as f64) as u32;
@@ -4154,7 +4260,8 @@ fn main() {
             let (bytes, b, l) = chunk_bytes(&files[c.file], c, &mut buf);
             match c.kind {
                 Kind::Event => parse_events(ctx, &ix, bytes, b, l, lm, &mut o, &mut memo_ev, &mut memo_ev6),
-                Kind::Click => parse_clicks(ctx, bytes, b, l, lm, &mut o.clq, &mut o.cesc, &mut memo_cl),
+                // (the bytes are the file's mapping itself, or a copy that goes away)
+                Kind::Click => parse_clicks(ctx, bytes, b, l, lm, &mut o.clq, &mut o.cesc, &mut memo_cl, !files[c.file].map.is_null() && bytes.as_ptr() == files[c.file].map),
                 Kind::Link => unreachable!(),
             }
             let inf = &files[c.file];
